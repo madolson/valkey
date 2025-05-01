@@ -1435,6 +1435,48 @@ static sds makeHint(char **inputargv, int inputargc, int cmdlen, struct commandD
     return hint;
 }
 
+/* Given the provided argc and argv, list out the possible commands the
+ * user might be trying to type out. The first result will be the one
+ * that can auto-completed with tab. */
+static sds makeCommandSuggestionHint(int argc, char **argv, int endisspace) {
+    sds hint = sdsempty();
+    sds previous_hit = NULL;
+    int suggestions = 0;
+    if (endisspace) argc++;
+    for (int i = 0; i < helpEntriesLen && suggestions < 10; i++) {
+        if (!(helpEntries[i].type & CLI_HELP_COMMAND)) continue;
+        for (int j = 0; j < helpEntries[i].argc && j < argc; j++) {
+            if (j < argc - 1) {
+                if (strcasecmp(argv[j], helpEntries[i].argv[j])) break;
+            } else {
+                if (previous_hit && !strcasecmp(previous_hit, helpEntries[i].argv[j])) continue;
+
+                /* Check if we match the partially typed string. Note, if the end is
+                 * a space, we'll match with everything, which is useful for enumerating
+                 * subcommands. */
+                if (!endisspace && strncasecmp(argv[j], helpEntries[i].argv[j], strlen(argv[j]))) {
+                    previous_hit = NULL;
+                    continue;
+                }
+
+                /* We have an exact match, so we won't return a hint. */
+                if (!endisspace && !strcasecmp(argv[j], helpEntries[i].argv[j])) {
+                    sdsfree(hint);
+                    return sdsempty();
+                }
+
+                /* Only add the latest partially matched string. */
+                hint = sdscatsds(hint, helpEntries[i].argv[j]);
+                hint = sdscat(hint, " ");
+                previous_hit = helpEntries[i].argv[j];
+                suggestions++;
+                break;
+            }
+        }
+    }
+    return hint;
+}
+
 /* Search for a command matching the longest possible prefix of input words. */
 static helpEntry *findHelpEntry(int argc, char **argv) {
     helpEntry *entry = NULL;
@@ -1475,6 +1517,11 @@ static sds getHintForInput(const char *charinput) {
     helpEntry *entry = findHelpEntry(matchargc, inputargv);
     if (entry) {
         hint = makeHint(inputargv, matchargc, entry->argc, entry->docs);
+    }
+    /* If there was no hint, or it was empty fill in with possible completions. */
+    if (!hint || !sdslen(hint)) {
+        if (hint) sdsfree(hint);
+        hint = makeCommandSuggestionHint(inputargc, inputargv, endspace);
     }
     sdsfreesplitres(inputargv, inputargc);
     return hint;
