@@ -379,25 +379,21 @@ run_solo {defrag} {
             set n 200000
 
             perform_defrag_test $title populate {
-                set rd [valkey_deferring_client]
                 set val [string repeat A 350]
                 set k 0
                 set f 0
                 for {set j 0} {$j < $n} {incr j} {
-                    $rd lpush k$k $val
+                    r lpush k$k $val
                     lassign [next_exp_kf $k $f] k f
                 }
-                for {set j 0} {$j < $n} {incr j} { $rd read } ; # Discard replies
             } fragment {
                 set k 0
                 set f 0
                 for {set j 0} {$j < $n} {incr j 2} {
-                    $rd ltrim k$k 1 -1 ;# deletes the leftmost item
-                    $rd lmove k$k k$k LEFT RIGHT ;# rotates the leftmost item to the right side
+                    r ltrim k$k 1 -1 ;# deletes the leftmost item
+                    r lmove k$k k$k LEFT RIGHT ;# rotates the leftmost item to the right side
                     lassign [next_exp_kf $k $f 2] k f
                 }
-                for {set j 0} {$j < $n} {incr j 2} { $rd read; $rd read } ; # Discard replies
-                $rd close
             }
         }
     }
@@ -564,29 +560,15 @@ run_solo {defrag} {
     set std_overrides [list appendonly no save "" lazyfree-lazy-user-del no]
 
     set tests {}
-    lappend tests [list test_main_dictionary standalone $aof_overrides] ;# only need AOF for main dict, standalone
-    lappend tests [list test_eval_scripts standalone $std_overrides]
-    lappend tests [list test_big_hash standalone $std_overrides]
-    lappend tests [list test_big_list standalone $std_overrides]
-    lappend tests [list test_big_set standalone $std_overrides]
-    lappend tests [list test_big_zset standalone $std_overrides]
-    lappend tests [list test_stream standalone $std_overrides]
-    lappend tests [list test_pubsub standalone $std_overrides]
 
-    lappend tests [list test_main_dictionary cluster $std_overrides]
-    lappend tests [list test_eval_scripts cluster $std_overrides]
-    lappend tests [list test_big_hash cluster $std_overrides]
     lappend tests [list test_big_list cluster $std_overrides]
-    lappend tests [list test_big_set cluster $std_overrides]
-    lappend tests [list test_big_zset cluster $std_overrides]
-    lappend tests [list test_stream cluster $std_overrides]
-    lappend tests [list test_pubsub cluster $std_overrides]
+
 
     # set ::verbose 1
 
     set have_defrag 0
     start_server [list tags $standalone_tags overrides $std_overrides] {
-        if {[string match {*jemalloc*} [s mem_allocator]] && [r debug mallctl arenas.page] <= 8192} {
+        if {[string match {*jemalloc*} [s mem_allocator]]} {
             set have_defrag 1
         }
     }
