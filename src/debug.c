@@ -872,6 +872,11 @@ void debugCommand(client *c) {
     } else if (!strcasecmp(c->argv[1]->ptr, "set-skip-checksum-validation") && c->argc == 3) {
         server.skip_checksum_validation = atoi(c->argv[2]->ptr);
         addReply(c, shared.ok);
+    } else if (!strcasecmp(c->argv[1]->ptr,"generate-rdb-checksum") && c->argc == 3) {
+        uint64_t crc = crc64(0, c->argv[2]->ptr,
+                sdslen(c->argv[2]->ptr));
+        memrev64ifbe(&crc);
+        addReplyBulkSds(c, sdscatlen(sdsempty(), &crc, sizeof(crc)));
     } else if (!strcasecmp(c->argv[1]->ptr, "aof-flush-sleep") && c->argc == 3) {
         server.aof_flush_sleep = atoi(c->argv[2]->ptr);
         addReply(c, shared.ok);
