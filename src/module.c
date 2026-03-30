@@ -2104,6 +2104,9 @@ int VM_SetCommandInfo(ValkeyModuleCommand *command, const ValkeyModuleCommandInf
         /* Update the legacy (first,last,step) spec and "movablekeys" flag used by the COMMAND command,
          * by trying to "glue" consecutive range key specs. */
         populateCommandLegacyRangeSpec(cmd);
+
+        /* Validate CMD_WRITE_FIRSTKEY_ONLY key spec consistency. */
+        detectAndValidateWriteFirstkeyOnly(cmd);
     }
 
     if (info->args) {

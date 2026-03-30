@@ -3310,6 +3310,35 @@ void commandAddSubcommand(struct serverCommand *parent, struct serverCommand *su
     serverAssert(hashtableAdd(parent->subcommands_ht, subcommand));
 }
 
+/* Automatically set CMD_WRITE_FIRSTKEY_ONLY for write commands where the first
+ * key spec is a write and all remaining key specs are read-only. Then validate
+ * that any command with the flag has consistent key specs. */
+void detectAndValidateWriteFirstkeyOnly(struct serverCommand *c) {
+    /* Auto-detect: set the flag if the key specs qualify. */
+    if ((c->flags & CMD_WRITE) && c->key_specs_num >= 2 &&
+        (c->key_specs[0].flags & (CMD_KEY_OW | CMD_KEY_RW))) {
+        int all_rest_ro = 1;
+        for (int i = 1; i < c->key_specs_num; i++) {
+            if (!(c->key_specs[i].flags & CMD_KEY_RO) ||
+                (c->key_specs[i].flags & (CMD_KEY_RW | CMD_KEY_OW | CMD_KEY_RM))) {
+                all_rest_ro = 0;
+                break;
+            }
+        }
+        if (all_rest_ro) c->flags |= CMD_WRITE_FIRSTKEY_ONLY;
+    }
+
+    /* Validate: if the flag is set (manually or auto), key specs must be consistent. */
+    if (!(c->flags & CMD_WRITE_FIRSTKEY_ONLY)) return;
+    serverAssert(c->flags & CMD_WRITE);
+    serverAssert(c->key_specs_num >= 2);
+    serverAssert(c->key_specs[0].flags & (CMD_KEY_OW | CMD_KEY_RW));
+    for (int i = 1; i < c->key_specs_num; i++) {
+        serverAssert(c->key_specs[i].flags & CMD_KEY_RO);
+        serverAssert(!(c->key_specs[i].flags & (CMD_KEY_RW | CMD_KEY_OW | CMD_KEY_RM)));
+    }
+}
+
 /* Recursively populate the command structure.
  *
  * On success, the function return C_OK. Otherwise C_ERR is returned and we won't
@@ -3332,6 +3361,9 @@ int populateCommandStructure(struct serverCommand *c) {
 
     /* Handle the legacy range spec and the "movablekeys" flag (must be done after populating all key specs). */
     populateCommandLegacyRangeSpec(c);
+
+    /* Validate CMD_WRITE_FIRSTKEY_ONLY key spec consistency. */
+    detectAndValidateWriteFirstkeyOnly(c);
 
     /* Assign the ID used for ACL. */
     c->id = ACLGetCommandID(c->fullname);
