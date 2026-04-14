@@ -1,28 +1,28 @@
 Valkey NEXT release notes
 =========================
 
-<!--
-RELEASE NOTES GUIDE
-===================
+Release Notes Guide
+-------------------
 When submitting a PR with user-visible changes, add an entry to the appropriate
 section below. Your PR must have the "release-notes" label for CI to validate.
 
 Entry format:
-  * <description> by @<author> (#<PR number>)
+
+    * <description> by @<author> (#<PR number>)
 
 Multiple authors/PRs:
-  * <description> by @<author1>, @<author2> (#111, #222)
+
+    * <description> by @<author1>, @<author2> (#111, #222)
 
 Guidelines:
-  - Be concise: one line per entry.
-  - Describe the user-facing impact, not the implementation detail.
-  - Start with a verb (Add, Fix, Optimize, Support) or a noun (New ...).
-  - Use backticks for command names, config parameters, and field names.
-  - Place your entry under the section that best fits the change.
+- Be concise: one line per entry.
+- Describe the user-facing impact, not the implementation detail.
+- Start with a verb (Add, Fix, Optimize, Support) or a noun (New ...).
+- Use backticks for command names, config parameters, and field names.
+- Place your entry under the section that best fits the change.
 
 This file is reset to a clean template after each release is cut.
 The Contributors section is auto-generated at release time.
--->
 
 Upgrade urgency levels:
 
