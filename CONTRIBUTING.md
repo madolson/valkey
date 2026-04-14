@@ -128,4 +128,74 @@ Notes:
 * The scheduled part of this workflow is gated to `valkey-io/valkey`, but manual
   `workflow_dispatch` runs work for forks.
 
+## Release Notes
+
+If your PR includes user-visible changes, you must add a release note entry to
+`00-RELEASENOTES` and apply the `release-notes` label to your PR. CI will
+validate the entry format when the label is present.
+
+### When to add a release note
+
+Add an entry for any change that affects users, including:
+* New features or enhanced behavior
+* New or modified commands and APIs
+* Performance and efficiency improvements
+* Module API changes
+* Observability and logging changes (new metrics, INFO fields, log formats)
+* Build and tooling changes (new build flags, CLI tool improvements)
+* Bug fixes
+
+Changes that do **not** need a release note: test-only changes, CI/workflow
+updates, documentation-only edits, code refactors with no user-visible effect.
+
+### How to add a release note
+
+1. Open `00-RELEASENOTES` in the repo root.
+2. Find the section that best fits your change.
+3. Add a single-line entry at the end of that section in this format:
+
+```
+* <description> by @<author> (#<PR>)
+```
+
+For multiple authors or PRs:
+
+```
+* <description> by @<author1>, @<author2> (#111, #222)
+```
+
+4. Apply the `release-notes` label to your PR.
+
+### Valid sections
+
+| Section | Use for |
+|---------|---------|
+| New Features and enhanced behavior | New capabilities, behavior changes |
+| Command and API updates | New commands, modified command behavior, new flags |
+| Performance and Efficiency improvements | Throughput, latency, memory optimizations |
+| Module API changes | New or modified module API functions |
+| Observability and logging | New metrics, INFO fields, log format changes |
+| Build and Tooling | Build flags, CLI tools, benchmark improvements |
+| Bug Fixes | Corrections to existing behavior |
+
+### Writing guidance
+
+* Be concise — one line per entry.
+* Describe the **user-facing impact**, not the implementation detail.
+* Start with a verb (Add, Fix, Optimize, Support) or a noun (New ...).
+* Use backticks for command names, config parameters, and field names.
+
+**Good examples:**
+```
+* Add `MSETEX` command to set multiple keys with a shared expiration by @enjoy-binbin (#3121)
+* Optimize zset memory usage by embedding element in skiplist by @chzhoo (#2508)
+* Fix strict CRLF checking when parsing querybuf by @enjoy-binbin (#2872)
+```
+
+**Bad examples:**
+```
+* Fixed a bug (missing author/PR, too vague)
+* Refactored the hashtable resize code to use a new helper function by @user (#100) (implementation detail, not user-facing)
+```
+
 Thanks!

@@ -1,16 +1,53 @@
-Hello! This file is just a placeholder, since this is the "unstable" branch
-of Valkey, the place where all the development happens.
+Valkey NEXT release notes
+=========================
 
-There is no release notes for this branch, it gets forked into another branch
-every time there is a partial feature freeze in order to eventually create
-a new stable release.
+<!--
+RELEASE NOTES GUIDE
+===================
+When submitting a PR with user-visible changes, add an entry to the appropriate
+section below. Your PR must have the "release-notes" label for CI to validate.
 
-Usually "unstable" is stable enough for you to use it in development environments
-however you should never use it in production environments. It is possible
-to download the latest stable release here:
+Entry format:
+  * <description> by @<author> (#<PR number>)
 
-    https://valkey.io/download/
+Multiple authors/PRs:
+  * <description> by @<author1>, @<author2> (#111, #222)
 
-More information is available at https://valkey.io
+Guidelines:
+  - Be concise: one line per entry.
+  - Describe the user-facing impact, not the implementation detail.
+  - Start with a verb (Add, Fix, Optimize, Support) or a noun (New ...).
+  - Use backticks for command names, config parameters, and field names.
+  - Place your entry under the section that best fits the change.
 
-Happy hacking!
+This file is reset to a clean template after each release is cut.
+The Contributors section is auto-generated at release time.
+-->
+
+Upgrade urgency levels:
+
+| Level    | Meaning                                                             |
+|----------|---------------------------------------------------------------------|
+| LOW      | No need to upgrade unless there are new features you want to use.   |
+| MODERATE | Program an upgrade of the server, but it's not urgent.              |
+| HIGH     | There is a critical bug that may affect a subset of users. Upgrade! |
+| CRITICAL | There is a critical bug affecting MOST USERS. Upgrade ASAP.         |
+| SECURITY | There are security fixes in the release.                            |
+
+### New Features and enhanced behavior
+
+### Command and API updates
+
+### Performance and Efficiency improvements
+
+### Module API changes
+
+### Observability and logging
+
+### Build and Tooling
+
+### Bug Fixes
+
+### Contributors
+
+Contributors will be auto-generated at release time.

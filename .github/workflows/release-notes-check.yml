@@ -1,0 +1,25 @@
+name: Release Notes Check
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+
+concurrency:
+  group: release-notes-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check-release-notes:
+    if: contains(github.event.pull_request.labels.*.name, 'release-notes')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Validate release notes
+        run: .github/scripts/check-release-notes.sh origin/${{ github.event.pull_request.base.ref }}
