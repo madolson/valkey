@@ -4,7 +4,8 @@ Valkey NEXT release notes
 Release Notes Guide
 -------------------
 When submitting a PR with user-visible changes, add an entry to the appropriate
-section below. Your PR must have the "release-notes" label for CI to validate.
+release target and section below. Your PR must have the "release-notes" label
+for CI to validate.
 
 Entry format:
 
@@ -19,7 +20,12 @@ Guidelines:
 - Describe the user-facing impact, not the implementation detail.
 - Start with a verb (Add, Fix, Optimize, Support) or a noun (New ...).
 - Use backticks for command names, config parameters, and field names.
-- Place your entry under the section that best fits the change.
+- Place your entry under the release target and section that best fits.
+
+Release targets:
+- **Unreleased (9.2.0)**: Features and changes targeting the next major.minor.
+- **Next RC (9.1.0-rc2)**: Features being backported into the current release candidate.
+- **Backport (9.0.x)**: Bug fixes being backported to the current stable release.
 
 This file is reset to a clean template after each release is cut.
 The Contributors section is auto-generated at release time.
@@ -34,6 +40,9 @@ Upgrade urgency levels:
 | CRITICAL | There is a critical bug affecting MOST USERS. Upgrade ASAP.         |
 | SECURITY | There are security fixes in the release.                            |
 
+Unreleased (9.2.0)
+-------------------
+
 ### New Features and enhanced behavior
 
 ### Command and API updates
@@ -45,6 +54,28 @@ Upgrade urgency levels:
 ### Observability and logging
 
 ### Build and Tooling
+
+### Bug Fixes
+
+Next RC (9.1.0-rc2)
+--------------------
+
+### New Features and enhanced behavior
+
+### Command and API updates
+
+### Performance and Efficiency improvements
+
+### Module API changes
+
+### Observability and logging
+
+### Build and Tooling
+
+### Bug Fixes
+
+Backport (9.0.x)
+-----------------
 
 ### Bug Fixes
 

@@ -151,8 +151,12 @@ updates, documentation-only edits, code refactors with no user-visible effect.
 ### How to add a release note
 
 1. Open `00-RELEASENOTES` in the repo root.
-2. Find the section that best fits your change.
-3. Add a single-line entry at the end of that section in this format:
+2. Find the release target that matches your change:
+   - **Unreleased** — Features and changes targeting the next major.minor release.
+   - **Next RC** — Features being backported into the current release candidate.
+   - **Backport** — Bug fixes being backported to the current stable release.
+3. Under that release target, find the section that best fits your change.
+4. Add a single-line entry at the end of that section in this format:
 
 ```
 * <description> by @<author> (#<PR>)

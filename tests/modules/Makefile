@@ -69,7 +69,8 @@ TEST_MODULES = \
     crash.so \
     cluster.so \
     helloscripting.so \
-    unsupported_features.so
+    unsupported_features.so \
+    bugreview.so
 
 .PHONY: all
 
