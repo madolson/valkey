@@ -23,9 +23,9 @@ Guidelines:
 - Place your entry under the release target and section that best fits.
 
 Release targets:
-- **Unreleased (9.2.0)**: Features and changes targeting the next major.minor.
+- **Next**: Features and changes targeting the next major.minor release.
 - **Next RC (9.1.0-rc2)**: Features being backported into the current release candidate.
-- **Backport (9.0.x)**: Bug fixes being backported to the current stable release.
+- **Back Porting**: Bug fixes being backported to stable releases.
 
 This file is reset to a clean template after each release is cut.
 The Contributors section is auto-generated at release time.
@@ -40,8 +40,8 @@ Upgrade urgency levels:
 | CRITICAL | There is a critical bug affecting MOST USERS. Upgrade ASAP.         |
 | SECURITY | There are security fixes in the release.                            |
 
-Unreleased (9.2.0)
--------------------
+Next
+----
 
 ### New Features and enhanced behavior
 
@@ -74,8 +74,8 @@ Next RC (9.1.0-rc2)
 
 ### Bug Fixes
 
-Backport (9.0.x)
------------------
+Back Porting
+------------
 
 ### Bug Fixes
 
