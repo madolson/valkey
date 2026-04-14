@@ -44,6 +44,7 @@ Next
 ----
 
 ### New Features and enhanced behavior
+* Add release notes infrastructure for tracking changes per commit by @madolson (#9999)
 
 ### Command and API updates
 
