@@ -28,6 +28,7 @@
  */
 
 #include "../../valkeymodule.h"
+#include "../../sds.h"
 #include "script_lua.h"
 #include "debug_lua.h"
 #include "engine_structs.h"
@@ -53,6 +54,19 @@ extern int VM_ReplyRaw(ValkeyModuleCtx *ctx, const char *proto, size_t proto_len
 
 #define LUA_CMD_OBJCACHE_SIZE 32
 #define LUA_CMD_OBJCACHE_MAX_LEN 64
+
+/* objectGetVal is provided by the server binary at link time. It returns the
+ * SDS pointer for string-encoded robj (which ValkeyModuleString is). */
+extern void *objectGetVal(const void *o);
+
+/* Cached argv array and argument objects to avoid per-call allocation.
+ * After each redis.call(), small string objects are retained here. On the
+ * next call, if the cached SDS buffer is large enough, we memcpy the new
+ * content in-place — zero malloc/free for the hot path. */
+static ValkeyModuleString **lua_argv_cache = NULL;
+static int lua_argv_cache_size = 0;
+static ValkeyModuleString *lua_args_cached_objects[LUA_CMD_OBJCACHE_SIZE];
+static size_t lua_args_cached_objects_len[LUA_CMD_OBJCACHE_SIZE];
 
 /* Command propagation flags, see propagateNow() function */
 #define PROPAGATE_NONE 0
@@ -685,7 +699,12 @@ static ValkeyModuleString **luaArgsToServerArgv(ValkeyModuleCtx *ctx, lua_State 
         return NULL;
     }
 
-    ValkeyModuleString **lua_argv = ValkeyModule_Alloc(sizeof(ValkeyModuleString *) * *argc);
+    /* Reuse the argv array across calls to avoid per-call allocation. */
+    if (lua_argv_cache_size < *argc) {
+        lua_argv_cache = ValkeyModule_Realloc(lua_argv_cache, sizeof(ValkeyModuleString *) * *argc);
+        lua_argv_cache_size = *argc;
+    }
+    ValkeyModuleString **lua_argv = lua_argv_cache;
 
     for (j = 0; j < *argc; j++) {
         char *obj_s;
@@ -713,7 +732,25 @@ static ValkeyModuleString **luaArgsToServerArgv(ValkeyModuleCtx *ctx, lua_State 
             if (obj_s == NULL) break; /* Not a string. */
         }
 
-        lua_argv[j] = ValkeyModule_CreateString(ctx, obj_s, obj_len);
+        /* Try to reuse a cached object to avoid malloc/free.
+         * objectGetVal() returns the SDS pointer; sdsalloc() gives us the
+         * buffer capacity without needing to know the robj struct layout. */
+        if (j < LUA_CMD_OBJCACHE_SIZE && lua_args_cached_objects[j] &&
+            lua_args_cached_objects_len[j] >= obj_len) {
+            sds s = objectGetVal(lua_args_cached_objects[j]);
+            memcpy(s, obj_s, obj_len);
+            s[obj_len] = '\0';
+            sdssetlen(s, obj_len);
+            lua_argv[j] = lua_args_cached_objects[j];
+            lua_args_cached_objects[j] = NULL;
+        } else {
+            /* Cache miss: free stale cached object and create new. */
+            if (j < LUA_CMD_OBJCACHE_SIZE && lua_args_cached_objects[j]) {
+                ValkeyModule_FreeString(ctx, lua_args_cached_objects[j]);
+                lua_args_cached_objects[j] = NULL;
+            }
+            lua_argv[j] = ValkeyModule_CreateString(ctx, obj_s, obj_len);
+        }
     }
 
     /* Pop all arguments from the stack, we do not need them anymore
@@ -724,7 +761,7 @@ static ValkeyModuleString **luaArgsToServerArgv(ValkeyModuleCtx *ctx, lua_State 
      * is not a string or an integer (lua_isstring() return true for
      * integers as well). */
     if (j != *argc) {
-        freeLuaServerArgv(ctx, lua_argv, j);
+        for (int k = 0; k < j; k++) ValkeyModule_FreeString(ctx, lua_argv[k]);
         luaPushError(lua, "ERR Command arguments must be strings or integers");
         return NULL;
     }
@@ -735,10 +772,23 @@ static ValkeyModuleString **luaArgsToServerArgv(ValkeyModuleCtx *ctx, lua_State 
 void freeLuaServerArgv(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
     int j;
     for (j = 0; j < argc; j++) {
-        ValkeyModuleString *o = argv[j];
-        ValkeyModule_FreeString(ctx, o);
+        if (j < LUA_CMD_OBJCACHE_SIZE) {
+            size_t len;
+            ValkeyModule_StringPtrLen(argv[j], &len);
+            if (len <= LUA_CMD_OBJCACHE_MAX_LEN) {
+                /* Cache this object for reuse. Retain it so FreeString from
+                 * the module context doesn't destroy it. */
+                if (lua_args_cached_objects[j])
+                    ValkeyModule_FreeString(ctx, lua_args_cached_objects[j]);
+                ValkeyModule_RetainString(ctx, argv[j]);
+                lua_args_cached_objects[j] = argv[j];
+                lua_args_cached_objects_len[j] = sdsalloc(objectGetVal(argv[j]));
+                continue;
+            }
+        }
+        ValkeyModule_FreeString(ctx, argv[j]);
     }
-    ValkeyModule_Free(argv);
+    /* Don't free argv — it's the reusable lua_argv_cache. */
 }
 
 static void luaProcessReplyError(const char *err, lua_State *lua) {
