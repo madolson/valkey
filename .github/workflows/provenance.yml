@@ -13,7 +13,7 @@ jobs:
           fetch-depth: 0
 
       - name: Run Provenance Check
-        uses: valkey-io/verify-provenance@main
+        uses: madolson/verify-provenance@main
         with:
           source_repo: "redis/redis"
           target_repo: "${{ github.repository }}"
