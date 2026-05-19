@@ -247,20 +247,33 @@ run_solo {defrag} {
             perform_defrag_test $title populate {
                 # add a mass of string keys
                 set rd [valkey_deferring_client]
-                $rd client reply off
+                set count 0
                 for {set j 0} {$j < $n} {incr j} {
                     $rd setrange $j 250 a
                     if {$j % 3 == 0} {
                         $rd expire $j 1000 ;# put expiration on some
                     }
-                    if {$j % 1000 == 999} {client_reply_off_wait_for_server $rd}
+
+                    incr count
+                    if {$count % 10000 == 0} {
+                        for {set k 0} {$k < 10000} {incr k} {
+                            $rd read ; # Discard replies
+                        }
+                    }
                 }
                 assert {[scan [regexp -inline {expires\=([\d]*)} [r info keyspace]] expires=%d] > 0}
             } fragment {
                 # delete half of the keys
+                set count 0
                 for {set j 0} {$j < $n} {incr j 2} {
                     $rd del $j
-                    if {$j % 1000 == 998} {client_reply_off_wait_for_server $rd}
+
+                    incr count
+                    if {$count % 10000 == 0} {
+                        for {set k 0} {$k < 10000} {incr k} {
+                            $rd read ; # Discard replies
+                        }
+                    }
                 }
                 $rd close
 
