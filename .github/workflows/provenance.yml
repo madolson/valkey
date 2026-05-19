@@ -1,0 +1,23 @@
+name: Verify Provenance
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Provenance Check
+        uses: valkey-io/verify-provenance@main
+        with:
+          source_repo: "redis/redis"
+          target_repo: "${{ github.repository }}"
+          branding_pairs: "Redis:Valkey"
+          prefix_pairs: "RM_:VM_,REDISMODULE_:VALKEYMODULE_"
+          exclude_dirs: "deps/"
+          github_token: "${{ secrets.GITHUB_TOKEN }}"
