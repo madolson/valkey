@@ -20,5 +20,5 @@ jobs:
           branding_pairs: "Redis:Valkey"
           prefix_pairs: "RM_:VM_,REDISMODULE_:VALKEYMODULE_"
           exclude_dirs: "deps/"
-          threshold: "0.60"
+          threshold: "0.85"
           github_token: "${{ secrets.GITHUB_TOKEN }}"
