@@ -1678,7 +1678,7 @@ jobs:
         with:
           job-name: ${{ matrix.name }}
   test-macos-latest:
-    runs-on: macos-latest
+    runs-on: macos-26
     if: |
       (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
         (github.event_name == 'schedule' && github.repository == 'valkey-io/valkey') ||
@@ -1725,7 +1725,7 @@ jobs:
         with:
           job-name: ${{ github.job }}
   test-macos-latest-sentinel:
-    runs-on: macos-latest
+    runs-on: macos-26
     if: |
       (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
         (github.event_name == 'schedule' && github.repository == 'valkey-io/valkey') ||
@@ -1769,7 +1769,7 @@ jobs:
         with:
           job-name: ${{ github.job }}
   test-macos-latest-cluster:
-    runs-on: macos-latest
+    runs-on: macos-26
     if: |
       (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
         (github.event_name == 'schedule' && github.repository == 'valkey-io/valkey') ||
