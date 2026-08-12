@@ -90,8 +90,6 @@ These come up repeatedly in review.
    Its comments are user documentation, and they are easy to leave describing the old behavior or a command spelling that no longer exists.
 1. Use assertions instead of defensive checks for states that can't be reached.
    If an invariant isn't obvious at the call site, a comment explaining why it holds is better than a check that can never fire.
-1. Check what a hot path costs before adding to it.
-   Extra validation, a metric or an allocation on a command path needs a measurement, not an argument that it should be cheap.
 
 ## Licensing information
 When creating new source code files, use the following snippet to indicate the license:
