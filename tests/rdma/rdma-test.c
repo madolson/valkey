@@ -704,8 +704,11 @@ static int valkeyRdmaCM(RdmaContext *ctx, int timeout) {
         /* printf("GET RDMA CM EVENT: %s\n", rdma_event_str(event->event)); */
         switch (event->event) {
         case RDMA_CM_EVENT_ADDR_RESOLVED:
-            if (timeout < 0 || timeout > 100)
-                timeout = 100; /* at most 100ms to resolve route */
+            /* Resolve the route within the remaining connection budget, with a
+             * 100ms floor. A hard 100ms cap is too tight on loaded CI hosts
+             * (e.g. soft-RoCE), causing spurious route-resolve timeouts. */
+            if (timeout < 100)
+                timeout = 100;
             ret = rdma_resolve_route(event->id, timeout);
             if (ret) {
                 rdmaFatal("RDMA: route resolve failed");
@@ -826,8 +829,13 @@ static RdmaContext *valkeyContextConnectRdma(const char *addr, int port, int tim
             goto free_rdma;
         }
 
-        /* resolve addr as most 100ms */
-        if (rdma_resolve_addr(ctx->cm_id, NULL, (struct sockaddr *)&saddr, 100)) {
+        /* Resolve the address within the remaining connection budget, with a
+         * 100ms floor, rather than a fixed 100ms which is too tight on loaded
+         * CI hosts (e.g. soft-RoCE) and caused spurious "resolve failed". */
+        timed = timeout - (valkeyNowMs() - start);
+        if (timed < 100)
+            timed = 100;
+        if (rdma_resolve_addr(ctx->cm_id, NULL, (struct sockaddr *)&saddr, timed)) {
             continue;
         }
 
