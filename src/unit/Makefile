@@ -137,12 +137,12 @@ $(WRAP_DIR):
 define wrap-object
 	@mkdir -p $(dir $@)
 	@if file $< | grep -q "LLVM bitcode"; then \
-		llc $< -filetype=obj -o $(WRAP_DIR)/$*_temp.o; \
-		python3 generate-redefine-syms.py $(WRAP_DIR)/$*_temp.o > $(WRAP_DIR)/$*-wrap-syms; \
-		llvm-objcopy --redefine-syms=$(WRAP_DIR)/$*-wrap-syms $(WRAP_DIR)/$*_temp.o $@; \
+		$(CC) -O2 -x ir -c $< -o $(WRAP_DIR)/$*_temp.o && \
+		python3 generate-redefine-syms.py $(WRAP_DIR)/$*_temp.o > $(WRAP_DIR)/$*-wrap-syms && \
+		llvm-objcopy --redefine-syms=$(WRAP_DIR)/$*-wrap-syms $(WRAP_DIR)/$*_temp.o $@ && \
 		rm -f $(WRAP_DIR)/$*_temp.o; \
 	else \
-		python3 generate-redefine-syms.py $< > $(WRAP_DIR)/$*-wrap-syms; \
+		python3 generate-redefine-syms.py $< > $(WRAP_DIR)/$*-wrap-syms && \
 		llvm-objcopy --redefine-syms=$(WRAP_DIR)/$*-wrap-syms $< $@; \
 	fi
 	@rm -f $(WRAP_DIR)/$*-wrap-syms
