@@ -168,20 +168,84 @@ static inline void raxStackFree(raxStack *ts) {
      ((n)->iscompr ? sizeof(raxNode *) : sizeof(raxNode *) * (n)->size) + \
      (((n)->iskey && !(n)->isnull) * sizeof(void *)))
 
+/* Bytes a non compressed node with 'children' children needs, not counting the
+ * value pointer. Must stay in sync with raxNodeCurrentLength(). */
+static inline size_t raxNodeSize(size_t children) {
+    return sizeof(raxNode) + children + raxPadding(children) + sizeof(raxNode *) * children;
+}
+
+/* Bytes a compressed node holding 'chars' characters needs, not counting the
+ * value pointer. A compressed node has a single child whatever its length. */
+static inline size_t raxComprNodeSize(size_t chars) {
+    return sizeof(raxNode) + chars + raxPadding(chars) + sizeof(raxNode *);
+}
+
+/* Ask raxNewNodeSized() for exactly the bytes the node needs. */
+#define RAX_NODE_SIZE_EXACT 0
+
 /* Allocate a new non compressed node with the specified number of children.
  * If datafield is true, the allocation is made large enough to hold the
  * associated data pointer.
+ *
+ * 'nodesize' is the number of bytes to request from the allocator, raised to the
+ * minimum a node with that layout needs, so RAX_NODE_SIZE_EXACT asks for exactly
+ * that minimum. Requesting more is useful when the caller knows the node is
+ * about to grow, since the extra room removes the following reallocation.
+ *
+ * If 'cap' is not NULL it receives the number of bytes of the new allocation
+ * that are safe to write to, for raxResizeNode() to use later.
  * Returns the new node pointer. On out of memory NULL is returned. */
-raxNode *raxNewNode(size_t children, int datafield) {
-    size_t nodesize = sizeof(raxNode) + children + raxPadding(children) + sizeof(raxNode *) * children;
-    if (datafield) nodesize += sizeof(void *);
+static raxNode *raxNewNodeSized(size_t children, int datafield, size_t nodesize, size_t *cap) {
+    size_t minsize = raxNodeSize(children);
+    if (datafield) minsize += sizeof(void *);
+    if (nodesize < minsize) nodesize = minsize;
     raxNode *node = rax_malloc(nodesize);
     if (node == NULL) return NULL;
     node->iskey = 0;
     node->isnull = 0;
     node->iscompr = 0;
     node->size = children;
+    if (cap) *cap = rax_ptr_usable_size(node);
     return node;
+}
+
+/* Make sure node 'n' has room for at least 'newsize' bytes, where '*cap' is the
+ * room it currently has and is updated if the node is reallocated.
+ *
+ * Allocators round small allocations up to a size class, so the node often
+ * already has the room needed and the reallocation - which for a growing small
+ * allocation means malloc + copy + free - can be skipped. The node content is
+ * never moved when this happens, so callers must use the returned pointer
+ * exactly as they would use the result of a realloc().
+ *
+ * '*cap' must come from rax_ptr_usable_size() and never from
+ * rax_ptr_alloc_size(), which counts bytes that are not writable.
+ * Returns NULL on out of memory, leaving 'n' untouched. */
+static inline raxNode *raxResizeNode(raxNode *n, size_t newsize, size_t *cap) {
+    if (newsize <= *cap) return n;
+    raxNode *newn = rax_realloc(n, newsize);
+    if (newn != NULL) *cap = rax_ptr_usable_size(newn);
+    return newn;
+}
+
+/* Number of bytes to allocate for the node that will represent the remaining
+ * 'rem' characters of the key being inserted, that is, the node
+ * raxAddChild()/raxCompressNode() is about to create as their new child. The
+ * node is created empty and then immediately turned into a compressed node, a
+ * single child node, or a key holding node: allocating the final size right
+ * away removes that reallocation. */
+static inline size_t raxSuffixNodeSize(size_t rem, int hasdata) {
+    if (rem == 0) {
+        /* The child is the node holding the value of the inserted key. */
+        return sizeof(raxNode) + raxPadding(0) + (hasdata ? sizeof(void *) : 0);
+    }
+    if (rem == 1) {
+        /* A single character left: the child gets one non compressed child. */
+        return raxNodeSize(1);
+    }
+    /* More characters left: the child becomes a compressed node. */
+    size_t comprsize = rem > RAX_NODE_MAX_SIZE ? RAX_NODE_MAX_SIZE : rem;
+    return raxComprNodeSize(comprsize);
 }
 
 /* Allocate a new rax and return its pointer. On out of memory the function
@@ -191,7 +255,7 @@ rax *raxNew(void) {
     if (rax == NULL) return NULL;
     rax->numele = 0;
     rax->numnodes = 1;
-    rax->head = raxNewNode(0, 0);
+    rax->head = raxNewNodeSized(0, 0, RAX_NODE_SIZE_EXACT, NULL);
     rax->alloc_size = rax_ptr_alloc_size(rax) + rax_ptr_alloc_size(rax->head);
     if (rax->head == NULL) {
         rax_free(rax);
@@ -203,10 +267,10 @@ rax *raxNew(void) {
 
 /* realloc the node to make room for auxiliary data in order
  * to store an item in that node. On out of memory NULL is returned. */
-raxNode *raxReallocForData(raxNode *n, void *data) {
+raxNode *raxReallocForData(raxNode *n, void *data, size_t *cap) {
     if (data == NULL) return n; /* No reallocation needed, setting isnull=1 */
     size_t curlen = raxNodeCurrentLength(n);
-    return rax_realloc(n, curlen + sizeof(void *));
+    return raxResizeNode(n, curlen + sizeof(void *), cap);
 }
 
 /* Set the node auxiliary data to the specified pointer. */
@@ -236,10 +300,20 @@ void *raxGetData(raxNode *n) {
  * the new child was stored, which is useful for the caller to replace the
  * child pointer if it gets reallocated.
  *
+ * 'childsize' is the number of bytes to allocate for the new child, see
+ * raxNewNodeSized(): the caller knows the shape the child is about to be
+ * turned into, so the child can be allocated at its final size.
+ *
  * On success the new parent node pointer is returned (it may change because
  * of the realloc, so the caller should discard 'n' and use the new value).
  * On out of memory NULL is returned, and the old node is still valid. */
-raxNode *raxAddChild(raxNode *n, unsigned char c, raxNode **childptr, raxNode ***parentlink) {
+raxNode *raxAddChild(raxNode *n,
+                     unsigned char c,
+                     raxNode **childptr,
+                     raxNode ***parentlink,
+                     size_t childsize,
+                     size_t *cap,
+                     size_t *childcap) {
     assert(n->iscompr == 0);
 
     size_t curlen = raxNodeCurrentLength(n);
@@ -249,11 +323,12 @@ raxNode *raxAddChild(raxNode *n, unsigned char c, raxNode **childptr, raxNode **
                   success at the end. */
 
     /* Alloc the new child we will link to 'n'. */
-    raxNode *child = raxNewNode(0, 0);
+    raxNode *child = raxNewNodeSized(0, 0, childsize, childcap);
     if (child == NULL) return NULL;
 
-    /* Make space in the original node. */
-    raxNode *newn = rax_realloc(n, newlen);
+    /* Make space in the original node, reusing the allocation if it is already
+     * large enough. */
+    raxNode *newn = raxResizeNode(n, newlen, cap);
     if (newn == NULL) {
         rax_free(child);
         return NULL;
@@ -289,7 +364,7 @@ raxNode *raxAddChild(raxNode *n, unsigned char c, raxNode **childptr, raxNode **
      * a child "c" in our case pos will be = 2 after the end of the following
      * loop. */
     int pos;
-    for (pos = 0; pos < n->size; pos++) {
+    for (pos = 0; pos < (int)n->size; pos++) {
         if (n->data[pos] > c) break;
     }
 
@@ -377,8 +452,17 @@ raxNode *raxAddChild(raxNode *n, unsigned char c, raxNode **childptr, raxNode **
  *
  * The function also returns a child node, since the last node of the
  * compressed chain cannot be part of the chain: it has zero children while
- * we can only compress inner nodes with exactly one child each. */
-raxNode *raxCompressNode(raxNode *n, unsigned char *s, size_t len, raxNode **child) {
+ * we can only compress inner nodes with exactly one child each.
+ *
+ * 'childsize' is the number of bytes to allocate for that child, see
+ * raxNewNodeSized(). */
+raxNode *raxCompressNode(raxNode *n,
+                         unsigned char *s,
+                         size_t len,
+                         raxNode **child,
+                         size_t childsize,
+                         size_t *cap,
+                         size_t *childcap) {
     assert(n->size == 0 && n->iscompr == 0);
     void *data = NULL; /* Initialized only to avoid warnings. */
     size_t newsize;
@@ -386,16 +470,16 @@ raxNode *raxCompressNode(raxNode *n, unsigned char *s, size_t len, raxNode **chi
     debugf("Compress node: %.*s\n", (int)len, s);
 
     /* Allocate the child to link to this node. */
-    *child = raxNewNode(0, 0);
+    *child = raxNewNodeSized(0, 0, childsize, childcap);
     if (*child == NULL) return NULL;
 
     /* Make space in the parent node. */
-    newsize = sizeof(raxNode) + len + raxPadding(len) + sizeof(raxNode *);
+    newsize = raxComprNodeSize(len);
     if (n->iskey) {
         data = raxGetData(n); /* To restore it later. */
         if (!n->isnull) newsize += sizeof(void *);
     }
-    raxNode *newn = rax_realloc(n, newsize);
+    raxNode *newn = raxResizeNode(n, newsize, cap);
     if (newn == NULL) {
         rax_free(*child);
         return NULL;
@@ -513,8 +597,8 @@ int raxGenericInsert(rax *rax, unsigned char *s, size_t len, void *data, void **
         debugf("### Insert: node representing key exists\n");
         /* Make space for the value pointer if needed. */
         if (!h->iskey || (h->isnull && overwrite)) {
-            size_t oldalloc = rax_ptr_alloc_size(h);
-            h = raxReallocForData(h, data);
+            size_t oldalloc = rax_ptr_alloc_size(h), hcap = rax_ptr_usable_size(h);
+            h = raxReallocForData(h, data, &hcap);
             if (h) {
                 memcpy(parentlink, &h, sizeof(h));
                 rax->alloc_size = rax->alloc_size - oldalloc + rax_ptr_alloc_size(h);
@@ -688,8 +772,14 @@ int raxGenericInsert(rax *rax, unsigned char *s, size_t len, void *data, void **
         size_t nodesize;
 
         /* 2: Create the split node. Also allocate the other nodes we'll need
-         *    ASAP, so that it will be simpler to handle OOM. */
-        raxNode *splitnode = raxNewNode(1, split_node_is_key);
+         *    ASAP, so that it will be simpler to handle OOM.
+         *    The split node always gets a second child right away (the
+         *    mismatching character of the key being inserted), so allocate the
+         *    room for it now and let raxAddChild() reuse the allocation. */
+        size_t splitsize = sizeof(raxNode) + 2 + raxPadding(2) + sizeof(raxNode *) * 2;
+        if (split_node_is_key) splitsize += sizeof(void *);
+        size_t splitalloc = 0;
+        raxNode *splitnode = raxNewNodeSized(1, split_node_is_key, splitsize, &splitalloc);
         raxNode *trimmed = NULL;
         raxNode *postfix = NULL;
 
@@ -713,7 +803,7 @@ int raxGenericInsert(rax *rax, unsigned char *s, size_t len, void *data, void **
             return 0;
         }
         splitnode->data[0] = h->data[j];
-        rax->alloc_size += rax_ptr_alloc_size(splitnode);
+        rax->alloc_size += splitalloc;
 
         if (j == 0) {
             /* 3a: Replace the old node with the split node. */
@@ -835,9 +925,10 @@ int raxGenericInsert(rax *rax, unsigned char *s, size_t len, void *data, void **
 
     /* We walked the radix tree as far as we could, but still there are left
      * chars in our string. We need to insert the missing nodes. */
+    size_t hcap = rax_ptr_usable_size(h);
     while (i < len) {
         raxNode *child;
-        size_t oldalloc = rax_ptr_alloc_size(h);
+        size_t childcap, oldalloc = rax_ptr_alloc_size(h);
 
         /* If this node is going to have a single child, and there
          * are other characters, so that that would result in a chain
@@ -846,7 +937,8 @@ int raxGenericInsert(rax *rax, unsigned char *s, size_t len, void *data, void **
             debugf("Inserting compressed node\n");
             size_t comprsize = len - i;
             if (comprsize > RAX_NODE_MAX_SIZE) comprsize = RAX_NODE_MAX_SIZE;
-            raxNode *newh = raxCompressNode(h, s + i, comprsize, &child);
+            raxNode *newh = raxCompressNode(h, s + i, comprsize, &child,
+                                            raxSuffixNodeSize(len - i - comprsize, data != NULL), &hcap, &childcap);
             if (newh == NULL) goto oom;
             h = newh;
             memcpy(parentlink, &h, sizeof(h));
@@ -855,7 +947,8 @@ int raxGenericInsert(rax *rax, unsigned char *s, size_t len, void *data, void **
         } else {
             debugf("Inserting normal node\n");
             raxNode **new_parentlink;
-            raxNode *newh = raxAddChild(h, s[i], &child, &new_parentlink);
+            raxNode *newh = raxAddChild(h, s[i], &child, &new_parentlink,
+                                        raxSuffixNodeSize(len - i - 1, data != NULL), &hcap, &childcap);
             if (newh == NULL) goto oom;
             h = newh;
             memcpy(parentlink, &h, sizeof(h));
@@ -864,10 +957,13 @@ int raxGenericInsert(rax *rax, unsigned char *s, size_t len, void *data, void **
         }
         rax->numnodes++;
         rax->alloc_size = rax->alloc_size - oldalloc + rax_ptr_alloc_size(h) + rax_ptr_alloc_size(child);
+        /* The child is the 'h' of the next iteration: carry its capacity over
+         * instead of asking the allocator for it again. */
         h = child;
+        hcap = childcap;
     }
     size_t oldalloc = rax_ptr_alloc_size(h);
-    raxNode *newh = raxReallocForData(h, data);
+    raxNode *newh = raxReallocForData(h, data, &hcap);
     if (newh == NULL) goto oom;
     h = newh;
     if (!h->iskey) rax->numele++;
