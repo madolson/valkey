@@ -1551,6 +1551,14 @@ test "Dual channel replication buffer memory fields" {
             $replica config set dual-channel-replication-enabled yes
             $replica config set loading-process-events-interval-bytes 1024
             $replica config set client-output-buffer-limit "replica 0 0 0"
+            # rdb-key-save-delay keeps the RDB channel busy for the whole test, and the
+            # rdb child buffers its output until it has a full PROTO_IOBUF_LEN chunk, so
+            # the replica receives no RDB payload at all here. repl_transfer_lastio is
+            # only refreshed by RDB channel reads, so the default 60s repl-timeout puts a
+            # hard deadline on this whole test body: once it expires the replica aborts
+            # the sync and frees the very buffer that is being measured, and the retry
+            # has no incremental stream left to buffer. Give it plenty of room.
+            $replica config set repl-timeout 3600
 
             $replica replicaof $primary_host $primary_port
 
@@ -1572,9 +1580,20 @@ test "Dual channel replication buffer memory fields" {
             }
 
             # Waiting for data to be transferred from the primary to the replica.
+            # Wait on replicas_repl_buffer_size, not on mem_total_replication_buffers.
+            # replicas_repl_buffer_size counts the payload bytes of the pending buffer,
+            # while mem_replicas_repl_buffer (and therefore mem_total_replication_buffers)
+            # also counts per-block bookkeeping, so it crosses 40MB about 0.2% of the
+            # buffer earlier. Gating on the larger value lets the loop exit in a window
+            # where the assertions below on replicas_repl_buffer_size and
+            # replicas_repl_buffer_peak are still just short of 40MB. Both the primary
+            # value (only shrinks, as the replica consumes the stream) and the replica
+            # value (only grows, until the sync ends) move monotonically here, so once
+            # the smallest asserted value clears the threshold every assertion below is
+            # satisfied too.
             wait_for_condition 1000 50 {
                [s $primary_srv_id mem_total_replication_buffers] < [expr 1024000 * 10] &&
-               [s $replica_srv_id mem_total_replication_buffers] > [expr 1024000 * 40]
+               [s $replica_srv_id replicas_repl_buffer_size] >= [expr 1024000 * 40]
             } else {
                 fail "replica didn't receive the data in time"
             }
