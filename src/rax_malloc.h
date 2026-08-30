@@ -41,5 +41,11 @@
 #define rax_malloc zmalloc
 #define rax_realloc zrealloc
 #define rax_free zfree
+/* Bytes the allocation is accounted for, used to maintain rax->alloc_size. */
 #define rax_ptr_alloc_size zmalloc_size
+/* Bytes of the allocation that are actually safe to write to. This is NOT the
+ * same as rax_ptr_alloc_size(): without HAVE_MALLOC_SIZE the accounted size
+ * includes zmalloc's own header, so using it as a capacity would overrun the
+ * block. Only ever use this one to decide whether a node has to grow. */
+#define rax_ptr_usable_size zmalloc_usable_size
 #endif
