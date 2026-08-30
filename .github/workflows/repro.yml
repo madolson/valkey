@@ -1,0 +1,170 @@
+name: Repro Harness
+# Targeted flaky-test reproduction harness (fork-only tooling, not for upstream).
+# Runs one test file under a chosen build config N times in parallel to measure a failure rate.
+on:
+  workflow_dispatch:
+    inputs:
+      test_ref:
+        description: "git ref of madolson/valkey to build/test"
+        default: "unstable"
+      test_file:
+        description: "runtest --single argument, e.g. unit/cluster/misc (space separated for multiple)"
+        required: true
+      build:
+        description: "build config"
+        type: choice
+        default: valgrind
+        options:
+          - valgrind
+          - valgrind-nomus
+          - asan-gcc
+          - asan-clang
+          - ubsan-gcc
+          - ubsan-clang
+          - fortify
+          - libc-malloc
+          - no-malloc-usable-size
+          - jemalloc
+          - defrag
+          - io-threads
+          - tls
+      attempts:
+        description: "number of parallel attempts (1-30)"
+        default: "10"
+      loops:
+        description: "sequential repetitions of the test inside each attempt"
+        default: "1"
+      extra_args:
+        description: "extra runtest args (e.g. --accurate, --loops 5)"
+        default: ""
+      runner:
+        description: "runner label"
+        default: "ubuntu-latest"
+
+concurrency:
+  group: repro-${{ github.event.inputs.test_file }}-${{ github.event.inputs.build }}-${{ github.run_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+    steps:
+      - id: gen
+        run: |
+          n=${{ github.event.inputs.attempts }}
+          if [ "$n" -lt 1 ] || [ "$n" -gt 30 ]; then echo "attempts must be 1-30"; exit 1; fi
+          echo "matrix=$(seq 1 $n | jq -cRs 'split("\n")|map(select(length>0))')" >> $GITHUB_OUTPUT
+
+  repro:
+    needs: plan
+    runs-on: ${{ github.event.inputs.runner }}
+    timeout-minutes: 720
+    strategy:
+      fail-fast: false
+      matrix:
+        attempt: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: madolson/valkey
+          ref: ${{ github.event.inputs.test_ref }}
+
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tcl8.6 tclx pkg-config libgtest-dev libgmock-dev
+          case "${{ github.event.inputs.build }}" in
+            valgrind|valgrind-nomus) sudo apt-get install -y valgrind ;;
+            tls) sudo apt-get install -y tcl-tls ;;
+          esac
+
+      - name: Build
+        run: |
+          case "${{ github.event.inputs.build }}" in
+            valgrind)       make -j4 valgrind SERVER_CFLAGS='-Werror' ;;
+            valgrind-nomus) make -j4 valgrind CFLAGS="-DNO_MALLOC_USABLE_SIZE" SERVER_CFLAGS='-Werror' ;;
+            asan-gcc)       make -j4 CC=gcc   OPT=-O3 SANITIZER=address SERVER_CFLAGS='-Werror' ;;
+            asan-clang)     make -j4 CC=clang OPT=-O3 SANITIZER=address SERVER_CFLAGS='-Werror' ;;
+            ubsan-gcc)      make -j4 CC=gcc   OPT=-O3 SANITIZER=undefined SERVER_CFLAGS='-Werror' LUA_DEBUG=yes ;;
+            ubsan-clang)    make -j4 CC=clang OPT=-O3 SANITIZER=undefined SERVER_CFLAGS='-Werror' LUA_DEBUG=yes ;;
+            fortify)        make -j4 CC=gcc OPT=-O3 SERVER_CFLAGS='-Werror -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=3' ;;
+            libc-malloc)    make -j4 MALLOC=libc SERVER_CFLAGS='-Werror' ;;
+            no-malloc-usable-size) make -j4 MALLOC=libc CFLAGS=-DNO_MALLOC_USABLE_SIZE SERVER_CFLAGS='-Werror' ;;
+            jemalloc)       make -j4 SERVER_CFLAGS='-Werror' ;;
+            defrag)         make -j4 OPT=-O3 SANITIZER=address DEBUG_FORCE_DEFRAG=yes USE_JEMALLOC=no SERVER_CFLAGS='-Werror' ;;
+            io-threads)     make -j4 SERVER_CFLAGS='-Werror' ;;
+            tls)            make -j4 BUILD_TLS=yes SERVER_CFLAGS='-Werror' ;;
+          esac
+
+      - name: TLS certs
+        if: github.event_name && github.event.inputs.build == 'tls'
+        run: ./utils/gen-test-certs.sh
+
+      - name: Run
+        run: |
+          set -o pipefail
+          singles=()
+          for t in ${{ github.event.inputs.test_file }}; do singles+=(--single "$t"); done
+
+          base=(--failures-output test-failures/valkey-${{ matrix.attempt }}.json --verbose --dump-logs)
+          case "${{ github.event.inputs.build }}" in
+            valgrind|valgrind-nomus) base+=(--valgrind --no-latency --clients 1 --timeout 2400) ;;
+            io-threads) base+=(--io-threads) ;;
+            tls) base+=(--tls) ;;
+          esac
+
+          rc=0
+          for i in $(seq 1 ${{ github.event.inputs.loops }}); do
+            echo "::group::attempt ${{ matrix.attempt }} loop $i"
+            if ! ./runtest "${singles[@]}" "${base[@]}" ${{ github.event.inputs.extra_args }}; then
+              echo "LOOP $i FAILED"
+              rc=1
+            fi
+            echo "::endgroup::"
+          done
+          exit $rc
+
+      - name: Upload failures
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: repro-failures-${{ matrix.attempt }}
+          path: |
+            test-failures/
+            tests/tmp/**/*.log
+            tests/tmp/**/stdout
+            tests/tmp/**/stderr
+          if-no-files-found: ignore
+
+  summary:
+    needs: repro
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        with:
+          script: |
+            const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, {
+              owner: context.repo.owner, repo: context.repo.repo, run_id: context.runId,
+            });
+            const attempts = jobs.filter(j => j.name.startsWith('repro'));
+            const failed = attempts.filter(j => j.conclusion === 'failure');
+            const body = [
+              `**Repro summary**`,
+              `- test: \`${process.env.TEST_FILE}\``,
+              `- build: \`${process.env.BUILD}\``,
+              `- ref: \`${process.env.REF}\``,
+              `- attempts: ${attempts.length}, failures: ${failed.length}`,
+              `- rate: ${attempts.length ? (100*failed.length/attempts.length).toFixed(0) : 0}%`,
+            ].join('\n');
+            core.summary.addRaw(body).write();
+            console.log(body);
+        env:
+          TEST_FILE: ${{ github.event.inputs.test_file }}
+          BUILD: ${{ github.event.inputs.build }}
+          REF: ${{ github.event.inputs.test_ref }}
