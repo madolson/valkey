@@ -63,10 +63,12 @@ start_cluster 1 1 {tags {external:skip cluster}} {
             set remaining [R 0 pttl $watched_key]
             if {$remaining > 0} break
 
-            # This tier lost the race. PTTL found the key already expired, and looking it up lazily
-            # deleted it and signalled it as modified, which dirtied this client's CAS. Clear that
-            # before re-arming, or a later winning tier would inherit the dirty flag and EXEC would
-            # abort for the wrong reason, leaving the test green without exercising anything.
+            # This tier lost the race, and the client is now watching a key that no longer exists:
+            # PTTL's lookup lazily deleted the already-expired key. That deletion does not dirty the
+            # CAS, but it does clear the watch entry's expired flag (src/multi.c:481-490), so the next
+            # tier's SET re-creates a key this client still watches and that dirties the CAS. Drop the
+            # watch before re-arming, or a winning tier would inherit the dirty flag, EXEC would abort
+            # for the wrong reason, and the test would pass without exercising anything.
             R 0 unwatch
         }
         assert_morethan $remaining 0 "the WATCHed key expired before WATCH ran, even with a ${ttl}ms TTL"
