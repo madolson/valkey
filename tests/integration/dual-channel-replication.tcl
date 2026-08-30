@@ -841,6 +841,14 @@ start_server {tags {"dual-channel-replication external:skip"}} {
                 fail "Primary should abort sync"
             }
         }
+        # If the test above failed before its own resume_process, the primary is still armed with
+        # pause-after-fork and will stop itself whenever the fork finally lands, which would block the
+        # commands below forever: the test client has no read timeout. SIGCONT never blocks and is
+        # harmless on a running process, so resume first, then disarm, then resume again in case the
+        # fork landed in between. All three are no-ops on the passing path.
+        resume_process [srv -1 pid]
+        $primary debug pause-after-fork 0
+        resume_process [srv -1 pid]
         stop_write_load $load_handle0
         stop_write_load $load_handle1
         stop_write_load $load_handle2
