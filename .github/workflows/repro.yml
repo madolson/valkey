@@ -28,6 +28,7 @@ on:
           - defrag
           - io-threads
           - tls
+          - cmake-tls
       attempts:
         description: "number of parallel attempts (1-30)"
         default: "10"
@@ -81,6 +82,7 @@ jobs:
           case "${{ github.event.inputs.build }}" in
             valgrind|valgrind-nomus) sudo apt-get install -y valgrind ;;
             tls) sudo apt-get install -y tcl-tls ;;
+            cmake-tls) sudo apt-get install -y tcl-tls cmake libssl-dev ;;
           esac
 
       - name: Build
@@ -99,10 +101,14 @@ jobs:
             defrag)         make -j4 OPT=-O3 SANITIZER=address DEBUG_FORCE_DEFRAG=yes USE_JEMALLOC=no SERVER_CFLAGS='-Werror' ;;
             io-threads)     make -j4 SERVER_CFLAGS='-Werror' ;;
             tls)            make -j4 BUILD_TLS=yes SERVER_CFLAGS='-Werror' ;;
+            # Mirrors ci.yml's test-ubuntu-latest-cmake-tls job exactly.
+            cmake-tls)      mkdir -p build-release && cd build-release &&
+                            cmake -DCMAKE_BUILD_TYPE=Release .. -DBUILD_TLS=yes -DBUILD_UNIT_GTESTS=yes &&
+                            make -j$(nproc) ;;
           esac
 
       - name: TLS certs
-        if: github.event_name && github.event.inputs.build == 'tls'
+        if: contains(github.event.inputs.build, 'tls')
         run: ./utils/gen-test-certs.sh
 
       - name: Run
@@ -115,13 +121,16 @@ jobs:
           case "${{ github.event.inputs.build }}" in
             valgrind|valgrind-nomus) base+=(--valgrind --no-latency --clients 1 --timeout 2400) ;;
             io-threads) base+=(--io-threads) ;;
-            tls) base+=(--tls) ;;
+            tls|cmake-tls) base+=(--tls) ;;
           esac
+
+          RUNTEST=./runtest
+          if [ "${{ github.event.inputs.build }}" = "cmake-tls" ]; then RUNTEST=./build-release/runtest; fi
 
           rc=0
           for i in $(seq 1 ${{ github.event.inputs.loops }}); do
             echo "::group::attempt ${{ matrix.attempt }} loop $i"
-            if ! ./runtest "${singles[@]}" "${base[@]}" ${{ github.event.inputs.extra_args }}; then
+            if ! $RUNTEST "${singles[@]}" "${base[@]}" ${{ github.event.inputs.extra_args }}; then
               echo "LOOP $i FAILED"
               rc=1
             fi
