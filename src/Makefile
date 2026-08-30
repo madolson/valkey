@@ -801,11 +801,11 @@ test: $(ALL_BUILD_PREREQUISITES)
 	@(cd ..; VALKEY_PROG_SUFFIX="$(PROG_SUFFIX)" ./runtest)
 
 test-unit: $(ENGINE_LIB_NAME)
-	@(cd unit && $(MAKE) test-unit)
+	@(cd unit && $(MAKE) test-unit ENGINE_SERVER_OBJ="$(ENGINE_SERVER_OBJ)")
 
 # valkey-unit-gtests
 $(ENGINE_UNIT_GTESTS): $(ENGINE_LIB_NAME)
-	@(cd unit && $(MAKE) $(ENGINE_UNIT_GTESTS))
+	@(cd unit && $(MAKE) $(ENGINE_UNIT_GTESTS) ENGINE_SERVER_OBJ="$(ENGINE_SERVER_OBJ)")
 
 test-modules: $(SERVER_NAME)
 	@(cd ..; ./runtest-moduleapi)
