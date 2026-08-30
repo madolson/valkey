@@ -48,13 +48,28 @@ start_cluster 1 1 {tags {external:skip cluster}} {
         assert {[R 0 cluster keyslot $watched_key] != [R 0 cluster keyslot $transaction_key]}
 
         # The TTL is set before WATCH, and the key is still in the keyspace once it elapses, so nothing but
-        # the key having expired can abort the transaction.
+        # the key having expired can abort the transaction. Re-arming the TTL after WATCH is not an option:
+        # EXPIRE and SET signal the key as modified, which would abort EXEC for the wrong reason.
         R 0 debug set-active-expire 0
         R 0 del $transaction_key
-        R 0 set $watched_key alive px 50
-        R 0 watch $watched_key
+
+        # The key must still be alive when WATCH runs, otherwise the server remembers it as already expired
+        # and deliberately lets EXEC commit. A round trip can take tens of milliseconds under valgrind, so
+        # start with a short TTL and retry with a longer one until PTTL confirms the key outlived WATCH.
+        # PTTL is a safe probe: it never signals the key as modified, and it does not delete it while alive.
+        foreach ttl {100 500 2500} {
+            R 0 unwatch
+            R 0 set $watched_key alive px $ttl
+            R 0 watch $watched_key
+            set remaining [R 0 pttl $watched_key]
+            if {$remaining > 0} break
+        }
+        assert_morethan $remaining 0 "the WATCHed key expired before WATCH ran, even with a ${ttl}ms TTL"
+
+        # Wait for the TTL to elapse. The key stays in the keyspace because active expiry is off and no
+        # command reads it in the meantime.
         set keys_before [R 0 dbsize]
-        after 100
+        after [expr {$remaining + 50}]
         assert_equal $keys_before [R 0 dbsize]
 
         R 0 multi
@@ -62,7 +77,7 @@ start_cluster 1 1 {tags {external:skip cluster}} {
         set reply [R 0 exec]
         R 0 debug set-active-expire 1
 
-        assert_equal {} $reply
+        assert_equal {} $reply "EXEC committed even though the WATCHed key expired after WATCH"
         assert_equal 0 [R 0 exists $transaction_key]
     }
 
