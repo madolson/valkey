@@ -409,6 +409,18 @@ proc test_server_cron {} {
                     set test_name $tn
                 }
                 set test_name [string trim $test_name]
+                # Some client states carry a pid or a socket handle instead of a test name, e.g.
+                # "(SPAWNED SERVER) pid:123" or "ASSIGNED: sock12 (unit/type/list)". Those
+                # identifiers differ on every run, so reduce them to the part that is stable:
+                # the state itself, or the unit that was assigned. A sleeping client is not the
+                # one that hung, so it is not reported at all.
+                if {[regexp {^pid:\d+$} $test_name]} {
+                    regexp {^\(([^)]*)\)} $task -> test_name
+                } elseif {[regexp {^ASSIGNED:\s+\S+\s+(.*)$} $task -> assigned]} {
+                    set test_name "assigned $assigned"
+                } elseif {[string match "SLEEPING,*" $task]} {
+                    set test_name ""
+                }
                 if {[string length $test_name]} {
                     set file {}
                     if {[info exist ::active_clients_file($fd)]} {
@@ -501,6 +513,12 @@ proc read_from_test_client fd {
         }
     } elseif {$status eq {exception}} {
         puts "\[[colorstr red $status]\]: $data"
+        # Exceptions are raised outside test bodies, e.g. by an assertion in a start_server setup
+        # block, so they never reach the {err} branch above and were never added to ::failed_tests.
+        # Without recording one here the job fails while --failures-output reports an empty list,
+        # and the failure is invisible to the test failure detector.
+        lappend ::failed_tests [format_exception_failure $data]
+        incr ::err_count
         if {[catch {write_test_failures} err]} {
             puts "Warning: Failed to write test failures: $err"
         }
@@ -629,6 +647,37 @@ proc print_test_summary {} {
     puts "\nTest Summary: [colorstr bold-green $::ok_count] passed, [colorstr bold-red $::err_count] failed"
 }
 
+# Reduce an exception report to a single line that write_test_failures can attribute to a test file.
+# The report is a summary line followed by a stack trace, innermost frame first. Frames in
+# tests/support are harness plumbing, so prefer the innermost frame outside it. Two trace formats
+# reach us, matching the two branches in test_client_main: the pretty one from stacktrace.tcl
+# ("at tests/x.tcl:12") and raw ::errorInfo for builtin errors ('(file "tests/x.tcl" line 12)').
+# The trace is flattened because write_test_failures parses one line per failure.
+proc format_exception_failure {data} {
+    set lines [split $data "\n"]
+    set summary [string trim [lindex $lines 0]]
+
+    set test_file "unknown"
+    foreach line $lines {
+        if {![regexp {(tests/\S+\.tcl):\d+} $line -> candidate] &&
+            ![regexp {\(file "[^"]*?(tests/\S+\.tcl)" line \d+\)} $line -> candidate]} continue
+        if {![string match "tests/support/*" $candidate]} {
+            set test_file $candidate
+            break
+        } elseif {$test_file eq "unknown"} {
+            set test_file $candidate
+        }
+    }
+
+    set trace {}
+    foreach line [lrange $lines 1 end] {
+        set line [string trim $line]
+        if {$line ne ""} {lappend trace $line}
+    }
+
+    return "\[exception\]: $summary in $test_file [join $trace {; }]"
+}
+
 proc write_test_failures {} {
     if {$::failures_output_file eq ""} {
         return
@@ -636,7 +685,10 @@ proc write_test_failures {} {
 
     set failures {}
     foreach failed $::failed_tests {
-        if {[string match {*\[*TIMEOUT*\]*} $failed]} continue
+        # A timeout names a test and a file just like an ordinary failure, so it is reported as one.
+        # The classes below are still dropped because they carry no stable test identity: their text
+        # is a raw tool report (valgrind/sanitizer), an executable path, or contains a pid, so every
+        # occurrence would look like a distinct failure to the detector and open a fresh issue.
         if {[string match {*Sanitizer error*} $failed]} continue
         if {[string match {*Valgrind error*} $failed]} continue
         if {[string match {*Can't start*} $failed]} continue
@@ -650,7 +702,11 @@ proc write_test_failures {} {
         if {[regexp {\[(\w+)\]:\s*(.+?)\s+in\s+(tests/\S+\.tcl)\s*(.*)} $failed -> status test_name test_file error_msg]} {
             # Successfully parsed
         } else {
-            set test_name $failed
+            # No usable location. Keep the leading status token if there is one, so the entry is
+            # still classifiable rather than silently reported as an ordinary "err".
+            if {![regexp {^\[(\w+)\]:\s*(.+)} $failed -> status test_name]} {
+                set test_name $failed
+            }
             set test_file "unknown"
             set error_msg $failed
         }
