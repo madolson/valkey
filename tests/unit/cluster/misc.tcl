@@ -56,13 +56,18 @@ start_cluster 1 1 {tags {external:skip cluster}} {
         # The key must still be alive when WATCH runs, otherwise the server remembers it as already expired
         # and deliberately lets EXEC commit. A round trip can take tens of milliseconds under valgrind, so
         # start with a short TTL and retry with a longer one until PTTL confirms the key outlived WATCH.
-        # PTTL is a safe probe: it never signals the key as modified, and it does not delete it while alive.
+        # PTTL cannot abort EXEC in the case we keep, because it does not touch a key that is still alive.
         foreach ttl {100 500 2500} {
-            R 0 unwatch
             R 0 set $watched_key alive px $ttl
             R 0 watch $watched_key
             set remaining [R 0 pttl $watched_key]
             if {$remaining > 0} break
+
+            # This tier lost the race. PTTL found the key already expired, and looking it up lazily
+            # deleted it and signalled it as modified, which dirtied this client's CAS. Clear that
+            # before re-arming, or a later winning tier would inherit the dirty flag and EXEC would
+            # abort for the wrong reason, leaving the test green without exercising anything.
+            R 0 unwatch
         }
         assert_morethan $remaining 0 "the WATCHed key expired before WATCH ran, even with a ${ttl}ms TTL"
 
