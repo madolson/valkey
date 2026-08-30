@@ -1575,9 +1575,12 @@ test "Dual channel replication buffer memory fields" {
             # Added some data to primary, the replica will cache it in its local buffer.
             # Here we will use 50MB memory.
             set bigstr [string repeat x 1024000]
+            set t_writes_start [clock milliseconds]
             for {set j 0} {$j < 50} {incr j} {
                 $primary set key $bigstr
             }
+            set t_writes_end [clock milliseconds]
+            set write_ms [expr {$t_writes_end - $t_writes_start}]
 
             # Waiting for data to be transferred from the primary to the replica.
             # Wait on replicas_repl_buffer_size, not on mem_total_replication_buffers.
@@ -1591,12 +1594,30 @@ test "Dual channel replication buffer memory fields" {
             # value (only grows, until the sync ends) move monotonically here, so once
             # the smallest asserted value clears the threshold every assertion below is
             # satisfied too.
-            wait_for_condition 1000 50 {
-               [s $primary_srv_id mem_total_replication_buffers] < [expr 1024000 * 10] &&
-               [s $replica_srv_id replicas_repl_buffer_size] >= [expr 1024000 * 40]
-            } else {
-                fail "replica didn't receive the data in time"
+            set trace {}
+            set met 0
+            for {set i 0} {$i < 1000} {incr i} {
+                set pinfo [$primary info]
+                set rinfo [$replica info]
+                set p_tot [getInfoProperty $pinfo mem_total_replication_buffers]
+                set p_out [getInfoProperty $pinfo total_net_repl_output_bytes]
+                set r_tot [getInfoProperty $rinfo mem_total_replication_buffers]
+                set r_len [getInfoProperty $rinfo replicas_repl_buffer_size]
+                set r_sip [getInfoProperty $rinfo master_sync_in_progress]
+                set r_lnk [getInfoProperty $rinfo master_link_status]
+                lappend trace "$i@[expr {[clock milliseconds] - $t_writes_end}] p=$p_tot out=$p_out r=$r_tot l=$r_len s=$r_sip/$r_lnk"
+                if {$p_tot < [expr 1024000 * 10] && $r_len >= [expr 1024000 * 40]} { set met 1; break }
+                after 50
             }
+            if {!$met} {
+                set n [llength $trace]
+                set sampled {}
+                for {set k 0} {$k < $n} {incr k} {
+                    if {$k % 20 == 0 || $k >= $n - 5} { lappend sampled [lindex $trace $k] }
+                }
+                fail "replica didn't receive the data in time | write_ms=$write_ms | primary_replicas=[$primary client list type replica] | TRACE [join $sampled { || }]"
+            }
+            set probe_met_at [lindex $trace end]
 
             # Primary side check. Capture INFO and MEMORY STATS in one EXEC so the
             # replication buffer cannot change between the two snapshots.
@@ -1629,6 +1650,9 @@ test "Dual channel replication buffer memory fields" {
             assert_equal [getInfoProperty $replica_info mem_replicas_repl_buffer] [dict get $replica_memory_stats replicas.repl.buffer]
 
             # Replica's replica replication buffer size check.
+            if {[getInfoProperty $replica_info replicas_repl_buffer_size] < [expr 1024000 * 40]} {
+                fail "SIGB gate=$probe_met_at snapshot: len=[getInfoProperty $replica_info replicas_repl_buffer_size] mem=[getInfoProperty $replica_info mem_replicas_repl_buffer] peak=[getInfoProperty $replica_info replicas_repl_buffer_peak]"
+            }
             assert_morethan_equal [getInfoProperty $replica_info replicas_repl_buffer_size] [expr 1024000 * 40]
             assert_morethan_equal [getInfoProperty $replica_info replicas_repl_buffer_peak] [expr 1024000 * 40]
         }
