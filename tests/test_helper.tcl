@@ -636,16 +636,19 @@ proc print_test_summary {} {
 }
 
 # Reduce an exception report to a single line that write_test_failures can attribute to a test file.
-# The report is a summary line followed by a Tcl stack trace. Frames in tests/support are harness
-# plumbing, so the innermost frame outside it is the useful location; fall back to the innermost
-# frame of any kind. The trace is flattened because write_test_failures parses one line per failure.
+# The report is a summary line followed by a stack trace, innermost frame first. Frames in
+# tests/support are harness plumbing, so prefer the innermost frame outside it. Two trace formats
+# reach us, matching the two branches in test_client_main: the pretty one from stacktrace.tcl
+# ("at tests/x.tcl:12") and raw ::errorInfo for builtin errors ('(file "tests/x.tcl" line 12)').
+# The trace is flattened because write_test_failures parses one line per failure.
 proc format_exception_failure {data} {
     set lines [split $data "\n"]
     set summary [string trim [lindex $lines 0]]
 
     set test_file "unknown"
     foreach line $lines {
-        if {![regexp {(tests/\S+\.tcl):\d+} $line -> candidate]} continue
+        if {![regexp {(tests/\S+\.tcl):\d+} $line -> candidate] &&
+            ![regexp {\(file "[^"]*?(tests/\S+\.tcl)" line \d+\)} $line -> candidate]} continue
         if {![string match "tests/support/*" $candidate]} {
             set test_file $candidate
             break
@@ -687,7 +690,11 @@ proc write_test_failures {} {
         if {[regexp {\[(\w+)\]:\s*(.+?)\s+in\s+(tests/\S+\.tcl)\s*(.*)} $failed -> status test_name test_file error_msg]} {
             # Successfully parsed
         } else {
-            set test_name $failed
+            # No usable location. Keep the leading status token if there is one, so the entry is
+            # still classifiable rather than silently reported as an ordinary "err".
+            if {![regexp {^\[(\w+)\]:\s*(.+)} $failed -> status test_name]} {
+                set test_name $failed
+            }
             set test_file "unknown"
             set error_msg $failed
         }
