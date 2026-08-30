@@ -125,6 +125,12 @@ TEST_WRAP_OBJ := $(addprefix $(WRAP_DIR)/, $(ALL_OBJECTS))
 # Homebrew does not add llvm/bin to PATH by default, so we check the standard
 # Homebrew prefix locations for both Apple Silicon (/opt/homebrew) and Intel (/usr/local).
 BREW_LLVM_BIN := $(firstword $(wildcard /opt/homebrew/opt/llvm/bin /usr/local/opt/llvm/bin))
+
+# Resolve CC before the PATH prepend below, so wrap-object lowers bitcode with
+# the same compiler the parent used to produce it. A bare CC=clang would
+# otherwise resolve to the Homebrew clang added to PATH below, which cannot read
+# Apple clang's IR.
+BITCODE_CC := $(shell command -v $(CC) 2>/dev/null || echo $(CC))
 ifneq ($(BREW_LLVM_BIN),)
   export PATH := $(BREW_LLVM_BIN):$(PATH)
 else
@@ -137,7 +143,7 @@ $(WRAP_DIR):
 define wrap-object
 	@mkdir -p $(dir $@)
 	@if file $< | grep -q "LLVM bitcode"; then \
-		$(CC) -O2 -x ir -c $< -o $(WRAP_DIR)/$*_temp.o && \
+		$(BITCODE_CC) -O2 -x ir -c $< -o $(WRAP_DIR)/$*_temp.o && \
 		python3 generate-redefine-syms.py $(WRAP_DIR)/$*_temp.o > $(WRAP_DIR)/$*-wrap-syms && \
 		llvm-objcopy --redefine-syms=$(WRAP_DIR)/$*-wrap-syms $(WRAP_DIR)/$*_temp.o $@ && \
 		rm -f $(WRAP_DIR)/$*_temp.o; \
