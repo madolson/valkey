@@ -364,8 +364,15 @@ raxNode *raxAddChild(raxNode *n,
      * a child "c" in our case pos will be = 2 after the end of the following
      * loop. */
     int pos;
-    for (pos = 0; pos < (int)n->size; pos++) {
-        if (n->data[pos] > c) break;
+    /* Keys are very often inserted in increasing order (stream IDs, time
+     * prefixed keys, counters), in which case the new edge belongs at the end:
+     * check the last edge before scanning the whole array. */
+    if (n->size && n->data[n->size - 1] < c) {
+        pos = n->size;
+    } else {
+        for (pos = 0; pos < (int)n->size; pos++) {
+            if (n->data[pos] > c) break;
+        }
     }
 
     /* Now, if present, move auxiliary data pointer at the end
