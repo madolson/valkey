@@ -1,0 +1,86 @@
+name: Repro RPM TLS
+# Fork-only tooling. Mirrors daily.yml's test-rpm-distros-tls-module job for a single container
+# image and an arbitrary ref, so a backport candidate can be validated without running the
+# whole daily matrix.
+on:
+  workflow_dispatch:
+    inputs:
+      test_ref:
+        description: "git ref of madolson/valkey to build/test"
+        required: true
+      container:
+        description: "container image"
+        type: choice
+        default: "fedora:rawhide"
+        options:
+          - "fedora:rawhide"
+          - "fedora:latest"
+          - "almalinux:8"
+          - "almalinux:9"
+          - "quay.io/centos/centos:stream9"
+      test_file:
+        description: "optional runtest --single argument (empty = full suite)"
+        default: "unit/tls"
+      install_epel:
+        description: "install epel-release first (needed for almalinux/centos)"
+        default: "false"
+
+concurrency:
+  group: repro-rpm-tls-${{ github.run_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  repro:
+    runs-on: ubuntu-latest
+    container: ${{ github.event.inputs.container }}
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: madolson/valkey
+          ref: ${{ github.event.inputs.test_ref }}
+
+      - name: Install EPEL
+        if: github.event.inputs.install_epel == 'true'
+        run: dnf -y install epel-release
+
+      - name: Install build deps
+        run: dnf -y install make gcc openssl-devel openssl procps-ng which /usr/bin/kill /usr/bin/awk
+
+      - name: make
+        run: make -j BUILD_TLS=module SERVER_CFLAGS='-Werror'
+
+      - name: testprep
+        run: |
+          dnf -y install tcl tcltls
+          ./utils/gen-test-certs.sh
+
+      - name: Record environment
+        run: |
+          echo "### Environment" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          openssl version >> $GITHUB_STEP_SUMMARY 2>&1 || true
+          rpm -q tcltls tcl openssl openssl-libs >> $GITHUB_STEP_SUMMARY 2>&1 || true
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "### Server certificate" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          openssl x509 -in tests/tls/server.crt -noout -subject -ext subjectAltName >> $GITHUB_STEP_SUMMARY 2>&1 || true
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - name: test
+        run: |
+          singles=()
+          for t in ${{ github.event.inputs.test_file }}; do singles+=(--single "$t"); done
+          ./runtest "${singles[@]}" --failures-output test-failures/valkey.json \
+            --verbose --dump-logs --tls-module
+
+      - name: Upload failures
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: repro-rpm-tls-failures
+          path: test-failures/
+          if-no-files-found: ignore
