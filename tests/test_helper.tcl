@@ -409,6 +409,18 @@ proc test_server_cron {} {
                     set test_name $tn
                 }
                 set test_name [string trim $test_name]
+                # Some client states carry a pid or a socket handle instead of a test name, e.g.
+                # "(SPAWNED SERVER) pid:123" or "ASSIGNED: sock12 (unit/type/list)". Those
+                # identifiers differ on every run, so reduce them to the part that is stable:
+                # the state itself, or the unit that was assigned. A sleeping client is not the
+                # one that hung, so it is not reported at all.
+                if {[regexp {^pid:\d+$} $test_name]} {
+                    regexp {^\(([^)]*)\)} $task -> test_name
+                } elseif {[regexp {^ASSIGNED:\s+\S+\s+(.*)$} $task -> assigned]} {
+                    set test_name "assigned $assigned"
+                } elseif {[string match "SLEEPING,*" $task]} {
+                    set test_name ""
+                }
                 if {[string length $test_name]} {
                     set file {}
                     if {[info exist ::active_clients_file($fd)]} {
