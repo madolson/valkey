@@ -176,6 +176,9 @@ jobs:
       - name: test
         run: sudo ./runtest-rdma --install-rxe
       - name: show-kernel-log
+        # Always dump the kernel ring buffer, including on test failure, so that
+        # soft-RoCE (rxe) errors behind an RDMA failure are captured in CI logs.
+        if: always()
         run: sudo dmesg -c
 
   test-tls-only:
