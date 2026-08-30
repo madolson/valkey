@@ -738,8 +738,22 @@ proc process_is_paused pid {
 }
 
 # Wait until the process enters a paused state.
-proc wait_process_paused pid {
-    wait_for_condition 50 100 {
+#
+# Two kinds of callers share this helper, with very different cost profiles:
+#  - pause_process below, which sends SIGSTOP itself. The stop is then
+#    near-immediate, so a short budget is correct and keeps a genuinely stuck
+#    process reported quickly.
+#  - tests that arm a self-stopping debug point (DEBUG PAUSE-AFTER-FORK,
+#    DEBUG PAUSE-BEFORE-PSYNC). Those must additionally wait for the server to
+#    *reach* that point, e.g. to reach the fork of a full sync, which under
+#    valgrind can easily take longer than the 5 seconds a 50 x 100ms budget
+#    allows. Scale the budget for them, but only under valgrind, so that normal
+#    runs keep failing fast. pause_process opts out by passing $retries.
+proc wait_process_paused {pid {retries auto}} {
+    if {$retries eq "auto"} {
+        if {$::valgrind} {set retries 1000} else {set retries 50}
+    }
+    wait_for_condition $retries 100 {
         [process_is_paused $pid]
     } else {
         puts [exec ps j $pid]
@@ -749,7 +763,9 @@ proc wait_process_paused pid {
 
 proc pause_process pid {
     exec kill -SIGSTOP $pid
-    wait_process_paused $pid
+    # We sent the signal ourselves, so don't wait long: anything slower than
+    # this is a real problem and should be reported right away.
+    wait_process_paused $pid 50
 }
 
 proc resume_process pid {

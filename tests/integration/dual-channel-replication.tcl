@@ -827,18 +827,19 @@ start_server {tags {"dual-channel-replication external:skip"}} {
             resume_process $replica_pid
             set res [wait_for_log_messages -1 {"*Unable to partial resync with replica * for lack of backlog*"} $loglines 200 100]
             set loglines [lindex $res 1]
-        }
-        # Waiting for the primary to enter the paused state, that is, make sure that bgsave is triggered.
-        wait_process_paused [srv -1 pid]
-        wait_for_log_messages 0 {"*Done loading RDB*"} $replica_loglines 5000 10
-        $replica replicaof no one
-        # Resume the primary and make sure the sync is dropped.
-        resume_process [srv -1 pid]
-        $primary debug pause-after-fork 0
-        wait_for_condition 500 1000 {
-            [s -1 rdb_bgsave_in_progress] eq 0
-        } else {
-            fail "Primary should abort sync"
+
+            # Waiting for the primary to enter the paused state, that is, make sure that bgsave is triggered.
+            wait_process_paused [srv -1 pid]
+            wait_for_log_messages 0 {"*Done loading RDB*"} $replica_loglines 5000 10
+            $replica replicaof no one
+            # Resume the primary and make sure the sync is dropped.
+            resume_process [srv -1 pid]
+            $primary debug pause-after-fork 0
+            wait_for_condition 500 1000 {
+                [s -1 rdb_bgsave_in_progress] eq 0
+            } else {
+                fail "Primary should abort sync"
+            }
         }
         stop_write_load $load_handle0
         stop_write_load $load_handle1
