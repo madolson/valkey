@@ -1551,6 +1551,11 @@ test "Dual channel replication buffer memory fields" {
             $replica config set dual-channel-replication-enabled yes
             $replica config set loading-process-events-interval-bytes 1024
             $replica config set client-output-buffer-limit "replica 0 0 0"
+            # This RDB is smaller than one PROTO_IOBUF_LEN chunk, so with rdb-key-save-delay
+            # the child never flushes and the replica reads no RDB bytes. Only RDB channel
+            # reads refresh repl_transfer_lastio, so the default repl-timeout would abort the
+            # sync and free the buffer this test measures.
+            $replica config set repl-timeout 3600
 
             $replica replicaof $primary_host $primary_port
 
@@ -1565,16 +1570,19 @@ test "Dual channel replication buffer memory fields" {
             }
 
             # Added some data to primary, the replica will cache it in its local buffer.
-            # Here we will use 50MB memory.
+            # Here we will use 10MB memory.
             set bigstr [string repeat x 1024000]
-            for {set j 0} {$j < 50} {incr j} {
+            for {set j 0} {$j < 10} {incr j} {
                 $primary set key $bigstr
             }
 
             # Waiting for data to be transferred from the primary to the replica.
+            # Gate on replicas_repl_buffer_size, the smallest of the values asserted below.
+            # mem_replicas_repl_buffer adds 40 bytes of bookkeeping per block, so it reaches
+            # the threshold first and would let the wait pass while the assertions still fail.
             wait_for_condition 1000 50 {
-               [s $primary_srv_id mem_total_replication_buffers] < [expr 1024000 * 10] &&
-               [s $replica_srv_id mem_total_replication_buffers] > [expr 1024000 * 40]
+                [s $primary_srv_id mem_total_replication_buffers] < [expr 1024000 * 2] &&
+                [s $replica_srv_id replicas_repl_buffer_size] >= [expr 1024000 * 8]
             } else {
                 fail "replica didn't receive the data in time"
             }
@@ -1587,7 +1595,7 @@ test "Dual channel replication buffer memory fields" {
             lassign [$primary exec] primary_info primary_memory_stats
 
             # Primary's total replication buffers check.
-            assert_lessthan_equal [getInfoProperty $primary_info mem_total_replication_buffers] [expr 1024000 * 10]
+            assert_lessthan_equal [getInfoProperty $primary_info mem_total_replication_buffers] [expr 1024000 * 2]
 
             # Primary's replicas replication buffer should be 0.
             assert_equal 0 [getInfoProperty $primary_info mem_replicas_repl_buffer]
@@ -1601,17 +1609,17 @@ test "Dual channel replication buffer memory fields" {
             lassign [$replica exec] replica_info replica_memory_stats
 
             # Replica's memory overhead check.
-            assert_morethan_equal [getInfoProperty $replica_info used_memory_overhead] [expr 1024000 * 40]
+            assert_morethan_equal [getInfoProperty $replica_info used_memory_overhead] [expr 1024000 * 8]
             assert_equal [getInfoProperty $replica_info used_memory_overhead] [dict get $replica_memory_stats overhead.total]
 
             # Replica's total replication buffers check. It should be equal to the replica replication buffer.
-            assert_morethan_equal [getInfoProperty $replica_info mem_total_replication_buffers] [expr 1024000 * 40]
+            assert_morethan_equal [getInfoProperty $replica_info mem_total_replication_buffers] [expr 1024000 * 8]
             assert_equal [getInfoProperty $replica_info mem_replicas_repl_buffer] [getInfoProperty $replica_info mem_total_replication_buffers]
             assert_equal [getInfoProperty $replica_info mem_replicas_repl_buffer] [dict get $replica_memory_stats replicas.repl.buffer]
 
             # Replica's replica replication buffer size check.
-            assert_morethan_equal [getInfoProperty $replica_info replicas_repl_buffer_size] [expr 1024000 * 40]
-            assert_morethan_equal [getInfoProperty $replica_info replicas_repl_buffer_peak] [expr 1024000 * 40]
+            assert_morethan_equal [getInfoProperty $replica_info replicas_repl_buffer_size] [expr 1024000 * 8]
+            assert_morethan_equal [getInfoProperty $replica_info replicas_repl_buffer_peak] [expr 1024000 * 8]
         }
     }
 }
