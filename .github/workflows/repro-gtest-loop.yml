@@ -1,0 +1,76 @@
+name: Repro gtest loop
+# Fork-only tooling. Builds the gtest binary on x86 and runs one filter many times in
+# SEPARATE processes. The unit tests seed the hash function from getRandomBytes once per
+# process, so a seed-dependent failure needs fresh processes, not --gtest_repeat.
+on:
+  workflow_dispatch:
+    inputs:
+      use_repo:
+        description: "repo owner/name to check out"
+        default: "valkey-io/valkey"
+      use_git_ref:
+        description: "branch, tag or sha to build"
+        required: true
+      gtest_filter:
+        description: "--gtest_filter value"
+        required: true
+      iterations:
+        description: "processes to run per attempt"
+        default: "300"
+      attempts:
+        description: "parallel attempts (1-20)"
+        default: "10"
+
+concurrency:
+  group: repro-gtest-${{ github.run_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+    steps:
+      - id: gen
+        run: |
+          n=${{ github.event.inputs.attempts }}
+          if [ "$n" -lt 1 ] || [ "$n" -gt 20 ]; then echo "attempts must be 1-20"; exit 1; fi
+          echo "matrix=$(seq 1 $n | jq -cRs 'split("\n")|map(select(length>0))')" >> $GITHUB_OUTPUT
+
+  repro:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        attempt: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: ${{ github.event.inputs.use_repo }}
+          ref: ${{ github.event.inputs.use_git_ref }}
+
+      - name: Install gtest
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libgtest-dev libgmock-dev
+
+      - name: Build
+        run: make -j$(nproc) all-with-unit-tests SERVER_CFLAGS='-Werror'
+
+      - name: Loop
+        run: |
+          fails=0
+          for i in $(seq 1 ${{ github.event.inputs.iterations }}); do
+            if ! ./src/unit/valkey-unit-gtests --gtest_filter='${{ github.event.inputs.gtest_filter }}' \
+                 > /tmp/it-$i.log 2>&1; then
+              fails=$((fails+1))
+              echo "=== iteration $i FAILED ==="
+              grep -E "Failure|Value of|Actual|Expected|FAILED" /tmp/it-$i.log | head -12
+            fi
+          done
+          echo "ITERATIONS=${{ github.event.inputs.iterations }} FAILURES=$fails"
+          echo "attempt ${{ matrix.attempt }}: $fails / ${{ github.event.inputs.iterations }} failed" >> $GITHUB_STEP_SUMMARY
+          [ "$fails" -eq 0 ]
