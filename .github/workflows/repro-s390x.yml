@@ -1,0 +1,71 @@
+name: Repro s390x
+# Fork-only tooling. Mirrors daily.yml's test-s390x job (qemu-emulated big-endian) for an
+# arbitrary repo and ref, so a release-branch or backport failure can be reproduced directly.
+on:
+  workflow_dispatch:
+    inputs:
+      use_repo:
+        description: "repo owner/name to check out"
+        default: "valkey-io/valkey"
+      use_git_ref:
+        description: "branch, tag or sha to build"
+        required: true
+      attempts:
+        description: "number of parallel attempts (1-6)"
+        default: "1"
+
+concurrency:
+  group: repro-s390x-${{ github.run_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+    steps:
+      - id: gen
+        run: |
+          n=${{ github.event.inputs.attempts }}
+          if [ "$n" -lt 1 ] || [ "$n" -gt 6 ]; then echo "attempts must be 1-6"; exit 1; fi
+          echo "matrix=$(seq 1 $n | jq -cRs 'split("\n")|map(select(length>0))')" >> $GITHUB_OUTPUT
+
+  repro:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 720
+    strategy:
+      fail-fast: false
+      matrix:
+        attempt: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: ${{ github.event.inputs.use_repo }}
+          ref: ${{ github.event.inputs.use_git_ref }}
+
+      - name: Build and test on s390x (big endian)
+        uses: uraimo/run-on-arch-action@d94c13912ea685de38fccc1109385b83fd79427d # v3.0.1
+        with:
+          arch: s390x
+          distro: ubuntu_latest
+          githubToken: ${{ github.token }}
+          run: |
+            apt-get update
+            apt-get install -y build-essential pkg-config libgtest-dev libgmock-dev python3
+            # Report what the build actually produced before running anything, so a
+            # "no binary" failure is distinguishable from a test failure.
+            make all-with-unit-tests SERVER_CFLAGS='-Werror'
+            echo "=== unit test binaries present ==="
+            ls -la ./src/unit/valkey-unit-gtests ./src/valkey-unit-tests 2>&1 || true
+            if [ -f ./src/unit/valkey-unit-gtests ]; then
+              make test-unit
+            elif [ -f ./src/valkey-unit-tests ]; then
+              ./src/valkey-unit-tests
+            else
+              echo "No unit-test binary was produced"
+              exit 1
+            fi
