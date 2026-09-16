@@ -786,6 +786,19 @@ jobs:
           vmtouch -v ./dump.rdb > /dev/null
       - name: test
         run: |
+          # memory.stat's `file` counter is fed by per-CPU vmstat deltas that the
+          # kernel folds in lazily, so a sample taken the instant an operation
+          # returns can read tens of MB above the settled value even when the RDB
+          # is already fully evicted. Poll until it settles instead of sampling once.
+          check_cache() {
+            for _ in $(seq 10); do
+              CACHE=$(grep -w file /sys/fs/cgroup/memory.stat | awk '{print $2}')
+              if [ "$(( $CACHE-$CACHE0 ))" -le "8000000" ]; then break; fi
+              sleep 1
+            done
+            echo "$CACHE"
+            if [ "$(( $CACHE-$CACHE0 ))" -gt "8000000" ]; then exit 1; fi
+          }
           echo "test SAVE doesn't increase cache"
           CACHE0=$(grep -w file /sys/fs/cgroup/memory.stat | awk '{print $2}')
           echo "$CACHE0"
@@ -798,9 +811,7 @@ jobs:
           VMOUT=$(vmtouch -v /tmp/master/dump.rdb)
           echo $VMOUT
           grep -q " 0%" <<< $VMOUT
-          CACHE=$(grep -w file /sys/fs/cgroup/memory.stat | awk '{print $2}')
-          echo "$CACHE"
-          if [ "$(( $CACHE-$CACHE0 ))" -gt "8000000" ]; then exit 1; fi
+          check_cache
           echo "test replication doesn't increase cache"
           ./src/valkey-cli -p 8081 REPLICAOF 127.0.0.1 8080 > /dev/null
           while [ $(./src/valkey-cli -p 8081 info replication | grep "master_link_status:down") ]; do sleep 1; done;
@@ -811,9 +822,7 @@ jobs:
           VMOUT=$(vmtouch -v /tmp/slave/dump.rdb)
           echo $VMOUT
           grep -q " 0%" <<< $VMOUT
-          CACHE=$(grep -w file /sys/fs/cgroup/memory.stat | awk '{print $2}')
-          echo "$CACHE"
-          if [ "$(( $CACHE-$CACHE0 ))" -gt "8000000" ]; then exit 1; fi
+          check_cache
 
           echo "test reboot doesn't increase cache"
           PID=$(cat /tmp/master/valkey.pid)
@@ -826,9 +835,7 @@ jobs:
           VMOUT=$(vmtouch -v /tmp/master/dump.rdb)
           echo $VMOUT
           grep -q " 0%" <<< $VMOUT
-          CACHE=$(grep -w file /sys/fs/cgroup/memory.stat | awk '{print $2}')
-          echo "$CACHE"
-          if [ "$(( $CACHE-$CACHE0 ))" -gt "8000000" ]; then exit 1; fi
+          check_cache
   test-valgrind-test:
     name: test-valgrind-test (${{ matrix.shard }})
     runs-on: ubuntu-latest
