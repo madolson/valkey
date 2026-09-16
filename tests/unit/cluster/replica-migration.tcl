@@ -245,6 +245,15 @@ proc test_sub_replica {type} {
         R 3 config set cluster-allow-replica-migration yes
         R 7 config set cluster-allow-replica-migration no
 
+        # The rank and zero-offset delays in clusterHandleReplicaFailover only
+        # make an empty replica less likely to win the election, they do not
+        # forbid it, and with cluster-node-timeout 1000 the whole ordering
+        # margin is about 600 ms. Forbid failover on the two soon-to-be empty
+        # sub-replicas so that "server 4 wins" is an invariant rather than a
+        # timing margin.
+        R 3 config set cluster-replica-no-failover yes
+        R 7 config set cluster-replica-no-failover yes
+
         # 10s, make sure primary 0 will hang in the save.
         R 0 config set rdb-key-save-delay 100000000
 
