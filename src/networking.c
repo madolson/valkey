@@ -394,6 +394,9 @@ client *createClient(connection *conn) {
     c->client_list_node = NULL;
     c->io_read_state = CLIENT_IDLE;
     c->io_write_state = CLIENT_IDLE;
+    /* 0 means no IO thread has performed IO for this client yet. Only written by
+     * an IO thread, so it must be initialized for clients read on the main thread. */
+    c->cur_tid = 0;
     c->nwritten = 0;
     c->last_memory_usage = 0;
     c->last_memory_type = CLIENT_TYPE_NORMAL;
