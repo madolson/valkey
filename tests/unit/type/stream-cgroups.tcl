@@ -98,6 +98,12 @@ start_server {
         assert {[llength $pending] == 4}
     }
 
+    test {XPENDING only group with an empty PEL} {
+        r XGROUP CREATE mystream emptygroup $
+        assert_equal {0 {} {} {}} [r XPENDING mystream emptygroup]
+        r XGROUP DESTROY mystream emptygroup
+    }
+
     test {XPENDING with IDLE} {
         after 20
         set pending [r XPENDING mystream mygroup IDLE 99999999 - + 10 consumer-1]
