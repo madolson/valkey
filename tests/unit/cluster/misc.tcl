@@ -109,8 +109,14 @@ proc create_nodes_conf_folder {srv_idx} {
     set dir [lindex [R $srv_idx config get dir] 1]
     set cluster_conf [lindex [R $srv_idx config get cluster-config-file] 1]
     set cluster_conf_path [file join $dir $cluster_conf]
-    if {[file exists $cluster_conf_path]} { exec rm -f $cluster_conf_path }
-    exec mkdir -p $cluster_conf_path
+    # The server may legitimately recreate nodes.conf at any moment, so deleting
+    # the path and then creating the directory is racy. Retry until it sticks.
+    wait_for_condition 50 100 {
+        [catch {file delete -force $cluster_conf_path; file mkdir $cluster_conf_path}] == 0 &&
+        [file isdirectory $cluster_conf_path]
+    } else {
+        fail "Could not turn $cluster_conf_path into a directory"
+    }
 }
 
 start_cluster 1 1 {tags {external:skip cluster} overrides {cluster-config-save-behavior sync}} {
