@@ -1531,6 +1531,15 @@ test "Dual channel replication buffer memory fields" {
         $primary config set repl-backlog-size 1
         $primary config set client-output-buffer-limit "replica 0 0 0"
 
+        # The RDB channel is deliberately frozen for the whole test (one 20 byte
+        # key every 2s, and rioConnset buffers it, so the replica reads nothing
+        # after the $EOF: preamble). repl_transfer_lastio therefore never
+        # advances and the default 60s repl-timeout would abort the sync, free
+        # the pending buffer this test measures, and park the reconnect behind
+        # the still-running socket-target BGSAVE. Disable the timeout instead of
+        # racing it: the 50MB write loop below takes minutes on slow TLS runners.
+        $primary config set repl-timeout 3600
+
         $primary config set rdb-key-save-delay 2000000
         for {set j 0} {$j < 1000} {incr j} {
             $primary set "key-$j" $j
@@ -1540,6 +1549,7 @@ test "Dual channel replication buffer memory fields" {
             set replica [srv 0 client]
             set replica_srv_id 0
 
+            $replica config set repl-timeout 3600
             $replica config set dual-channel-replication-enabled yes
             $replica config set loading-process-events-interval-bytes 1024
             $replica config set client-output-buffer-limit "replica 0 0 0"
