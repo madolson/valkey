@@ -17,6 +17,10 @@ mod resp_parse;
 mod client_layout;
 
 mod output_buffer;
+// R1 shadow: the parser runs alongside the C parser and is exercised by tests
+// and the differential harness; it is wired to drive execution in R2. Until
+// then its public surface has no non-test caller, which is expected.
+#[allow(dead_code)]
 mod shadow_parser;
 #[cfg(test)]
 mod diff_test;

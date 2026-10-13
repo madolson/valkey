@@ -103,6 +103,7 @@ pub fn parse_multibulk_header(buf: &[u8]) -> MultibulkHeader {
 /// Returns None for every input string2ll returns 0 for.
 /// Public wrapper so other modules (shadow_parser) share the string2ll-exact
 /// integer parse instead of reimplementing it.
+#[allow(dead_code)]
 pub fn parse_i64_pub(b: &[u8]) -> Option<i64> { parse_i64(b) }
 
 fn parse_i64(b: &[u8]) -> Option<i64> {
