@@ -771,10 +771,19 @@ endif
 # Rust networking layer (rust/valkey_net), built as a C static library and
 # linked into the server. See NETWORKING_MODULARIZATION.md.
 VALKEY_NET_RUST_DIR=../rust/valkey_net
-VALKEY_NET_RUST_LIB=$(VALKEY_NET_RUST_DIR)/target/release/libvalkey_net.a
+
+# Cross-compile support: when RUST_TARGET is set (e.g.
+# RUST_TARGET=aarch64-unknown-linux-gnu), cargo builds for that triple and
+# emits the archive under target/<triple>/release instead of target/release,
+# so the linked .a matches the C object architecture. Honor CARGO_TARGET_DIR
+# too, so an out-of-tree target dir is found. Default: host triple, in-tree.
+VALKEY_NET_CARGO_TARGET_DIR=$(if $(CARGO_TARGET_DIR),$(CARGO_TARGET_DIR),$(VALKEY_NET_RUST_DIR)/target)
+VALKEY_NET_RUST_TARGET_FLAG=$(if $(RUST_TARGET),--target $(RUST_TARGET),)
+VALKEY_NET_RUST_TARGET_SUBDIR=$(if $(RUST_TARGET),$(RUST_TARGET)/release,release)
+VALKEY_NET_RUST_LIB=$(VALKEY_NET_CARGO_TARGET_DIR)/$(VALKEY_NET_RUST_TARGET_SUBDIR)/libvalkey_net.a
 
 $(VALKEY_NET_RUST_LIB): $(VALKEY_NET_RUST_DIR)/src/lib.rs $(VALKEY_NET_RUST_DIR)/Cargo.toml
-	cd $(VALKEY_NET_RUST_DIR) && cargo build --release
+	cd $(VALKEY_NET_RUST_DIR) && cargo build --release $(VALKEY_NET_RUST_TARGET_FLAG)
 
 .PHONY: valkey-net-rust
 valkey-net-rust: $(VALKEY_NET_RUST_LIB)

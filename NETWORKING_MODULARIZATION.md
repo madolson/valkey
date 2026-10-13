@@ -125,6 +125,11 @@ maintainers must weigh.
     transport code** (`socket.c`, `networking.c`); the shared anet/connection
     utility layer stays C to avoid breaking those binaries' link. This is the
     natural seam for the vanilla-Rust approach.
+  - **Cross-compilation.** The `src/Makefile` honors two knobs so a
+    cross-compiled server links a matching-arch Rust archive:
+    `make RUST_TARGET=<triple>` passes `--target` to cargo and looks under
+    `target/<triple>/release/`, and `CARGO_TARGET_DIR=<dir>` relocates the
+    cargo output base. Default (unset) builds the host triple in-tree.
 - **Phase 3b — tokio feasibility spike.** A separate branch exploring a
   tokio-owned ingress, to understand feasibility and cost. Expected to be a
   research prototype, not a drop-in: Valkey's single-threaded `ae` loop + main-
