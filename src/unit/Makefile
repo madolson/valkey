@@ -96,6 +96,12 @@ endif
 
 # Valkey server library dependencies
 VALKEY_SERVER_LIB := ../libvalkey.a
+# Rust networking layer static library (see ../../rust/valkey_net). The unit
+# test binary links the same libvalkey.a as the server, which may call into
+# these symbols, so it must link the Rust archive too -- but only when the
+# server build enabled it. The parent Makefile passes VALKEY_NET_LIB down;
+# default empty so a Rust-disabled build (e.g. 32-bit, C fallback) links nothing.
+VALKEY_NET_LIB ?=
 HIREDIS_LIB := ../../deps/libvalkey/lib/libvalkey.a
 JEMALLOC_LIB := ../../deps/jemalloc/lib/libjemalloc.a
 HDR_HISTOGRAM_LIB := ../../deps/hdr_histogram/libhdrhistogram.a
@@ -268,13 +274,13 @@ generated_wrappers.o: generated_wrappers.cpp
 
 # Generate the single test binary in parent directory.
 ifeq ($(uname_S), Darwin)
-valkey-unit-gtests: $(TEST_WRAP_OBJ) generated_wrappers.o $(VALKEY_SERVER_WRAP_LIB) $(FINAL_LIBS)
+valkey-unit-gtests: $(TEST_WRAP_OBJ) generated_wrappers.o $(VALKEY_SERVER_WRAP_LIB) $(VALKEY_NET_LIB) $(FINAL_LIBS)
 	$(CXX) -g $(LDFLAGS) -fno-lto \
 		-Wall -Wno-deprecated-declarations \
 		-o $@ $^ $(LD_LIBS) \
 		-lm -pthread -ldl
 else
-valkey-unit-gtests: $(ALL_OBJECTS) generated_wrappers.o $(VALKEY_SERVER_LIB) $(FINAL_LIBS)
+valkey-unit-gtests: $(ALL_OBJECTS) generated_wrappers.o $(VALKEY_SERVER_LIB) $(VALKEY_NET_LIB) $(FINAL_LIBS)
 	$(CXX) -g $(LDFLAGS) -fno-lto \
 		$(OVERRIDES) \
 		-Wall -Wno-deprecated-declarations \

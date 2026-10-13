@@ -3,11 +3,20 @@
  * All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
- * valkey_net.h -- C ABI exported by the Rust networking layer (rust/valkey_net).
+ * valkey_net.h -- networking leaf operations, with two interchangeable
+ * implementations selected at build time.
  *
- * These symbols are implemented in Rust (rust/valkey_net/src/lib.rs), compiled
- * to a static library (libvalkey_net.a) and linked into valkey-server. In
- * Phase 2 the surface is a stub used to prove the C <-> Rust link path.
+ * When USE_RUST_NET is defined (the default for the normal server build), these
+ * symbols are implemented in Rust (rust/valkey_net/src/lib.rs), compiled to a
+ * static library (libvalkey_net.a) and linked in. When it is NOT defined -- for
+ * build configurations where a matching-architecture Rust archive is not
+ * available, e.g. the 32-bit build -- this header supplies equivalent
+ * `static inline` C implementations, so no Rust toolchain or archive is needed
+ * and callers (socket.c, server.c) compile unchanged.
+ *
+ * This keeps the Rust networking layer an opt-outable experiment: the C
+ * fallback is behaviourally identical, so the server builds and runs either
+ * way. See NETWORKING_MODULARIZATION.md.
  */
 #ifndef VALKEY_NET_H
 #define VALKEY_NET_H
@@ -15,26 +24,18 @@
 #include <sys/uio.h>   /* struct iovec */
 #include <sys/types.h> /* ssize_t, size_t */
 
+/* ABI version shared by both implementations. */
+#define VALKEY_NET_EXPECTED_ABI_VERSION 1u
+
+#ifdef USE_RUST_NET
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-/* ABI version of the Rust networking layer; must match the C expectation. */
-#define VALKEY_NET_EXPECTED_ABI_VERSION 1u
-
-/* Return the ABI version compiled into the Rust layer. */
+/* Rust-provided symbols (linked from libvalkey_net.a). */
 unsigned int valkey_net_abi_version(void);
-
-/* Compute a trivial checksum of a NUL-terminated C string, in Rust.
- * Returns -1 if s is NULL. Used by the Phase 2 link smoke test. */
 int valkey_net_cstr_checksum(const char *s);
-
-/* Socket byte-I/O leaf operations, implemented in Rust (Phase 3).
- *
- * Each performs the raw syscall on `fd` and returns its result (bytes
- * transferred, 0 for read-EOF, or <0 on error). On a negative return the errno
- * is written through `out_errno` (set to 0 otherwise); `out_errno` may be NULL.
- * The C caller retains ownership of connection-struct state transitions. */
 ssize_t valkey_net_write(int fd, const void *data, size_t data_len, int *out_errno);
 ssize_t valkey_net_read(int fd, void *buf, size_t buf_len, int *out_errno);
 ssize_t valkey_net_writev(int fd, const struct iovec *iov, int iovcnt, int *out_errno);
@@ -42,5 +43,42 @@ ssize_t valkey_net_writev(int fd, const struct iovec *iov, int iovcnt, int *out_
 #ifdef __cplusplus
 }
 #endif
+
+#else /* !USE_RUST_NET -- C fallback, behaviourally identical to the Rust path. */
+
+#include <errno.h>
+#include <string.h>
+#include <unistd.h>
+
+static inline unsigned int valkey_net_abi_version(void) {
+    return VALKEY_NET_EXPECTED_ABI_VERSION;
+}
+
+static inline int valkey_net_cstr_checksum(const char *s) {
+    if (s == NULL) return -1;
+    unsigned int sum = 0;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) sum += *p;
+    return (int)(sum & 0x7fffffffu);
+}
+
+static inline ssize_t valkey_net_write(int fd, const void *data, size_t data_len, int *out_errno) {
+    ssize_t ret = write(fd, data, data_len);
+    if (out_errno) *out_errno = (ret < 0) ? errno : 0;
+    return ret;
+}
+
+static inline ssize_t valkey_net_read(int fd, void *buf, size_t buf_len, int *out_errno) {
+    ssize_t ret = read(fd, buf, buf_len);
+    if (out_errno) *out_errno = (ret < 0) ? errno : 0;
+    return ret;
+}
+
+static inline ssize_t valkey_net_writev(int fd, const struct iovec *iov, int iovcnt, int *out_errno) {
+    ssize_t ret = writev(fd, iov, iovcnt);
+    if (out_errno) *out_errno = (ret < 0) ? errno : 0;
+    return ret;
+}
+
+#endif /* USE_RUST_NET */
 
 #endif /* VALKEY_NET_H */

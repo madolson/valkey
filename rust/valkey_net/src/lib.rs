@@ -77,7 +77,7 @@ pub struct ValkeyNetIovec {
  * targets, iovec is { void *iov_base; size_t iov_len; } == two pointer-sized
  * words with the pointer first, which is exactly this layout. If a future
  * target reorders or repacks iovec, this assertion fails at compile time
- * rather than silently passing writev a mis-shaped array. */
+ * rather than silently passing writev a misshapen array. */
 const _: () = {
     assert!(core::mem::size_of::<ValkeyNetIovec>() == 2 * core::mem::size_of::<usize>());
     assert!(core::mem::align_of::<ValkeyNetIovec>() == core::mem::align_of::<*mut c_void>());

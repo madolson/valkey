@@ -20,8 +20,8 @@
 
 /* Networking / client-I/O state. Embedded in `struct client` as `c->net`. */
 typedef struct clientNet {
-    sds peerid;    /* Cached peer ID (addr:port of the remote end). */
-    sds sockname;  /* Cached connection target address (local bound addr). */
+    sds peerid;   /* Cached peer ID (addr:port of the remote end). */
+    sds sockname; /* Cached connection target address (local bound addr). */
     /* Network byte-count statistics. */
     unsigned long long net_input_bytes;           /* Total network input bytes read from this client. */
     unsigned long long net_input_bytes_curr_cmd;  /* Total network input bytes read for the execution of this client's current command. */

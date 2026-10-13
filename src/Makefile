@@ -772,17 +772,30 @@ endif
 # linked into the server. See NETWORKING_MODULARIZATION.md.
 VALKEY_NET_RUST_DIR=../rust/valkey_net
 
-# Cross-compile support: when RUST_TARGET is set (e.g.
-# RUST_TARGET=aarch64-unknown-linux-gnu), cargo builds for that triple and
-# emits the archive under target/<triple>/release instead of target/release,
-# so the linked .a matches the C object architecture. Honor CARGO_TARGET_DIR
-# too, so an out-of-tree target dir is found. Default: host triple, in-tree.
-VALKEY_NET_CARGO_TARGET_DIR=$(if $(CARGO_TARGET_DIR),$(CARGO_TARGET_DIR),$(VALKEY_NET_RUST_DIR)/target)
-VALKEY_NET_RUST_TARGET_FLAG=$(if $(RUST_TARGET),--target $(RUST_TARGET),)
-VALKEY_NET_RUST_TARGET_SUBDIR=$(if $(RUST_TARGET),$(RUST_TARGET)/release,release)
-VALKEY_NET_RUST_LIB=$(VALKEY_NET_CARGO_TARGET_DIR)/$(VALKEY_NET_RUST_TARGET_SUBDIR)/libvalkey_net.a
+# The Rust networking layer is opt-outable. It is ON by default, but disabled
+# automatically for the 32-bit build (where a matching-arch Rust archive is not
+# generally available) and can be turned off explicitly with BUILD_RUST_NET=no.
+# When off, valkey_net.h supplies a behaviourally-identical C fallback, so the
+# server builds and runs with no Rust toolchain. See NETWORKING_MODULARIZATION.md.
+BUILD_RUST_NET?=yes
+ifneq (,$(findstring -m32,$(FINAL_CFLAGS)))
+    BUILD_RUST_NET:=no
+endif
 
-$(VALKEY_NET_RUST_LIB): $(VALKEY_NET_RUST_DIR)/src/lib.rs $(VALKEY_NET_RUST_DIR)/Cargo.toml
+ifeq ($(BUILD_RUST_NET),yes)
+    SERVER_CFLAGS+= -DUSE_RUST_NET
+    # Cross-compile support: RUST_TARGET sets the cargo triple (archive lands in
+    # target/<triple>/release); CARGO_TARGET_DIR relocates the base. Default:
+    # host triple, in-tree target/.
+    VALKEY_NET_CARGO_TARGET_DIR=$(if $(CARGO_TARGET_DIR),$(CARGO_TARGET_DIR),$(VALKEY_NET_RUST_DIR)/target)
+    VALKEY_NET_RUST_TARGET_FLAG=$(if $(RUST_TARGET),--target $(RUST_TARGET),)
+    VALKEY_NET_RUST_TARGET_SUBDIR=$(if $(RUST_TARGET),$(RUST_TARGET)/release,release)
+    VALKEY_NET_RUST_LIB=$(VALKEY_NET_CARGO_TARGET_DIR)/$(VALKEY_NET_RUST_TARGET_SUBDIR)/libvalkey_net.a
+else
+    VALKEY_NET_RUST_LIB=
+endif
+
+$(VALKEY_NET_CARGO_TARGET_DIR)/$(VALKEY_NET_RUST_TARGET_SUBDIR)/libvalkey_net.a: $(VALKEY_NET_RUST_DIR)/src/lib.rs $(VALKEY_NET_RUST_DIR)/Cargo.toml
 	cd $(VALKEY_NET_RUST_DIR) && cargo build --release $(VALKEY_NET_RUST_TARGET_FLAG)
 
 .PHONY: valkey-net-rust
@@ -878,11 +891,11 @@ test: $(ALL_BUILD_PREREQUISITES)
 	@(cd ..; VALKEY_PROG_SUFFIX="$(PROG_SUFFIX)" ./runtest)
 
 test-unit:
-	@(cd unit && $(MAKE) test-unit)
+	@(cd unit && $(MAKE) test-unit VALKEY_NET_LIB="$(if $(VALKEY_NET_RUST_LIB),../$(VALKEY_NET_RUST_LIB),)")
 
 # valkey-unit-gtests
-$(ENGINE_UNIT_GTESTS): $(ENGINE_LIB_NAME)
-	@(cd unit && $(MAKE) $(ENGINE_UNIT_GTESTS))
+$(ENGINE_UNIT_GTESTS): $(ENGINE_LIB_NAME) $(VALKEY_NET_RUST_LIB)
+	@(cd unit && $(MAKE) $(ENGINE_UNIT_GTESTS) VALKEY_NET_LIB="$(if $(VALKEY_NET_RUST_LIB),../$(VALKEY_NET_RUST_LIB),)")
 
 test-modules: $(SERVER_NAME)
 	@(cd ..; ./runtest-moduleapi)

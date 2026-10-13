@@ -1474,12 +1474,12 @@ typedef struct client {
     uint8_t last_memory_type;
     uint8_t capa; /* Client capabilities: CLIENT_CAPA* macros. */
     /* Statistics and metrics */
-    unsigned long long commands_processed;        /* Total count of commands this client executed. */
-    size_t buf_peak;                              /* Peak used size of buffer in last 5 sec interval. */
-    int nwritten;                                 /* Number of bytes of the last write. */
-    int nread;                                    /* Number of bytes of the last read. */
-    int read_flags;                               /* Client Read flags - used to communicate the client read state. */
-    int slot;                                     /* The slot the client is executing against. Set to -1 if no slot is being used */
+    unsigned long long commands_processed; /* Total count of commands this client executed. */
+    size_t buf_peak;                       /* Peak used size of buffer in last 5 sec interval. */
+    int nwritten;                          /* Number of bytes of the last write. */
+    int nread;                             /* Number of bytes of the last read. */
+    int read_flags;                        /* Client Read flags - used to communicate the client read state. */
+    int slot;                              /* The slot the client is executing against. Set to -1 if no slot is being used */
     listNode *mem_usage_bucket_node;
     clientMemUsageBucket *mem_usage_bucket;
     /* In updateClientMemoryUsage() we track the memory usage of
