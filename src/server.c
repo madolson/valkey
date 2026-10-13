@@ -35,6 +35,7 @@
 #include "hotkeys.h"
 #include "ordered_index.h"
 #include "connection.h"
+#include "valkey_net.h" /* Rust networking layer C ABI */
 #include "monotonic.h"
 #include "cluster.h"
 #include "cluster_slot_stats.h"
@@ -8202,6 +8203,19 @@ __attribute__((weak)) int main(int argc, char **argv) {
     if (!server.sentinel_mode) {
         /* Things not needed when running in Sentinel mode. */
         serverLog(LL_NOTICE, "Server initialized");
+        /* Prove the Rust networking layer is linked and executing. The
+         * checksum is computed Rust-side so a correct value cannot come from
+         * the C caller alone. See rust/valkey_net and NETWORKING_MODULARIZATION.md. */
+        {
+            unsigned int rust_abi = valkey_net_abi_version();
+            int rust_chk = valkey_net_cstr_checksum("valkey");
+            serverLog(LL_NOTICE, "Rust networking layer linked: abi=%u (expected %u), self-check=%d",
+                      rust_abi, VALKEY_NET_EXPECTED_ABI_VERSION, rust_chk);
+            if (rust_abi != VALKEY_NET_EXPECTED_ABI_VERSION) {
+                serverLog(LL_WARNING, "Rust networking layer ABI mismatch: got %u, expected %u",
+                          rust_abi, VALKEY_NET_EXPECTED_ABI_VERSION);
+            }
+        }
         aofLoadManifestFromDisk();
         loadDataFromDisk();
         aofOpenIfNeededOnServerStart();

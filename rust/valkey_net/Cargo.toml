@@ -1,0 +1,20 @@
+# Rust networking layer for Valkey (Phase 2 stub).
+#
+# This crate is compiled as a C static library (`staticlib`) and linked into
+# valkey-server. In Phase 2 it exports a single trivial `extern "C"` symbol used
+# to prove the C <-> Rust link path end to end. Later phases grow it into a
+# real implementation of the client_net.h / ConnectionType interface.
+[package]
+name = "valkey_net"
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+[lib]
+name = "valkey_net"
+crate-type = ["staticlib"]
+
+[profile.release]
+opt-level = 3
+lto = true
+panic = "abort"
