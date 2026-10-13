@@ -850,6 +850,7 @@ clean:
 	rm -rf $(SERVER_NAME) $(ENGINE_SENTINEL_NAME) $(ENGINE_CLI_NAME) $(ENGINE_BENCHMARK_NAME) $(ENGINE_CHECK_RDB_NAME) $(ENGINE_CHECK_AOF_NAME) $(ENGINE_UNIT_GTESTS) $(ENGINE_LIB_NAME) trace/*.o trace/*.d *.o *.gcda *.gcno *.gcov valkey.info lcov-html Makefile.dep *.so
 	rm -f $(DEP)
 	-(cd modules/lua && $(MAKE) clean)
+	-(cd $(VALKEY_NET_RUST_DIR) && cargo clean --release 2> /dev/null) || rm -f $(VALKEY_NET_RUST_LIB)
 
 .PHONY: clean
 
@@ -860,6 +861,7 @@ distclean: clean
 	-(cd unit && $(MAKE) clean)
 	-(rm -f .make-*)
 	-(find unit -type d -name __pycache__ -exec rm -rf {} +)
+	-(cd $(VALKEY_NET_RUST_DIR) && cargo clean 2> /dev/null) || rm -rf $(VALKEY_NET_RUST_DIR)/target
 
 .PHONY: distclean
 

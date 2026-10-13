@@ -12,7 +12,8 @@
 #ifndef VALKEY_NET_H
 #define VALKEY_NET_H
 
-#include <sys/uio.h> /* struct iovec */
+#include <sys/uio.h>   /* struct iovec */
+#include <sys/types.h> /* ssize_t, size_t */
 
 #ifdef __cplusplus
 extern "C" {
@@ -34,9 +35,9 @@ int valkey_net_cstr_checksum(const char *s);
  * transferred, 0 for read-EOF, or <0 on error). On a negative return the errno
  * is written through `out_errno` (set to 0 otherwise); `out_errno` may be NULL.
  * The C caller retains ownership of connection-struct state transitions. */
-long valkey_net_write(int fd, const void *data, unsigned long data_len, int *out_errno);
-long valkey_net_read(int fd, void *buf, unsigned long buf_len, int *out_errno);
-long valkey_net_writev(int fd, const struct iovec *iov, int iovcnt, int *out_errno);
+ssize_t valkey_net_write(int fd, const void *data, size_t data_len, int *out_errno);
+ssize_t valkey_net_read(int fd, void *buf, size_t buf_len, int *out_errno);
+ssize_t valkey_net_writev(int fd, const struct iovec *iov, int iovcnt, int *out_errno);
 
 #ifdef __cplusplus
 }

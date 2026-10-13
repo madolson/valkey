@@ -73,12 +73,39 @@ pub struct ValkeyNetIovec {
     pub iov_len: usize,
 }
 
+/* Guard against drift from the platform `struct iovec`. On every OS valkey
+ * targets, iovec is { void *iov_base; size_t iov_len; } == two pointer-sized
+ * words with the pointer first, which is exactly this layout. If a future
+ * target reorders or repacks iovec, this assertion fails at compile time
+ * rather than silently passing writev a mis-shaped array. */
+const _: () = {
+    assert!(core::mem::size_of::<ValkeyNetIovec>() == 2 * core::mem::size_of::<usize>());
+    assert!(core::mem::align_of::<ValkeyNetIovec>() == core::mem::align_of::<*mut c_void>());
+};
+
 extern "C" {
     fn write(fd: c_int, buf: *const c_void, count: usize) -> isize;
     fn read(fd: c_int, buf: *mut c_void, count: usize) -> isize;
     fn writev(fd: c_int, iov: *const ValkeyNetIovec, iovcnt: c_int) -> isize;
-    // errno location accessor; __errno_location on glibc.
-    #[cfg_attr(target_env = "gnu", link_name = "__errno_location")]
+}
+
+/* The errno thread-local is reached through a different accessor symbol per
+ * platform: __errno_location on Linux (glibc and musl both export it),
+ * __error on Apple, and __errno on *BSD. Declare each under its own cfg so the
+ * crate links on every platform valkey_server targets. */
+#[cfg(target_os = "linux")]
+extern "C" {
+    #[link_name = "__errno_location"]
+    fn errno_location() -> *mut c_int;
+}
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+extern "C" {
+    #[link_name = "__error"]
+    fn errno_location() -> *mut c_int;
+}
+#[cfg(any(target_os = "freebsd", target_os = "dragonfly", target_os = "openbsd", target_os = "netbsd"))]
+extern "C" {
+    #[link_name = "__errno"]
     fn errno_location() -> *mut c_int;
 }
 
