@@ -403,8 +403,8 @@ client *createClient(connection *conn) {
     c->module_data = NULL;
     c->mstate = NULL;
     c->woff = 0;
-    c->peerid = NULL;
-    c->sockname = NULL;
+    c->net.peerid = NULL;
+    c->net.sockname = NULL;
     c->client_list_node = NULL;
     c->io_read_state = CLIENT_IDLE;
     c->io_write_state = CLIENT_IDLE;
@@ -2476,8 +2476,8 @@ int freeClient(client *c) {
     if (c->lib_ver) decrRefCount(c->lib_ver);
     freeClientMultiState(c);
     if (c->cob_trend) trendCalculator_free(c->cob_trend);
-    sdsfree(c->peerid);
-    sdsfree(c->sockname);
+    sdsfree(c->net.peerid);
+    sdsfree(c->net.sockname);
     zfree(c);
     return 1;
 }
@@ -4895,11 +4895,11 @@ void genClientAddrString(client *client, char *addr, size_t addr_len, int remote
 char *getClientPeerId(client *c) {
     char peerid[CONN_ADDR_STR_LEN] = {0};
 
-    if (c->peerid == NULL) {
+    if (c->net.peerid == NULL) {
         genClientAddrString(c, peerid, sizeof(peerid), 1);
-        c->peerid = sdsnew(peerid);
+        c->net.peerid = sdsnew(peerid);
     }
-    return c->peerid;
+    return c->net.peerid;
 }
 
 /* This function returns the client bound socket name, by creating and caching
@@ -4909,11 +4909,11 @@ char *getClientPeerId(client *c) {
 char *getClientSockname(client *c) {
     char sockname[CONN_ADDR_STR_LEN] = {0};
 
-    if (c->sockname == NULL) {
+    if (c->net.sockname == NULL) {
         genClientAddrString(c, sockname, sizeof(sockname), 0);
-        c->sockname = sdsnew(sockname);
+        c->net.sockname = sdsnew(sockname);
     }
-    return c->sockname;
+    return c->net.sockname;
 }
 
 int isClientConnIpV6(client *c) {

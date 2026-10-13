@@ -1400,10 +1400,13 @@ typedef struct LastWrittenBuf {
 /* Forward declaration of slotMigrationJob */
 typedef struct slotMigrationJob slotMigrationJob;
 
+#include "client_net_types.h" /* clientNet: networking/client-I/O state embedded below */
+
 typedef struct client {
     /* Basic client information and connection. */
     uint64_t id; /* Client incremental unique ID. */
     connection *conn;
+    clientNet net; /* Networking/client-I/O state owned by the networking layer. */
     /* Input buffer and command parsing fields */
     sds querybuf;        /* Buffer we use to accumulate client queries. */
     size_t qb_pos;       /* The position we have read in querybuf. */
@@ -1501,8 +1504,6 @@ typedef struct client {
     robj *name;                              /* As set by CLIENT SETNAME. */
     robj *lib_name;                          /* The client library name as set by CLIENT SETINFO. */
     robj *lib_ver;                           /* The client library version as set by CLIENT SETINFO. */
-    sds peerid;                              /* Cached peer ID. */
-    sds sockname;                            /* Cached connection target address. */
     time_t ctime;                            /* Client creation time. */
     list *deferred_reply;                    /* List of reply objects to be sent to the client, typically after
                                                 the client has been unblocked. */

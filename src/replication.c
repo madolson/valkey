@@ -5315,14 +5315,14 @@ void replicationCachePrimary(client *c) {
     server.cached_primary = server.primary;
 
     /* Invalidate the Peer ID cache. */
-    if (c->peerid) {
-        sdsfree(c->peerid);
-        c->peerid = NULL;
+    if (c->net.peerid) {
+        sdsfree(c->net.peerid);
+        c->net.peerid = NULL;
     }
     /* Invalidate the Sock Name cache. */
-    if (c->sockname) {
-        sdsfree(c->sockname);
-        c->sockname = NULL;
+    if (c->net.sockname) {
+        sdsfree(c->net.sockname);
+        c->net.sockname = NULL;
     }
 
     /* Caching the primary happens instead of the actual freeClient() call,
