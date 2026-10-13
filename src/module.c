@@ -4533,7 +4533,7 @@ int VM_SetExpire(ValkeyModuleKey *key, mstime_t expire) {
         return VALKEYMODULE_ERR;
     if (expire != VALKEYMODULE_NO_EXPIRE) {
         mstime_t basetime = commandTimeSnapshot();
-        if (expire > LLONG_MAX - basetime) return VALKEYMODULE_ERR; /* Would overflow. */
+        if (expire > LLONG_MAX - basetime) return VALKEYMODULE_ERR;
         expire += basetime;
         key->value = setExpire(key->ctx->client, key->db, key->key, expire);
     } else {

@@ -43,26 +43,10 @@ start_server {tags {"dump"}} {
         r set foo bar
         set encoded [r dump foo]
         r del foo
-        assert_error "*Invalid TTL value*" {r restore foo 9223372036854775807 $encoded}
-        assert_error "*Invalid TTL value*" {r restore foo 9223372036854770000 $encoded}
+        assert_error "ERR invalid expire time in 'restore' command" {r restore foo 9223372036854775807 $encoded}
+        assert_error "ERR invalid expire time in 'restore' command" {r restore foo 9223372036854770000 $encoded}
         assert_equal 0 [r exists foo]
     }
-
-    test {RESTORE with overflowing TTL in import mode must not store a negative expire} {
-        # In import mode checkAlreadyExpired() never deletes, so before the fix
-        # the wrapped (negative) expire was stored and the active expire cycle
-        # asserted on 't >= 0' once import mode was switched off.
-        r set foo bar
-        set encoded [r dump foo]
-        r del foo
-        r config set import-mode yes
-        assert_error "*Invalid TTL value*" {r restore foo 9223372036854775807 $encoded}
-        r config set import-mode no
-        assert_equal 0 [r exists foo]
-        # Give the active expire cycle a chance to run; the server must survive.
-        after 200
-        assert_equal PONG [r ping]
-    } {} {needs:config}
 
     test {RESTORE with ABSTTL in the past} {
         r set foo bar

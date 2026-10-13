@@ -247,13 +247,8 @@ void restoreCommand(client *c) {
     } else if (ttl < 0) {
         addReplyError(c, "Invalid TTL value, must be >= 0");
         return;
-    } else if (ttl && !absttl && ttl > LLONG_MAX - commandTimeSnapshot()) {
-        /* Relative TTL: adding the current time would overflow (undefined
-         * behavior). If it wrapped negative in a context where
-         * checkAlreadyExpired() does not delete (replica, loading, import
-         * mode, slot migration), a negative absolute expire would be stored
-         * and later trip the 't >= 0' assertion in the active expire cycle. */
-        addReplyError(c, "Invalid TTL value, must be >= 0");
+    } else if (!absttl && ttl > LLONG_MAX - commandTimeSnapshot()) {
+        addReplyErrorExpireTime(c);
         return;
     }
 
