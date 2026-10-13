@@ -101,6 +101,10 @@ pub fn parse_multibulk_header(buf: &[u8]) -> MultibulkHeader {
 ///   - overflow is checked at every step against the unsigned accumulator,
 ///     with the final signed-range check (LLONG_MIN is representable).
 /// Returns None for every input string2ll returns 0 for.
+/// Public wrapper so other modules (shadow_parser) share the string2ll-exact
+/// integer parse instead of reimplementing it.
+pub fn parse_i64_pub(b: &[u8]) -> Option<i64> { parse_i64(b) }
+
 fn parse_i64(b: &[u8]) -> Option<i64> {
     const LONG_STR_SIZE: usize = 21; // mirrors util.h LONG_STR_SIZE
     let slen = b.len();

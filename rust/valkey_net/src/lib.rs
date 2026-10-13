@@ -17,6 +17,9 @@ mod resp_parse;
 mod client_layout;
 
 mod output_buffer;
+mod shadow_parser;
+#[cfg(test)]
+mod diff_test;
 
 /// ABI version of this Rust networking layer. Bumped when the exported C ABI
 /// changes so the C side can assert compatibility at startup.
