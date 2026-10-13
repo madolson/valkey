@@ -22,6 +22,12 @@
 typedef struct clientNet {
     sds peerid;    /* Cached peer ID (addr:port of the remote end). */
     sds sockname;  /* Cached connection target address (local bound addr). */
+    /* Network byte-count statistics. */
+    unsigned long long net_input_bytes;           /* Total network input bytes read from this client. */
+    unsigned long long net_input_bytes_curr_cmd;  /* Total network input bytes read for the execution of this client's current command. */
+    unsigned long long net_output_bytes;          /* Total network output bytes sent to this client. */
+    unsigned long long net_output_bytes_curr_cmd; /* Total network output bytes sent to this client, by the current command. */
+    _Atomic(size_t) io_tracked_reply_len;         /* Total size of BULK_STR_REF replies tracked by I/O threads. */
 } clientNet;
 
 #endif /* VALKEY_CLIENT_NET_TYPES_H */

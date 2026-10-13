@@ -5257,7 +5257,7 @@ void replicationSendAck(void) {
 
         /* Accumulation from above replies must be reset back to 0 manually,
          * as this subroutine does not invoke resetClient(). */
-        c->net_output_bytes_curr_cmd = 0;
+        c->net.net_output_bytes_curr_cmd = 0;
     }
 }
 

@@ -143,7 +143,7 @@ void clusterSlotStatsAddNetworkBytesOutForSlot(int slot, unsigned long long net_
 
 /* Accumulates egress bytes upon sending RESP responses back to user clients. */
 void clusterSlotStatsAddNetworkBytesOutForUserClient(client *c) {
-    clusterSlotStatsAddNetworkBytesOutForSlot(c->slot, c->net_output_bytes_curr_cmd);
+    clusterSlotStatsAddNetworkBytesOutForSlot(c->slot, c->net.net_output_bytes_curr_cmd);
 }
 
 /* Accumulates egress bytes upon sending replication stream. This only applies for primary nodes. */
@@ -183,11 +183,11 @@ void clusterSlotStatsAddNetworkBytesOutForShardedPubSubInternalPropagation(clien
     if (!clusterSlotStatsEnabled(slot)) return;
 
     serverAssert(slot >= 0 && slot < CLUSTER_SLOTS);
-    server.cluster->slot_stats[slot].network_bytes_out += c->net_output_bytes_curr_cmd;
+    server.cluster->slot_stats[slot].network_bytes_out += c->net.net_output_bytes_curr_cmd;
 
     /* For sharded pubsub, the client's network bytes metrics must be reset here,
      * as resetClient() is not called until subscription ends. */
-    c->net_output_bytes_curr_cmd = 0;
+    c->net.net_output_bytes_curr_cmd = 0;
 }
 
 /* Adds reply for the ORDERBY variant.
@@ -248,10 +248,10 @@ void clusterSlotStatsAddNetworkBytesInForUserClient(client *c) {
 
     if (c->cmd->proc == execCommand) {
         /* Accumulate its corresponding MULTI RESP; *1\r\n$5\r\nmulti\r\n */
-        c->net_input_bytes_curr_cmd += 15;
+        c->net.net_input_bytes_curr_cmd += 15;
     }
 
-    server.cluster->slot_stats[c->slot].network_bytes_in += c->net_input_bytes_curr_cmd;
+    server.cluster->slot_stats[c->slot].network_bytes_in += c->net.net_input_bytes_curr_cmd;
 }
 
 void clusterSlotStatsCommand(client *c) {
