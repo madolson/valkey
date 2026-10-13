@@ -656,7 +656,19 @@ static size_t _addReplyPayloadToBuffer(client *c, const void *payload, size_t le
     if (c->flag.buf_encoded) {
         int track_bytes = (server.commandlog[COMMANDLOG_TYPE_LARGE_REPLY].threshold != -1);
         reply_len = upsertPayloadHeader(c->buf, &c->bufpos, &c->last_header, payload_type, len, c->slot, track_bytes, available);
+        if (!reply_len) return 0;
+        memcpy(c->buf + c->bufpos, payload, reply_len);
+        c->bufpos += reply_len;
+        if (c->buf_peak < (size_t)c->bufpos) c->buf_peak = (size_t)c->bufpos;
+        return reply_len;
     }
+#ifdef USE_RUST_NET
+    /* Plain (unencoded) append is owned by Rust, operating on the real client
+     * struct via the bindgen layout mirror. The bounds-sensitive memcpy becomes
+     * a length-bounded Rust slice copy. See rust/valkey_net/src/output_buffer.rs
+     * and RUST_DEVELOPMENT_NOTES.md. */
+    return valkey_net_add_reply_plain(c, (const unsigned char *)payload, len);
+#else
     if (!reply_len) return 0;
 
     memcpy(c->buf + c->bufpos, payload, reply_len);
@@ -664,6 +676,7 @@ static size_t _addReplyPayloadToBuffer(client *c, const void *payload, size_t le
     /* We update the buffer peak after appending the reply to the buffer */
     if (c->buf_peak < (size_t)c->bufpos) c->buf_peak = (size_t)c->bufpos;
     return reply_len;
+#endif
 }
 
 static size_t _addReplyToBuffer(client *c, const char *s, size_t len) {

@@ -65,6 +65,13 @@ typedef struct valkeyNetMultibulkParse {
  * Pure over the bytes; client-state checks (auth limits) stay on the C side. */
 valkeyNetMultibulkParse valkey_net_parse_multibulk(const unsigned char *data, size_t len);
 
+/* Append a plain reply payload to the client's static output buffer, in Rust,
+ * operating on the real `client` struct via the bindgen layout mirror. Returns
+ * the number of bytes written (0 if the buffer is full). Mirrors the
+ * PLAIN_REPLY branch of _addReplyPayloadToBuffer. */
+struct client;
+size_t valkey_net_add_reply_plain(struct client *c, const unsigned char *payload, size_t len);
+
 #ifdef __cplusplus
 }
 #endif
