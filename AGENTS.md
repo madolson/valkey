@@ -54,4 +54,4 @@
 - Treat vendored dependency code under `deps/` as special-case changes; modify it only when the task clearly requires it.
 
 ## Pull Requests
-Always push to the user's fork. Never push to the upstream valkey-io/valkey repository. Never push directly to unstable. If a user fork does not exist, ask the contributor to create one.
+Always push to the AI-native fork `madolson/valkey-agents`. This is the designated target for agent-authored work. Never push to the upstream `valkey-io/valkey` repository, and never push to the human fork `madolson/valkey`. Never push directly to the default branch; use feature branches and open PRs against `madolson/valkey-agents`. If the `valkey-agents` remote is not configured, ask the contributor to add it before pushing.
