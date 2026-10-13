@@ -290,6 +290,33 @@ start_server {tags {"expire"}} {
         set e
     } {ERR invalid expire time in 'getex' command}
 
+    test {GETEX and SET with relative expire overflow when basetime is added} {
+        r set foo bar
+
+        # The PX value fits in a long long, but adding the current time
+        # overflows. The old code added first and then checked for a negative
+        # result, which is undefined behavior: clang -O3 removes the check, so
+        # the key was stored with a negative absolute expire and the active
+        # expire cycle then hit 'serverAssert(t >= 0)' in expire.c, crashing
+        # the server. gcc happened to keep the check and reject the command.
+        assert_error "ERR invalid expire time in 'getex' command" {r GETEX foo PX 9223372036854775807}
+        assert_error "ERR invalid expire time in 'getex' command" {r GETEX foo PX 9223372036854770000}
+        # EX value passes the LLONG_MAX/1000 check but overflows once basetime is added.
+        assert_error "ERR invalid expire time in 'getex' command" {r GETEX foo EX 9223372036854775}
+
+        # SET shares the same expire parsing path.
+        assert_error "ERR invalid expire time in 'set' command" {r SET foo bar PX 9223372036854775807}
+        assert_error "ERR invalid expire time in 'set' command" {r SET foo bar EX 9223372036854775}
+
+        # The key must be untouched: still present, no TTL.
+        assert_equal {bar} [r get foo]
+        assert_equal {-1} [r ttl foo]
+
+        # Let the active expire cycle run a few times; the server must survive.
+        after 300
+        assert_equal PONG [r ping]
+    }
+
     test {GETEX with error expiration time} {
         r del foo
         assert_error {ERR value is not an integer or out of range} {r getex foo ex abcd}
