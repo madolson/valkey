@@ -496,7 +496,6 @@ static void createIOThread(int id) {
     /* Initialize the private SPSC queue for this thread */
     spscInit(&io_private_inbox[id], IO_SPSC_QUEUE_SIZE);
 
-    pthread_t tid;
     pthread_mutex_init(&io_threads_mutex[id], NULL);
     pthread_mutex_lock(&io_threads_mutex[id]); /* Thread will be stopped. */
 
@@ -512,6 +511,7 @@ static void createIOThread(int id) {
     }
     io_threads[id] = 0;
 #else
+    pthread_t tid;
     pthread_attr_t attr;
     serverInitThreadAttribute(&attr);
 

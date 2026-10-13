@@ -31,6 +31,7 @@
 #include "cluster.h"
 #include "cluster_slot_stats.h"
 #include "cluster_migrateslots.h"
+#include "valkey_net.h"
 #include "script.h"
 #include "intset.h"
 #include "sds.h"
@@ -4119,6 +4120,34 @@ static int parseMultibulk(client *c,
         /* The client (argc) should have been reset */
         serverAssertWithInfo(c, NULL, *argc == 0);
 
+        size_t multibulklen_slen;
+#ifdef USE_RUST_NET
+        /* Parse the `*<n>\r\n` header in Rust (resp_parse.rs). The Rust side
+         * does the memchr + bounds + integer parse over a bounds-checked slice;
+         * the C side keeps the client-state-dependent checks (auth limits) and
+         * all the state mutation below. See RUST_DEVELOPMENT_NOTES.md. */
+        valkeyNetMultibulkParse mb =
+            valkey_net_parse_multibulk((const unsigned char *)(c->querybuf + c->qb_pos), sdslen(c->querybuf) - c->qb_pos);
+        switch (mb.status) {
+        case VALKEY_NET_MBH_NEEDMORE: return 0;
+        case VALKEY_NET_MBH_ERR_BIG_MBULK: return READ_FLAGS_ERROR_BIG_MULTIBULK;
+        case VALKEY_NET_MBH_ERR_INVALID_CRLF: return READ_FLAGS_ERROR_INVALID_CRLF;
+        case VALKEY_NET_MBH_ERR_INVALID_LEN: return READ_FLAGS_ERROR_INVALID_MULTIBULK_LEN;
+        default: break; /* PARSED or NONPOSITIVE: fall through with mb filled in */
+        }
+        serverAssertWithInfo(c, NULL, c->querybuf[c->qb_pos] == '*');
+        ll = mb.count;
+        /* consumed spans `*`, the digits, and the trailing \r\n, i.e.
+         * 1 + digits + 2, so the digit length is consumed - 3. */
+        multibulklen_slen = mb.consumed - 3;
+        if (ll > 10 && auth_required) {
+            return READ_FLAGS_ERROR_UNAUTHENTICATED_MULTIBULK_LEN;
+        }
+        c->qb_pos += mb.consumed;
+        if (mb.status == VALKEY_NET_MBH_NONPOSITIVE) {
+            return READ_FLAGS_PARSING_NEGATIVE_MBULK_LEN;
+        }
+#else
         /* Multi bulk length cannot be read without a \r\n */
         newline = memchr(c->querybuf + c->qb_pos, '\r', sdslen(c->querybuf) - c->qb_pos);
         if (newline == NULL) {
@@ -4139,7 +4168,7 @@ static int parseMultibulk(client *c,
         /* We know for sure there is a whole line since newline != NULL,
          * so go ahead and find out the multi bulk length. */
         serverAssertWithInfo(c, NULL, c->querybuf[c->qb_pos] == '*');
-        size_t multibulklen_slen = newline - (c->querybuf + 1 + c->qb_pos);
+        multibulklen_slen = newline - (c->querybuf + 1 + c->qb_pos);
         ok = string2ll(c->querybuf + 1 + c->qb_pos, multibulklen_slen, &ll);
         if (!ok || ll > INT_MAX) {
             return READ_FLAGS_ERROR_INVALID_MULTIBULK_LEN;
@@ -4152,6 +4181,7 @@ static int parseMultibulk(client *c,
         if (ll <= 0) {
             return READ_FLAGS_PARSING_NEGATIVE_MBULK_LEN;
         }
+#endif
 
         c->multibulklen = ll;
         c->bulklen = -1;

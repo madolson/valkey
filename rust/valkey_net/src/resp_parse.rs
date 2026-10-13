@@ -153,6 +153,61 @@ pub unsafe extern "C" fn valkey_net_parse_multibulk_consumed(data: *const u8, le
     }
 }
 
+/* Status codes for the full-result FFI, mirroring the subset of READ_FLAGS_*
+ * the multibulk-header branch of parseMultibulk() produces. The C side maps
+ * these back to its own flag constants. */
+pub const MBH_NEEDMORE: c_int = 0;
+pub const MBH_PARSED: c_int = 1;
+pub const MBH_NONPOSITIVE: c_int = 2;
+pub const MBH_ERR_INVALID_LEN: c_int = 3; /* bad integer / over INT_MAX */
+pub const MBH_ERR_INVALID_CRLF: c_int = 4; /* char after \r is not \n */
+pub const MBH_ERR_BIG_MBULK: c_int = 5; /* no CRLF and over inline cap */
+
+/// Full C-ABI result of parsing a multibulk header, enough for the live C read
+/// path to replace its memchr + bounds + string2ll block with one call.
+#[repr(C)]
+pub struct MultibulkParse {
+    pub status: c_int, /* one of the MBH_* codes */
+    pub count: i64,    /* element count when status == MBH_PARSED */
+    pub consumed: usize, /* bytes consumed when PARSED or NONPOSITIVE */
+}
+
+/// Parse a multibulk header for the live read path. `data`/`len` is the
+/// unparsed query-buffer tail (starting at `*`). Pure function of the bytes;
+/// the C caller applies client-state-dependent checks (auth limits) itself.
+///
+/// # Safety
+/// `data` must point to `len` readable bytes, or be NULL with len 0.
+#[no_mangle]
+pub unsafe extern "C" fn valkey_net_parse_multibulk(data: *const u8, len: usize) -> MultibulkParse {
+    let buf: &[u8] = if data.is_null() || len == 0 {
+        &[]
+    } else {
+        core::slice::from_raw_parts(data, len)
+    };
+    // Distinguish the two "need more vs error" cases the C path separates.
+    if buf.iter().position(|&b| b == b'\r').is_none() {
+        let status = if buf.len() > PROTO_INLINE_MAX_SIZE { MBH_ERR_BIG_MBULK } else { MBH_NEEDMORE };
+        return MultibulkParse { status, count: 0, consumed: 0 };
+    }
+    match parse_multibulk_header(buf) {
+        MultibulkHeader::Parsed { count, consumed } => MultibulkParse { status: MBH_PARSED, count, consumed },
+        MultibulkHeader::NonPositive { consumed } => MultibulkParse { status: MBH_NONPOSITIVE, count: 0, consumed },
+        MultibulkHeader::NeedMore => MultibulkParse { status: MBH_NEEDMORE, count: 0, consumed: 0 },
+        MultibulkHeader::Error => {
+            // Decide which error: a non-\n after \r is INVALID_CRLF; otherwise
+            // it is an invalid length (bad digits / overflow / leading char).
+            let cr = buf.iter().position(|&b| b == b'\r').unwrap();
+            let status = if cr + 1 < buf.len() && buf[cr + 1] != b'\n' {
+                MBH_ERR_INVALID_CRLF
+            } else {
+                MBH_ERR_INVALID_LEN
+            };
+            MultibulkParse { status, count: 0, consumed: 0 }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

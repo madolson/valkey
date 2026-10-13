@@ -46,6 +46,25 @@ ssize_t valkey_net_writev(int fd, const struct iovec *iov, int iovcnt, int *out_
 int valkey_net_io_thread_spawn(int id);
 void valkey_net_io_thread_join(int id);
 
+/* RESP multibulk-header parsing in Rust (resp_parse.rs). Status codes mirror
+ * the subset of READ_FLAGS_* that parseMultibulk()'s header branch produces. */
+#define VALKEY_NET_MBH_NEEDMORE 0
+#define VALKEY_NET_MBH_PARSED 1
+#define VALKEY_NET_MBH_NONPOSITIVE 2
+#define VALKEY_NET_MBH_ERR_INVALID_LEN 3
+#define VALKEY_NET_MBH_ERR_INVALID_CRLF 4
+#define VALKEY_NET_MBH_ERR_BIG_MBULK 5
+
+typedef struct valkeyNetMultibulkParse {
+    int status;      /* one of VALKEY_NET_MBH_* */
+    long long count; /* element count when status == PARSED */
+    size_t consumed; /* bytes consumed when PARSED or NONPOSITIVE */
+} valkeyNetMultibulkParse;
+
+/* Parse a multibulk header from the unparsed query-buffer tail (starts at '*').
+ * Pure over the bytes; client-state checks (auth limits) stay on the C side. */
+valkeyNetMultibulkParse valkey_net_parse_multibulk(const unsigned char *data, size_t len);
+
 #ifdef __cplusplus
 }
 #endif
