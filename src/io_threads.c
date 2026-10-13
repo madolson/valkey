@@ -13,7 +13,6 @@
 #include "connection.h"
 #include "queues.h"
 #include "server.h"
-#include "valkey_net.h"
 #include <sys/resource.h>
 
 #define IO_MPSC_QUEUE_SIZE 16384
@@ -359,127 +358,85 @@ static inline void processTaggedSPMCJob(void *tagged_job) {
         serverPanic("Invalid SPMC job type: %d", type);
     }
 }
-
-/* Cooperative stop flags, one per worker. Set by the main thread to ask a
- * worker to exit its loop. Used by the Rust-owned worker path (which cannot be
- * pthread_cancel'd) and harmless for the C fallback. */
-static _Atomic int io_thread_stop[IO_THREADS_MAX_NUM] = {0};
-
-/* Per-thread scratch for one worker iteration (C fallback keeps its own). */
-
-/* Per-thread setup run once at worker start, from whichever thread owns the
- * worker (a pthread in the C path, a Rust std::thread in the Rust path). */
-void ioThreadWorkerSetup(int id) {
-    char thdname[32];
-    snprintf(thdname, sizeof(thdname), "io_thd_%d", id);
-    valkey_set_thread_title(thdname);
-    serverSetCpuAffinity(server.server_cpulist);
-    initSharedQueryBuf();
-    thread_id = id;
-    atomic_store_explicit(&io_thread_stop[id], 0, memory_order_release);
-}
-
-/* Run ONE drain iteration for worker `id`: SPSC batch, then SPMC high, then
- * SPMC normal. Returns the number of jobs processed (0 means the worker found
- * nothing to do and the caller should park). Shared by both the C fallback and
- * the Rust worker loop. */
-int ioThreadRunOnce(int id) {
-    void *batch_jobs[BATCH_SIZE];
-    int processed = 0;
-    size_t batch_count = 0;
-
-    /* PRIORITY 1: Drain Private SPSC Queue (Batch Processing) */
-    while ((batch_count = spscDequeueBatch(&io_private_inbox[id], batch_jobs, BATCH_SIZE)) > 0) {
-        for (size_t i = 0; i < batch_count; i++) {
-            void *data;
-            int type;
-            untagJob(batch_jobs[i], &data, &type);
-            switch (type) {
-            case JOB_SPSC_FREE_ARGV: ioThreadFreeArgv((robj **)data); break;
-            case JOB_SPSC_POLL: ioThreadPoll((aeEventLoop *)data); break;
-            default: serverPanic("Invalid SPSC job type: %d", type);
-            }
-        }
-        processed += batch_count;
-    }
-
-    /* PRIORITY 2: Shared Global Queue (SPMC), only after SPSC is drained. */
-    void *tagged_job;
-    if ((tagged_job = spmcDequeue(&io_shared_inbox[JOB_PRIORITY_HIGH])) != NULL) {
-        processTaggedSPMCJob(tagged_job);
-        processed++;
-    }
-    if ((tagged_job = spmcDequeue(&io_shared_inbox[JOB_PRIORITY_NORMAL])) != NULL) {
-        processTaggedSPMCJob(tagged_job);
-        processed++;
-    }
-
-    if (processed) {
-        atomic_fetch_add_explicit(&io_jobs_finished, processed, memory_order_release);
-    }
-    return processed;
-}
-
-/* Called when a worker iteration found no work: either flush backlogged
- * responses, or park on the per-thread mutex until the main thread unlocks it. */
-void ioThreadParkIfIdle(int id) {
-    int has_pending = 0;
-    for (int p = 0; p < JOB_PRIORITY_COUNT; p++) {
-        if (pending_io_responses[p]) has_pending = 1;
-    }
-    if (unlikely(has_pending)) {
-        flushPendingIOResponses(0);
-    } else {
-        /* Blocks until the main thread unlocks this worker's mutex. */
-        pthread_mutex_lock(&io_threads_mutex[id]);
-        pthread_mutex_unlock(&io_threads_mutex[id]);
-    }
-}
-
-/* Returns non-zero if worker `id` has been asked to stop. */
-int ioThreadShouldStop(int id) {
-    return atomic_load_explicit(&io_thread_stop[id], memory_order_acquire);
-}
-
-/* Worker loop body shared by the Rust path. The Rust std::thread calls this
- * after owning the OS thread; it returns when asked to stop. Active-time
- * accounting mirrors the C fallback. */
-void ioThreadWorkerLoop(int id) {
-    int processed = 0;
-    monotime work_start_time = 0;
-    while (!ioThreadShouldStop(id)) {
-        monotime prev_work_start_time = work_start_time;
-        work_start_time = getMonotonicUs();
-        if (processed != 0) {
-            atomic_fetch_add_explicit(&used_active_time_io_thread[id],
-                                      work_start_time - prev_work_start_time, memory_order_relaxed);
-        }
-        processed = ioThreadRunOnce(id);
-        if (processed == 0) ioThreadParkIfIdle(id);
-    }
-    cleanupThreadResources(NULL);
-}
-
 static void *IOThreadMain(void *myid) {
     /* The ID is the thread ID number (from 1 to server.io_threads_num-1). ID 0 is the main thread. */
     long id = (long)myid;
+    char thdname[32];
 
-    ioThreadWorkerSetup((int)id);
+    snprintf(thdname, sizeof(thdname), "io_thd_%ld", id);
+    valkey_set_thread_title(thdname);
+    serverSetCpuAffinity(server.server_cpulist);
+    initSharedQueryBuf();
     pthread_cleanup_push(cleanupThreadResources, NULL);
 
+    thread_id = (int)id;
+    void *batch_jobs[BATCH_SIZE];
     int processed = 0;
     monotime work_start_time = 0;
     while (1) {
         /* Cancellation point so that pthread_cancel() from main thread is honored. */
         pthread_testcancel();
+        size_t batch_count = 0;
         monotime prev_work_start_time = work_start_time;
         work_start_time = getMonotonicUs();
         if (processed != 0) {
             atomic_fetch_add_explicit(&used_active_time_io_thread[id],
-                                      work_start_time - prev_work_start_time, memory_order_relaxed);
+                                      work_start_time - prev_work_start_time,
+                                      memory_order_relaxed);
         }
-        processed = ioThreadRunOnce((int)id);
-        if (processed == 0) ioThreadParkIfIdle((int)id);
+        processed = 0;
+        /* PRIORITY 1: Drain Private SPSC Queue (Batch Processing) */
+        while ((batch_count = spscDequeueBatch(&io_private_inbox[id], batch_jobs, BATCH_SIZE)) > 0) {
+            for (size_t i = 0; i < batch_count; i++) {
+                void *data;
+                int type;
+                untagJob(batch_jobs[i], &data, &type);
+
+                switch (type) {
+                case JOB_SPSC_FREE_ARGV:
+                    ioThreadFreeArgv((robj **)data);
+                    break;
+                case JOB_SPSC_POLL:
+                    ioThreadPoll((aeEventLoop *)data);
+                    break;
+                default:
+                    serverPanic("Invalid SPSC job type: %d", type);
+                }
+            }
+            processed += batch_count;
+        }
+
+        /* PRIORITY 2: Shared Global Queue (SPMC)
+         * Only checked after SPSC is drained. */
+        void *tagged_job;
+        if ((tagged_job = spmcDequeue(&io_shared_inbox[JOB_PRIORITY_HIGH])) != NULL) {
+            processTaggedSPMCJob(tagged_job);
+            processed++;
+        }
+
+        if ((tagged_job = spmcDequeue(&io_shared_inbox[JOB_PRIORITY_NORMAL])) != NULL) {
+            processTaggedSPMCJob(tagged_job);
+            processed++;
+        }
+
+        if (processed) {
+            atomic_fetch_add_explicit(&io_jobs_finished, processed, memory_order_release);
+        }
+
+        /* If both queues were empty (no processing done), wait for signal. */
+        if (processed == 0) {
+            int has_pending = 0;
+            for (int p = 0; p < JOB_PRIORITY_COUNT; p++) {
+                if (pending_io_responses[p]) has_pending = 1;
+            }
+            if (unlikely(has_pending)) {
+                flushPendingIOResponses(0);
+            } else {
+                /* If it is locked. We should block until main thread unlocks it. */
+                pthread_mutex_lock(&io_threads_mutex[id]);
+                pthread_mutex_unlock(&io_threads_mutex[id]);
+            }
+        }
     }
     pthread_cleanup_pop(0);
     return NULL;
@@ -499,18 +456,6 @@ static void createIOThread(int id) {
     pthread_mutex_init(&io_threads_mutex[id], NULL);
     pthread_mutex_lock(&io_threads_mutex[id]); /* Thread will be stopped. */
 
-#ifdef USE_RUST_IO_THREADS
-    /* Rust-owned worker thread: the Rust layer spawns an OS thread that calls
-     * back into ioThreadWorkerSetup()/ioThreadWorkerLoop(). The C mutex, queues
-     * and job handlers are unchanged -- only the thread lifecycle moves to Rust.
-     * io_threads[id] stays 0 (no pthread_t); shutdown goes through Rust. */
-    UNUSED(IOThreadMain);
-    if (valkey_net_io_thread_spawn(id) != 0) {
-        serverLog(LL_WARNING, "Fatal: Can't initialize Rust IO thread for id %d", id);
-        exit(1);
-    }
-    io_threads[id] = 0;
-#else
     pthread_t tid;
     pthread_attr_t attr;
     serverInitThreadAttribute(&attr);
@@ -522,21 +467,11 @@ static void createIOThread(int id) {
         exit(1);
     }
     io_threads[id] = tid;
-#endif
 }
 
 /* Terminates the IO thread specified by id. */
 static void shutdownIOThread(int id) {
     int err;
-
-#ifdef USE_RUST_IO_THREADS
-    /* Rust-owned worker: ask it to stop cooperatively, wake it if parked, and
-     * join it through the Rust layer. No pthread_t is tracked for it. */
-    atomic_store_explicit(&io_thread_stop[id], 1, memory_order_release);
-    pthread_mutex_unlock(&io_threads_mutex[id]); /* unpark if blocked */
-    valkey_net_io_thread_join(id);
-    pthread_mutex_destroy(&io_threads_mutex[id]);
-#else
     pthread_t tid = io_threads[id];
     if (tid == pthread_self()) return;
     if (tid == 0) return;
@@ -553,8 +488,6 @@ static void shutdownIOThread(int id) {
         serverLog(LL_NOTICE, "IO thread(tid:%lu) terminated", (unsigned long)tid);
     }
     pthread_mutex_destroy(&io_threads_mutex[id]);
-#endif
-    UNUSED(err);
 
     /* The joined worker's inbox may contain uncommitted JOB_SPSC_FREE_ARGV jobs. */
     if (!server.crashed) {

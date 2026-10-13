@@ -91,26 +91,66 @@ pub fn parse_multibulk_header(buf: &[u8]) -> MultibulkHeader {
     MultibulkHeader::Parsed { count, consumed }
 }
 
-/// Parse a base-10 i64 from ASCII bytes, like the subset of string2ll() this
-/// path uses. Rejects empty input, non-digits, and anything with a sign other
-/// than a leading '-'. Overflow is checked (checked_mul / checked_sub) rather
-/// than wrapping silently as C's `ll*10` can.
+/// Parse a base-10 integer with EXACTLY the acceptance rules of C's string2ll
+/// (util.c:string2llScalar), so the Rust parser cannot diverge from the C one:
+///   - empty, or length >= LONG_STR_SIZE (21), is rejected;
+///   - a single '0'..='9' is accepted as itself;
+///   - an optional leading '-', then a first digit that must be '1'..='9'
+///     (so "00", "0123", "-0", "-01" are all rejected, matching C);
+///   - every subsequent byte must be a digit;
+///   - overflow is checked at every step against the unsigned accumulator,
+///     with the final signed-range check (LLONG_MIN is representable).
+/// Returns None for every input string2ll returns 0 for.
 fn parse_i64(b: &[u8]) -> Option<i64> {
-    if b.is_empty() {
+    const LONG_STR_SIZE: usize = 21; // mirrors util.h LONG_STR_SIZE
+    let slen = b.len();
+    if slen == 0 || slen >= LONG_STR_SIZE {
         return None;
     }
-    let (neg, rest) = if b[0] == b'-' { (true, &b[1..]) } else { (false, b) };
-    if rest.is_empty() {
+    // Special case: a single digit (handles lone "0" too).
+    if slen == 1 && b[0].is_ascii_digit() {
+        return Some((b[0] - b'0') as i64);
+    }
+    let mut p = b;
+    let negative = p[0] == b'-';
+    if negative {
+        p = &p[1..];
+        if p.is_empty() {
+            return None; // lone "-"
+        }
+    }
+    // First digit must be 1..=9 (rejects leading zero / "0..." multi-char).
+    if !(b'1'..=b'9').contains(&p[0]) {
         return None;
     }
-    let mut acc: i64 = 0;
-    for &c in rest {
+    let mut v: u64 = (p[0] - b'0') as u64;
+    for &c in &p[1..] {
         if !c.is_ascii_digit() {
             return None;
         }
-        acc = acc.checked_mul(10)?.checked_sub((c - b'0') as i64)?; // accumulate as negative to reach i64::MIN
+        if v > u64::MAX / 10 {
+            return None; // overflow
+        }
+        v *= 10;
+        let d = (c - b'0') as u64;
+        if v > u64::MAX - d {
+            return None; // overflow
+        }
+        v += d;
     }
-    Some(if neg { acc } else { acc.checked_neg()? })
+    if negative {
+        // -(LLONG_MIN+1)+1 == i64::MIN magnitude; v may equal that.
+        let min_mag = (-(i64::MIN + 1)) as u64 + 1;
+        if v > min_mag {
+            return None;
+        }
+        Some((v as i128 * -1) as i64)
+    } else {
+        if v > i64::MAX as u64 {
+            return None;
+        }
+        Some(v as i64)
+    }
 }
 
 /// C-ABI probe used by the PoC demonstration: parse a multibulk header from a
@@ -249,5 +289,30 @@ mod tests {
     fn rejects_overflow_instead_of_wrapping() {
         // A count that would overflow i64*10 is rejected, not silently wrapped.
         assert_eq!(parse_multibulk_header(b"*99999999999999999999\r\n"), MultibulkHeader::Error);
+    }
+
+    #[test]
+    fn string2ll_exact_edge_cases() {
+        // Leading zeros are rejected by string2ll (except lone "0").
+        assert_eq!(parse_i64(b"0"), Some(0));
+        assert_eq!(parse_i64(b"00"), None);
+        assert_eq!(parse_i64(b"0123"), None);
+        assert_eq!(parse_i64(b"-0"), None);
+        assert_eq!(parse_i64(b"-01"), None);
+        // Lone minus and empty.
+        assert_eq!(parse_i64(b"-"), None);
+        assert_eq!(parse_i64(b""), None);
+        // Normal values and the signed boundaries.
+        assert_eq!(parse_i64(b"3"), Some(3));
+        assert_eq!(parse_i64(b"-5"), Some(-5));
+        assert_eq!(parse_i64(b"9223372036854775807"), Some(i64::MAX));
+        assert_eq!(parse_i64(b"-9223372036854775808"), Some(i64::MIN));
+        assert_eq!(parse_i64(b"9223372036854775808"), None); // MAX+1
+        assert_eq!(parse_i64(b"-9223372036854775809"), None); // MIN-1
+        // Length cap: >= 21 chars rejected like string2ll (slen >= LONG_STR_SIZE).
+        assert_eq!(parse_i64(b"100000000000000000000"), None); // 21 digits
+        // Non-digits.
+        assert_eq!(parse_i64(b"1a"), None);
+        assert_eq!(parse_i64(b"+5"), None);
     }
 }

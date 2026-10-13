@@ -783,7 +783,7 @@ ifneq (,$(findstring -m32,$(FINAL_CFLAGS)))
 endif
 
 ifeq ($(BUILD_RUST_NET),yes)
-    SERVER_CFLAGS+= -DUSE_RUST_NET -DUSE_RUST_IO_THREADS
+    SERVER_CFLAGS+= -DUSE_RUST_NET
     # Cross-compile support: RUST_TARGET sets the cargo triple (archive lands in
     # target/<triple>/release); CARGO_TARGET_DIR relocates the base. Default:
     # host triple, in-tree target/.
@@ -795,7 +795,13 @@ else
     VALKEY_NET_RUST_LIB=
 endif
 
-$(VALKEY_NET_CARGO_TARGET_DIR)/$(VALKEY_NET_RUST_TARGET_SUBDIR)/libvalkey_net.a: $(VALKEY_NET_RUST_DIR)/src/lib.rs $(VALKEY_NET_RUST_DIR)/Cargo.toml
+# Rebuild the archive when ANY crate source changes, not just lib.rs: the crate
+# now has resp_parse.rs, output_buffer.rs and generated/client_layout.rs, and a
+# change to one of those must relink. cargo does its own fine-grained rebuild;
+# this prerequisite list just has to be a superset of what cargo compiles.
+VALKEY_NET_RUST_SRCS=$(wildcard $(VALKEY_NET_RUST_DIR)/src/*.rs $(VALKEY_NET_RUST_DIR)/src/generated/*.rs)
+
+$(VALKEY_NET_CARGO_TARGET_DIR)/$(VALKEY_NET_RUST_TARGET_SUBDIR)/libvalkey_net.a: $(VALKEY_NET_RUST_SRCS) $(VALKEY_NET_RUST_DIR)/Cargo.toml
 	cd $(VALKEY_NET_RUST_DIR) && cargo build --release $(VALKEY_NET_RUST_TARGET_FLAG)
 
 .PHONY: valkey-net-rust
