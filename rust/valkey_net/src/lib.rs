@@ -11,6 +11,8 @@
 
 use core::ffi::{c_char, c_int, c_uint, c_void};
 
+mod resp_parse;
+
 /// ABI version of this Rust networking layer. Bumped when the exported C ABI
 /// changes so the C side can assert compatibility at startup.
 const VALKEY_NET_ABI_VERSION: c_uint = 1;
