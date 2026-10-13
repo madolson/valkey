@@ -108,17 +108,31 @@ maintainers must weigh.
 
 ## Next phases
 
-- **Phase 2 — Rust FFI stub.** A `rust/` crate built as a static lib exporting
-  one `extern "C"` symbol, linked into the server via `src/Makefile`, called
-  from C, proven at runtime. Establishes the toolchain and link path.
-- **Phase 3 — Rust networking (vanilla, no tokio).** Re-implement a slice of
-  the networking layer in Rust behind the existing `ConnectionType` vtable and
-  the `client_net.h` interface, using the existing `ae` event loop and
-  I/O-thread model. No new runtime.
+- **Phase 2 — Rust FFI stub.** DONE (commit `net(rust): add Rust networking
+  crate ...`). `rust/valkey_net` builds as `libvalkey_net.a`, linked via
+  `src/Makefile`, called from `initServer()`; runtime-proven by a startup log
+  line whose checksum is computed in Rust.
+- **Phase 3 — Rust networking (vanilla, no tokio).** IN PROGRESS.
+  - First slice DONE (commit `net(rust): move TCP socket read/write/writev
+    ...`): `connSocketRead/Write/Writev` delegate the raw `read(2)/write(2)/
+    writev(2)` to `valkey_net_read/write/writev`; the C wrapper keeps the
+    `connection`-struct state transitions and the IO-thread asserts. All TCP
+    client byte-I/O flows through Rust, behind the existing `ConnectionType`
+    vtable and the `ae` loop. No concurrency-model change.
+  - **Linkage boundary (important).** `anet.o` and `connection.o` are linked
+    into `valkey-cli`, `valkey-benchmark` and the check tools, which do NOT
+    link `libvalkey_net.a`. So the Rust port is confined to **server-only
+    transport code** (`socket.c`, `networking.c`); the shared anet/connection
+    utility layer stays C to avoid breaking those binaries' link. This is the
+    natural seam for the vanilla-Rust approach.
 - **Phase 3b — tokio feasibility spike.** A separate branch exploring a
   tokio-owned ingress, to understand feasibility and cost. Expected to be a
-  research prototype, not a drop-in.
+  research prototype, not a drop-in: Valkey's single-threaded `ae` loop + main-
+  thread-owned client buffers conflict with tokio's work-stealing multi-thread
+  reactor, so a real integration means a channel hand-off from a tokio ingress
+  to the C command executor — a fork-level rearchitecture, benchmarked honestly.
 - **Phase 4 — interface review.** Parallel sub-agents review the C↔Rust
-  interface for consistency and coherence.
-- **Phase 5 — local benchmarking.** `valkey-benchmark` A/B on one host to check
-  the Rust path matches the C path.
+  interface (`valkey_net.h` / `lib.rs` / the `socket.c` call sites) for
+  consistency and coherence.
+- **Phase 5 — local benchmarking.** `valkey-benchmark` A/B: the pure-C baseline
+  vs the Rust-I/O build on one host, to confirm parity.
