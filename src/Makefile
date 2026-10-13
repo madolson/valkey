@@ -783,7 +783,7 @@ ifneq (,$(findstring -m32,$(FINAL_CFLAGS)))
 endif
 
 ifeq ($(BUILD_RUST_NET),yes)
-    SERVER_CFLAGS+= -DUSE_RUST_NET
+    SERVER_CFLAGS+= -DUSE_RUST_NET -DUSE_RUST_IO_THREADS
     # Cross-compile support: RUST_TARGET sets the cargo triple (archive lands in
     # target/<triple>/release); CARGO_TARGET_DIR relocates the base. Default:
     # host triple, in-tree target/.

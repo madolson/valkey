@@ -40,6 +40,12 @@ ssize_t valkey_net_write(int fd, const void *data, size_t data_len, int *out_err
 ssize_t valkey_net_read(int fd, void *buf, size_t buf_len, int *out_errno);
 ssize_t valkey_net_writev(int fd, const struct iovec *iov, int iovcnt, int *out_errno);
 
+/* Rust-owned IO worker thread lifecycle (used when USE_RUST_IO_THREADS is set).
+ * spawn returns 0 on success, -1 on failure; join stops+joins the worker. The
+ * Rust thread calls back into ioThreadWorkerSetup()/ioThreadWorkerLoop(). */
+int valkey_net_io_thread_spawn(int id);
+void valkey_net_io_thread_join(int id);
+
 #ifdef __cplusplus
 }
 #endif
