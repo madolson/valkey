@@ -9,7 +9,7 @@
 //! Everything here is `#[no_mangle] extern "C"` and uses only C-ABI types, so
 //! the symbols are callable from C exactly as declared in `valkey_net.h`.
 
-use core::ffi::{c_char, c_int, c_uint};
+use core::ffi::{c_char, c_int, c_uint, c_void};
 
 /// ABI version of this Rust networking layer. Bumped when the exported C ABI
 /// changes so the C side can assert compatibility at startup.
@@ -50,4 +50,98 @@ pub unsafe extern "C" fn valkey_net_cstr_checksum(s: *const c_char) -> c_int {
         p = p.add(1);
     }
     (sum & 0x7fff_ffff) as c_int
+}
+
+// ---------------------------------------------------------------------------
+// Socket byte-I/O leaf operations (Phase 3).
+//
+// These mirror the raw syscall core of connSocketRead/Write/Writev in
+// socket.c. The Rust side performs the I/O and reports the raw syscall result
+// plus the resulting errno; the thin C wrapper keeps ownership of the
+// `connection` struct state transitions (and its debug asserts, which call
+// C-only helpers). This is the deliberate FFI granularity for the port: Rust
+// owns the I/O, C owns the struct policy.
+//
+// We declare the libc syscalls directly rather than pulling in the `libc`
+// crate, to keep the static library dependency-free and the review small.
+// ---------------------------------------------------------------------------
+
+// iovec, matching struct iovec on Linux/*BSD (void* base, size_t len).
+#[repr(C)]
+pub struct ValkeyNetIovec {
+    pub iov_base: *mut c_void,
+    pub iov_len: usize,
+}
+
+extern "C" {
+    fn write(fd: c_int, buf: *const c_void, count: usize) -> isize;
+    fn read(fd: c_int, buf: *mut c_void, count: usize) -> isize;
+    fn writev(fd: c_int, iov: *const ValkeyNetIovec, iovcnt: c_int) -> isize;
+    // errno location accessor; __errno_location on glibc.
+    #[cfg_attr(target_env = "gnu", link_name = "__errno_location")]
+    fn errno_location() -> *mut c_int;
+}
+
+#[inline]
+unsafe fn current_errno() -> c_int {
+    *errno_location()
+}
+
+/// write(2) on `fd`. Returns the raw syscall result (bytes written, or <0 on
+/// error). On a negative return, `*out_errno` is set to the errno value so the
+/// C caller can apply its state-transition policy; on success it is set to 0.
+///
+/// # Safety
+/// `data` must point to at least `data_len` readable bytes. `out_errno` must be
+/// a valid pointer or NULL.
+#[no_mangle]
+pub unsafe extern "C" fn valkey_net_write(
+    fd: c_int,
+    data: *const c_void,
+    data_len: usize,
+    out_errno: *mut c_int,
+) -> isize {
+    let ret = write(fd, data, data_len);
+    if !out_errno.is_null() {
+        *out_errno = if ret < 0 { current_errno() } else { 0 };
+    }
+    ret
+}
+
+/// writev(2) on `fd`. See `valkey_net_write` for the return/errno contract.
+///
+/// # Safety
+/// `iov` must point to `iovcnt` valid iovec entries. `out_errno` may be NULL.
+#[no_mangle]
+pub unsafe extern "C" fn valkey_net_writev(
+    fd: c_int,
+    iov: *const ValkeyNetIovec,
+    iovcnt: c_int,
+    out_errno: *mut c_int,
+) -> isize {
+    let ret = writev(fd, iov, iovcnt);
+    if !out_errno.is_null() {
+        *out_errno = if ret < 0 { current_errno() } else { 0 };
+    }
+    ret
+}
+
+/// read(2) on `fd`. Returns the raw syscall result: 0 means the peer closed,
+/// <0 means error (with `*out_errno` set), >0 is the byte count.
+///
+/// # Safety
+/// `buf` must point to at least `buf_len` writable bytes. `out_errno` may be
+/// NULL.
+#[no_mangle]
+pub unsafe extern "C" fn valkey_net_read(
+    fd: c_int,
+    buf: *mut c_void,
+    buf_len: usize,
+    out_errno: *mut c_int,
+) -> isize {
+    let ret = read(fd, buf, buf_len);
+    if !out_errno.is_null() {
+        *out_errno = if ret < 0 { current_errno() } else { 0 };
+    }
+    ret
 }

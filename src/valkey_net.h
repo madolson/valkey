@@ -12,6 +12,8 @@
 #ifndef VALKEY_NET_H
 #define VALKEY_NET_H
 
+#include <sys/uio.h> /* struct iovec */
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -25,6 +27,16 @@ unsigned int valkey_net_abi_version(void);
 /* Compute a trivial checksum of a NUL-terminated C string, in Rust.
  * Returns -1 if s is NULL. Used by the Phase 2 link smoke test. */
 int valkey_net_cstr_checksum(const char *s);
+
+/* Socket byte-I/O leaf operations, implemented in Rust (Phase 3).
+ *
+ * Each performs the raw syscall on `fd` and returns its result (bytes
+ * transferred, 0 for read-EOF, or <0 on error). On a negative return the errno
+ * is written through `out_errno` (set to 0 otherwise); `out_errno` may be NULL.
+ * The C caller retains ownership of connection-struct state transitions. */
+long valkey_net_write(int fd, const void *data, unsigned long data_len, int *out_errno);
+long valkey_net_read(int fd, void *buf, unsigned long buf_len, int *out_errno);
+long valkey_net_writev(int fd, const struct iovec *iov, int iovcnt, int *out_errno);
 
 #ifdef __cplusplus
 }
