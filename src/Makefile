@@ -801,7 +801,14 @@ endif
 # this prerequisite list just has to be a superset of what cargo compiles.
 VALKEY_NET_RUST_SRCS=$(wildcard $(VALKEY_NET_RUST_DIR)/src/*.rs $(VALKEY_NET_RUST_DIR)/src/generated/*.rs)
 
-$(VALKEY_NET_CARGO_TARGET_DIR)/$(VALKEY_NET_RUST_TARGET_SUBDIR)/libvalkey_net.a: $(VALKEY_NET_RUST_SRCS) $(VALKEY_NET_RUST_DIR)/Cargo.toml
+# The '| .make-prerequisites' is an ORDER-ONLY prerequisite: on a fresh tree the
+# first build runs persist-settings -> distclean (which cargo-cleans the Rust
+# target). Without this ordering the archive rule races that distclean under
+# make -j and the just-built .a is deleted ("No such file or directory" at link,
+# or a cargo temp-dir race). Ordering it after .make-prerequisites makes the
+# distclean finish first; order-only means a settings rebuild does not force a
+# needless cargo rebuild.
+$(VALKEY_NET_CARGO_TARGET_DIR)/$(VALKEY_NET_RUST_TARGET_SUBDIR)/libvalkey_net.a: $(VALKEY_NET_RUST_SRCS) $(VALKEY_NET_RUST_DIR)/Cargo.toml | .make-prerequisites
 	cd $(VALKEY_NET_RUST_DIR) && cargo build --release $(VALKEY_NET_RUST_TARGET_FLAG)
 
 .PHONY: valkey-net-rust
