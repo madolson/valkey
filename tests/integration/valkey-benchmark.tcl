@@ -439,6 +439,28 @@ tags {"benchmark network external:skip logreqres:skip"} {
             file delete $csv_file
         }
 
+        test {benchmark: dataset mode rejects repeat counts and command sequences} {
+            set csv_file [tmpfile "dataset.csv"]
+            set fd [open $csv_file w]
+            puts $fd "a\nfoo"
+            close $fd
+
+            foreach template {
+                {3 SET k __field:a__}
+                {RPUSH l __field:a__ ; RPUSH l2 x}
+                {SET k __field:a__ ;}
+            } {
+                set cmd [valkeybenchmark $master_host $master_port "--dataset $csv_file -n 2 -c 1 -- $template"]
+                if {[catch { exec {*}$cmd } error]} {
+                    assert_match "*Dataset mode does not support repeat counts or ';' separated commands*" $error
+                } else {
+                    fail "Expected error for dataset template: $template"
+                }
+            }
+
+            file delete $csv_file
+        }
+
         test {benchmark: dataset with --csv produces clean CSV only} {
             # Create test CSV dataset
             set csv_data "name,value\ntest1,val1\ntest2,val2"
