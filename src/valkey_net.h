@@ -66,6 +66,12 @@ valkeyNetMultibulkParse valkey_net_parse_multibulk(const unsigned char *data, si
 struct client;
 size_t valkey_net_add_reply_plain(struct client *c, const unsigned char *payload, size_t len);
 
+/* R2: per-argument object construction through Rust. valkey_net_make_string_arg
+ * builds one OBJ_STRING robj from a (ptr,len) span by calling the C
+ * createStringObject -- the per-arg FFI boundary the multibulk loop routes
+ * through when USE_RUST_NET is set, measured by the MSET-heavy microbench. */
+void *valkey_net_make_string_arg(const char *ptr, size_t len);
+
 #ifdef __cplusplus
 }
 #endif

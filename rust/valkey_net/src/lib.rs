@@ -22,6 +22,7 @@ mod output_buffer;
 // then its public surface has no non-test caller, which is expected.
 #[allow(dead_code)]
 mod shadow_parser;
+mod argv_build;
 #[cfg(test)]
 mod diff_test;
 

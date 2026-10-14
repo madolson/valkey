@@ -4338,7 +4338,14 @@ static int parseMultibulk(client *c,
                 c->querybuf = sdsnewlen(SDS_NOINIT, c->bulklen + 2);
                 sdsclear(c->querybuf);
             } else {
+#ifdef USE_RUST_NET
+                /* R2: construct the argument object through the Rust FFI
+                 * boundary (which calls createStringObject). This is the
+                 * per-argument hop the MSET-heavy microbench measures. */
+                (*argv)[(*argc)++] = valkey_net_make_string_arg(c->querybuf + c->qb_pos, c->bulklen);
+#else
                 (*argv)[(*argc)++] = createStringObject(c->querybuf + c->qb_pos, c->bulklen);
+#endif
                 *argv_len_sum += c->bulklen;
                 c->qb_pos += c->bulklen + 2;
             }
