@@ -80,6 +80,7 @@ start_server {tags {"modules"} overrides {{save ""}}} {
 set unloadmodule [file normalize tests/modules/defragunload.so]
 set infomodule [file normalize tests/modules/infotest.so]
 
+# Returns 0 if the server was compiled without active defrag.
 proc start_held_global_defrag {} {
     r config set active-defrag-ignore-bytes 1
     r config set active-defrag-threshold-lower 0
@@ -104,10 +105,10 @@ proc assert_defragtest_cursor_intact {} {
 }
 
 start_server {tags {"modules"} overrides {{save ""}}} {
-    test {Module defrag: unloading the module being defragged does not pass its cursor on} {
-        r module load $unloadmodule
-        r module load $testmodule 100
-        if {[start_held_global_defrag]} {
+    r module load $unloadmodule
+    r module load $testmodule 100
+    if {[start_held_global_defrag]} {
+        test {Module defrag: unloading the module being defragged does not pass its cursor on} {
             r module unload defragunload
             assert_defragtest_cursor_intact
         }
@@ -115,12 +116,22 @@ start_server {tags {"modules"} overrides {{save ""}}} {
 }
 
 start_server {tags {"modules"} overrides {{save ""}}} {
-    test {Module defrag: unloading an earlier module does not skip the module being defragged} {
-        r module load $infomodule
-        r module load $unloadmodule
-        r module load $testmodule 100
-        if {[start_held_global_defrag]} {
+    r module load $infomodule
+    r module load $unloadmodule
+    r module load $testmodule 100
+    if {[start_held_global_defrag]} {
+        test {Module defrag: unloading an earlier module does not skip the module being defragged} {
             r module unload infotest
+
+            # defragunload must still be the module being defragged.
+            set calls [r defragunload.calls]
+            wait_for_condition 100 50 {
+                [r defragunload.calls] > $calls
+            } else {
+                fail "defragunload was skipped after unloading infotest"
+            }
+            assert_equal 0 [getInfoProperty [r info defragtest_stats] defragtest_global_attempts]
+
             r defragunload.release
             assert_defragtest_cursor_intact
         }
