@@ -5027,7 +5027,9 @@ int processCommand(client *c) {
     } else {
         int flags = CMD_CALL_FULL;
         call(c, flags);
-        if (listLength(server.ready_keys) && !isInsideYieldingLongCommand()) handleClientsBlockedOnKeys();
+        /* A caller that wraps us in an execution unit handles ready keys after exiting it. */
+        if (listLength(server.ready_keys) && !isInsideYieldingLongCommand() && !server.execution_nesting)
+            handleClientsBlockedOnKeys();
     }
     return C_OK;
 }

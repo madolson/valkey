@@ -438,4 +438,121 @@ foreach cmd {rm_call vm_call_argv } {
             r fsl.clear l
         }
     }
+
+    start_server {tags {"modules needs:debug needs:repl"} overrides {forkless-infrastructure-enabled yes save ""}} {
+        r module load $testmodule
+
+        test "Write blocked on a key in use by forkless save runs on unblock - $cmd" {
+            # An integer encoded string is not cloned, so the save thread uses the key itself.
+            r set k 1
+            r config set rdb-key-save-delay 1000000
+            r config set bgsave-default-method forkless
+            r bgsave
+            wait_for_condition 50 100 {
+                [s rdb_bgsave_in_progress] == 1
+            } else {
+                fail "forkless bgsave did not start"
+            }
+
+            set rd [valkey_deferring_client]
+            $rd do_${cmd}_async incr k
+            wait_for_blocked_clients_count 1
+            r config set rdb-key-save-delay 0
+            waitForBgsave r
+            wait_for_blocked_clients_count 0
+            assert_equal 2 [r get k]
+            assert_equal 2 [$rd read]
+            $rd close
+        }
+
+        test "Write blocked on a key in use by forkless save is postponed by CLIENT PAUSE - $cmd" {
+            r set k 1
+            r config set rdb-key-save-delay 1000000
+            r bgsave
+            wait_for_condition 50 100 {
+                [s rdb_bgsave_in_progress] == 1
+            } else {
+                fail "forkless bgsave did not start"
+            }
+
+            set rd [valkey_deferring_client]
+            $rd do_${cmd}_async incr k
+            wait_for_blocked_clients_count 1
+            # The key is released while writes are paused, so the re-executed command is postponed.
+            r client pause 100000 write
+            r config set rdb-key-save-delay 0
+            waitForBgsave r
+            assert_equal 1 [r get k]
+            r client unpause
+            wait_for_blocked_clients_count 0
+            assert_equal 2 [r get k]
+            assert_equal 2 [$rd read]
+            $rd close
+        }
+
+        test "Write re-executed after forkless save wakes a client blocked on keys - $cmd" {
+            r flushall
+            set repl [attach_to_replication_stream]
+            r rpush l a
+            r config set rdb-key-save-delay 1000000
+            r bgsave
+            wait_for_condition 50 100 {
+                [s rdb_bgsave_in_progress] == 1
+            } else {
+                fail "forkless bgsave did not start"
+            }
+
+            set rd_blpop [valkey_deferring_client]
+            $rd_blpop blpop dst 0
+            set rd [valkey_deferring_client]
+            $rd do_${cmd}_async lmove l dst left right
+            wait_for_blocked_clients_count 2
+            r config set rdb-key-save-delay 0
+            waitForBgsave r
+            wait_for_blocked_clients_count 0
+            assert_equal a [$rd read]
+            assert_equal {dst a} [$rd_blpop read]
+            assert_replication_stream $repl {
+                {select *}
+                {rpush l a}
+                {lmove l dst left right}
+                {lpop dst}
+            }
+            close_replication_stream $repl
+            $rd close
+            $rd_blpop close
+        }
+
+        test "Write re-executed after forkless save runs with its unblock handler as a unit - $cmd" {
+            r flushall
+            set repl [attach_to_replication_stream]
+            r rpush l a
+            r config set rdb-key-save-delay 1000000
+            r bgsave
+            wait_for_condition 50 100 {
+                [s rdb_bgsave_in_progress] == 1
+            } else {
+                fail "forkless bgsave did not start"
+            }
+
+            set rd [valkey_deferring_client]
+            $rd blpop_and_set_multiple_keys_with_${cmd} l string_foo 1 string_bar 2
+            wait_for_blocked_clients_count 1
+            r config set rdb-key-save-delay 0
+            waitForBgsave r
+            wait_for_blocked_clients_count 0
+            assert_equal OK [$rd read]
+            assert_replication_stream $repl {
+                {select *}
+                {rpush l a}
+                {multi}
+                {lpop l}
+                {set string_foo 1}
+                {set string_bar 2}
+                {exec}
+            }
+            close_replication_stream $repl
+            $rd close
+        }
+    }
 }

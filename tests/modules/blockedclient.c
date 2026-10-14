@@ -1039,6 +1039,8 @@ int ValkeyModule_OnLoad(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int arg
     if (ValkeyModule_Init(ctx, "blockedclient", 1, VALKEYMODULE_APIVER_1)== VALKEYMODULE_ERR)
         return VALKEYMODULE_ERR;
 
+    ValkeyModule_SetModuleOptions(ctx, VALKEYMODULE_OPTIONS_HANDLE_FORKLESS);
+
     if (ValkeyModule_CreateCommand(ctx, "acquire_gil", acquire_gil, "", 0, 0, 0) == VALKEYMODULE_ERR)
         return VALKEYMODULE_ERR;
 
