@@ -5388,13 +5388,18 @@ int VM_ZsetRangeNext(ValkeyModuleKey *key) {
             return 1;
         }
     } else if (objectGetEncoding(key->value) == OBJ_ENCODING_BTREE) {
+        /* The cursor sits between elements, so after a backward move it is
+         * just before 'current' and the first step returns 'current' itself. */
         OrderedIndexItem *next = orderedIndexNext(&key->u.zset.oi);
+        if (next == key->u.zset.current) next = orderedIndexNext(&key->u.zset.oi);
         if (next == NULL) {
             key->u.zset.er = 1;
             return 0;
         } else {
-            /* Are we still within the range? */
+            /* Are we still within the range? If not, step back so the cursor
+             * stays next to 'current'. */
             if (key->u.zset.type == VALKEYMODULE_ZSET_RANGE_SCORE && !zsetScoreLteMax(orderedIndexItemGetScore(next), &key->u.zset.rs)) {
+                orderedIndexPrev(&key->u.zset.oi);
                 key->u.zset.er = 1;
                 return 0;
             } else if (key->u.zset.type == VALKEYMODULE_ZSET_RANGE_LEX) {
@@ -5402,6 +5407,7 @@ int VM_ZsetRangeNext(ValkeyModuleKey *key) {
                 size_t ele_len;
                 orderedIndexItemGetElement(next, &ele, &ele_len);
                 if (!zsetLexLteMax(ele, ele_len, &key->u.zset.lrs)) {
+                    orderedIndexPrev(&key->u.zset.oi);
                     key->u.zset.er = 1;
                     return 0;
                 }
@@ -5453,13 +5459,18 @@ int VM_ZsetRangePrev(ValkeyModuleKey *key) {
             return 1;
         }
     } else if (objectGetEncoding(key->value) == OBJ_ENCODING_BTREE) {
+        /* The cursor sits between elements, so after a forward move it is
+         * just after 'current' and the first step returns 'current' itself. */
         OrderedIndexItem *prev = orderedIndexPrev(&key->u.zset.oi);
+        if (prev == key->u.zset.current) prev = orderedIndexPrev(&key->u.zset.oi);
         if (prev == NULL) {
             key->u.zset.er = 1;
             return 0;
         } else {
-            /* Are we still within the range? */
+            /* Are we still within the range? If not, step forward so the
+             * cursor stays next to 'current'. */
             if (key->u.zset.type == VALKEYMODULE_ZSET_RANGE_SCORE && !zsetScoreGteMin(orderedIndexItemGetScore(prev), &key->u.zset.rs)) {
+                orderedIndexNext(&key->u.zset.oi);
                 key->u.zset.er = 1;
                 return 0;
             } else if (key->u.zset.type == VALKEYMODULE_ZSET_RANGE_LEX) {
@@ -5467,6 +5478,7 @@ int VM_ZsetRangePrev(ValkeyModuleKey *key) {
                 size_t ele_len;
                 orderedIndexItemGetElement(prev, &ele, &ele_len);
                 if (!zsetLexGteMin(ele, ele_len, &key->u.zset.lrs)) {
+                    orderedIndexNext(&key->u.zset.oi);
                     key->u.zset.er = 1;
                     return 0;
                 }

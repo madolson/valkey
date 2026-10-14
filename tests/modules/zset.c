@@ -1,6 +1,7 @@
 #include "valkeymodule.h"
 #include <math.h>
 #include <errno.h>
+#include <strings.h>
 
 #define UNUSED(V) ((void) V)
 
@@ -127,6 +128,57 @@ int zset_revrangebylex(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc
     return zset_internal_rangebylex(ctx, argv, 1);
 }
 
+/* ZSET.WALK key SCORE|LEX min max FIRST|LAST [NEXT|PREV ...]
+ *
+ * Starts a range iterator at the first or last element of the range, then
+ * applies each move in order. Replies with the starting element followed by
+ * one entry per move: the new current element, or null if the move
+ * returned 0. Score bounds are inclusive; lex bounds use ZRANGEBYLEX syntax.
+ */
+int zset_walk(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
+    if (argc < 6) return ValkeyModule_WrongArity(ctx);
+    ValkeyModule_AutoMemory(ctx);
+    ValkeyModuleKey *key = ValkeyModule_OpenKey(ctx, argv[1], VALKEYMODULE_READ);
+    if (ValkeyModule_KeyType(key) != VALKEYMODULE_KEYTYPE_ZSET) {
+        return ValkeyModule_ReplyWithError(ctx, VALKEYMODULE_ERRORMSG_WRONGTYPE);
+    }
+
+    const char *type = ValkeyModule_StringPtrLen(argv[2], NULL);
+    int first = !strcasecmp(ValkeyModule_StringPtrLen(argv[5], NULL), "first");
+    int res;
+    if (!strcasecmp(type, "score")) {
+        double min, max;
+        if (ValkeyModule_StringToDouble(argv[3], &min) != VALKEYMODULE_OK ||
+            ValkeyModule_StringToDouble(argv[4], &max) != VALKEYMODULE_OK) {
+            return ValkeyModule_ReplyWithError(ctx, "invalid range");
+        }
+        res = first ? ValkeyModule_ZsetFirstInScoreRange(key, min, max, 0, 0)
+                    : ValkeyModule_ZsetLastInScoreRange(key, min, max, 0, 0);
+    } else {
+        res = first ? ValkeyModule_ZsetFirstInLexRange(key, argv[3], argv[4])
+                    : ValkeyModule_ZsetLastInLexRange(key, argv[3], argv[4]);
+    }
+    if (res != VALKEYMODULE_OK) return ValkeyModule_ReplyWithError(ctx, "invalid range");
+
+    ValkeyModule_ReplyWithArray(ctx, argc - 5);
+    ValkeyModuleString *ele = ValkeyModule_ZsetRangeCurrentElement(key, NULL);
+    if (ele) {
+        ValkeyModule_ReplyWithString(ctx, ele);
+    } else {
+        ValkeyModule_ReplyWithNull(ctx);
+    }
+    for (int j = 6; j < argc; j++) {
+        int next = !strcasecmp(ValkeyModule_StringPtrLen(argv[j], NULL), "next");
+        if (next ? ValkeyModule_ZsetRangeNext(key) : ValkeyModule_ZsetRangePrev(key)) {
+            ValkeyModule_ReplyWithString(ctx, ValkeyModule_ZsetRangeCurrentElement(key, NULL));
+        } else {
+            ValkeyModule_ReplyWithNull(ctx);
+        }
+    }
+    ValkeyModule_ZsetRangeStop(key);
+    return VALKEYMODULE_OK;
+}
+
 static void zset_members_cb(ValkeyModuleKey *key, ValkeyModuleString *field, ValkeyModuleString *value, void *privdata) {
     UNUSED(key);
     UNUSED(value);
@@ -179,6 +231,10 @@ int ValkeyModule_OnLoad(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int arg
         return VALKEYMODULE_ERR;
 
     if (ValkeyModule_CreateCommand(ctx, "zset.revrangebylex", zset_revrangebylex, "readonly",
+                                  1, 1, 1) == VALKEYMODULE_ERR)
+        return VALKEYMODULE_ERR;
+
+    if (ValkeyModule_CreateCommand(ctx, "zset.walk", zset_walk, "readonly",
                                   1, 1, 1) == VALKEYMODULE_ERR)
         return VALKEYMODULE_ERR;
 
