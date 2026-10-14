@@ -289,6 +289,22 @@ tags {"benchmark network external:skip logreqres:skip"} {
             file delete $csv_file
         }
 
+        test {benchmark: dataset values containing placeholder text are not expanded} {
+            set csv_data "id,a,b\n1,x __field:b__,y\n2,__field:,y\n"
+            set csv_file [tmpfile "placeholder_text.csv"]
+            set fd [open $csv_file w]
+            puts $fd $csv_data
+            close $fd
+
+            set cmd [valkeybenchmark $master_host $master_port \
+                "--dataset $csv_file -n 2 -c 1 -- SET doc:__field:id__ __field:a__|__field:b__"]
+            common_bench_setup $cmd
+
+            assert_equal "x __field:b__|y" [r get doc:1]
+            assert_equal "__field:|y" [r get doc:2]
+            file delete $csv_file
+        }
+
         test {benchmark: dataset with maxdocs limit} {
             # Create test dataset with multiple rows
             set csv_data "name,value\nitem1,value1\nitem2,value2\nitem3,value3\nitem4,value4"
