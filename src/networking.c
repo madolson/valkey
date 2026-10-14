@@ -31,6 +31,7 @@
 #include "cluster.h"
 #include "cluster_slot_stats.h"
 #include "cluster_migrateslots.h"
+#include "valkey_net.h"
 #include "script.h"
 #include "intset.h"
 #include "sds.h"
@@ -403,8 +404,8 @@ client *createClient(connection *conn) {
     c->module_data = NULL;
     c->mstate = NULL;
     c->woff = 0;
-    c->peerid = NULL;
-    c->sockname = NULL;
+    c->net.peerid = NULL;
+    c->net.sockname = NULL;
     c->client_list_node = NULL;
     c->io_read_state = CLIENT_IDLE;
     c->io_write_state = CLIENT_IDLE;
@@ -416,11 +417,11 @@ client *createClient(connection *conn) {
     c->mem_usage_bucket = NULL;
     c->mem_usage_bucket_node = NULL;
     if (conn) linkClient(c);
-    c->net_input_bytes = 0;
-    c->net_input_bytes_curr_cmd = 0;
-    c->net_output_bytes = 0;
-    c->net_output_bytes_curr_cmd = 0;
-    c->io_tracked_reply_len = 0;
+    c->net.net_input_bytes = 0;
+    c->net.net_input_bytes_curr_cmd = 0;
+    c->net.net_output_bytes = 0;
+    c->net.net_output_bytes_curr_cmd = 0;
+    c->net.io_tracked_reply_len = 0;
     c->commands_processed = 0;
     c->io_last_reply_block = NULL;
     c->io_last_bufpos = 0;
@@ -655,7 +656,19 @@ static size_t _addReplyPayloadToBuffer(client *c, const void *payload, size_t le
     if (c->flag.buf_encoded) {
         int track_bytes = (server.commandlog[COMMANDLOG_TYPE_LARGE_REPLY].threshold != -1);
         reply_len = upsertPayloadHeader(c->buf, &c->bufpos, &c->last_header, payload_type, len, c->slot, track_bytes, available);
+        if (!reply_len) return 0;
+        memcpy(c->buf + c->bufpos, payload, reply_len);
+        c->bufpos += reply_len;
+        if (c->buf_peak < (size_t)c->bufpos) c->buf_peak = (size_t)c->bufpos;
+        return reply_len;
     }
+#ifdef USE_RUST_NET
+    /* Plain (unencoded) append is owned by Rust, operating on the real client
+     * struct via the bindgen layout mirror. The bounds-sensitive memcpy becomes
+     * a length-bounded Rust slice copy. See rust/valkey_net/src/output_buffer.rs
+     * and RUST_DEVELOPMENT_NOTES.md. */
+    return valkey_net_add_reply_plain(c, (const unsigned char *)payload, len);
+#else
     if (!reply_len) return 0;
 
     memcpy(c->buf + c->bufpos, payload, reply_len);
@@ -663,6 +676,7 @@ static size_t _addReplyPayloadToBuffer(client *c, const void *payload, size_t le
     /* We update the buffer peak after appending the reply to the buffer */
     if (c->buf_peak < (size_t)c->bufpos) c->buf_peak = (size_t)c->bufpos;
     return reply_len;
+#endif
 }
 
 static size_t _addReplyToBuffer(client *c, const char *s, size_t len) {
@@ -770,7 +784,7 @@ void _addReplyToBufferOrList(client *c, const char *s, size_t len) {
         return;
     }
 
-    c->net_output_bytes_curr_cmd += len;
+    c->net.net_output_bytes_curr_cmd += len;
     /* We call it here because this function may affect the reply
      * buffer offset (see function comment) */
     reqresSaveClientReplyOffset(c);
@@ -1228,7 +1242,7 @@ void setDeferredReply(client *c, void *node, const char *s, size_t length) {
         size_t len_to_copy = prev->size - prev->used;
         if (len_to_copy > length) len_to_copy = length;
         memcpy(prev->buf + prev->used, s, len_to_copy);
-        c->net_output_bytes_curr_cmd += len_to_copy;
+        c->net.net_output_bytes_curr_cmd += len_to_copy;
         prev->used += len_to_copy;
         length -= len_to_copy;
         if (length == 0) {
@@ -1243,7 +1257,7 @@ void setDeferredReply(client *c, void *node, const char *s, size_t length) {
         next->buf != c->io_last_written.buf && !next->flag.buf_encoded) {
         memmove(next->buf + length, next->buf, next->used);
         memcpy(next->buf, s, length);
-        c->net_output_bytes_curr_cmd += length;
+        c->net.net_output_bytes_curr_cmd += length;
         next->used += length;
         listDelNode(reply_list, ln);
     } else {
@@ -1255,7 +1269,7 @@ void setDeferredReply(client *c, void *node, const char *s, size_t length) {
         buf->used = length;
         buf->flag.buf_encoded = 0;
         memcpy(buf->buf, s, length);
-        c->net_output_bytes_curr_cmd += length;
+        c->net.net_output_bytes_curr_cmd += length;
         listNodeValue(ln) = buf;
         *reply_bytes += buf->size;
 
@@ -1539,9 +1553,9 @@ void addReplyBulk(client *c, robj *obj) {
             size_t str_len = sdslen(objectGetVal(obj));
             uint32_t num_len = digits10(str_len);
             /* RESP encodes bulk strings as $<length>\r\n<data>\r\n */
-            c->net_output_bytes_curr_cmd += (num_len + 3); /* $<length>\r\n */
-            c->net_output_bytes_curr_cmd += str_len;       /* <data> */
-            c->net_output_bytes_curr_cmd += 2;             /* \r\n */
+            c->net.net_output_bytes_curr_cmd += (num_len + 3); /* $<length>\r\n */
+            c->net.net_output_bytes_curr_cmd += str_len;       /* <data> */
+            c->net.net_output_bytes_curr_cmd += 2;             /* \r\n */
         }
         return;
     }
@@ -2476,8 +2490,8 @@ int freeClient(client *c) {
     if (c->lib_ver) decrRefCount(c->lib_ver);
     freeClientMultiState(c);
     if (c->cob_trend) trendCalculator_free(c->cob_trend);
-    sdsfree(c->peerid);
-    sdsfree(c->sockname);
+    sdsfree(c->net.peerid);
+    sdsfree(c->net.sockname);
     zfree(c);
     return 1;
 }
@@ -3341,7 +3355,7 @@ static void trackBufReferences(char *buf, size_t bufpos, client *c) {
                  * stops early on partial writes (limit_reached) and may not check
                  * headers after write boundary */
                 header->reply_len = total_reply_len;
-                atomic_fetch_add_explicit(&c->io_tracked_reply_len, total_reply_len, memory_order_relaxed);
+                atomic_fetch_add_explicit(&c->net.io_tracked_reply_len, total_reply_len, memory_order_relaxed);
             }
         }
 
@@ -3361,7 +3375,7 @@ static void releaseBufReferences(char *buf, size_t bufpos, client *c) {
             /* Decrement tracked reply size only if it was previously tracked.
              * Use atomic exchange to ensure we only decrement once. */
             if (c && atomic_exchange_explicit(&header->tracked_for_cob, 0, memory_order_acq_rel)) {
-                atomic_fetch_sub_explicit(&c->io_tracked_reply_len, header->reply_len, memory_order_relaxed);
+                atomic_fetch_sub_explicit(&c->net.io_tracked_reply_len, header->reply_len, memory_order_relaxed);
             }
 
             /* When net byte tracking was disabled in the main thread (commandlog-reply-larger-than -1)
@@ -3489,7 +3503,7 @@ int postWriteToClient(client *c) {
         }
     }
     if (c->nwritten > 0) {
-        c->net_output_bytes += c->nwritten;
+        c->net.net_output_bytes += c->nwritten;
         /* For replicated clients we don't count sending data
          * as an interaction, since we always send ACK commands
          * that take some time to just fill the socket output buffer.
@@ -3585,7 +3599,7 @@ int handleReadResult(client *c) {
     }
 
     c->last_interaction = server.unixtime;
-    c->net_input_bytes += c->nread;
+    c->net.net_input_bytes += c->nread;
     if (isReplicatedClient(c)) {
         /* A reader-active primary link advances read_reploff with decoded
          * bytes (replDecodeToQueryBuf); c->nread counts wire bytes here. */
@@ -3804,14 +3818,14 @@ void resetClient(client *c) {
     freeClientOriginalArgv(c);
     c->redact_arg_bitmap = 0;
     c->cur_script = NULL;
-    c->net_input_bytes_curr_cmd = 0;
+    c->net.net_input_bytes_curr_cmd = 0;
     c->slot = -1;
     c->flag.executing_command = 0;
     c->flag.replication_done = 0;
     c->flag.buffered_reply = 0;
     c->flag.keyspace_notified = 0;
     c->flag.throttle_checked = 0;
-    c->net_output_bytes_curr_cmd = 0;
+    c->net.net_output_bytes_curr_cmd = 0;
 
     /* Make sure the duration has been recorded to some command. */
     serverAssert(c->duration == 0);
@@ -3984,7 +3998,7 @@ void parseInlineBuffer(client *c) {
     /* Per-slot network bytes-in calculation.
      *
      * We calculate and store the current command's ingress bytes under
-     * c->net_input_bytes_curr_cmd, for which its per-slot aggregation is deferred
+     * c->net.net_input_bytes_curr_cmd, for which its per-slot aggregation is deferred
      * until c->slot is parsed later within processCommand().
      *
      * Calculation: For inline buffer, every whitespace is of length 1,
@@ -3994,7 +4008,7 @@ void parseInlineBuffer(client *c) {
      * Command) SET key value
      * Inline) SET key value\r\n
      * */
-    c->net_input_bytes_curr_cmd = (c->argv_len_sum + (c->argc - 1) + 2);
+    c->net.net_input_bytes_curr_cmd = (c->argv_len_sum + (c->argc - 1) + 2);
     c->read_flags |= READ_FLAGS_PARSING_COMPLETED;
     /* Record qb_pos so commandProcessed() can update reploff precisely. */
     c->qb_applied = c->qb_pos;
@@ -4048,7 +4062,7 @@ static void setProtocolError(const char *errstr, client *c) {
  * to be '*'. Otherwise, for inline commands parseInlineBuffer() is called. */
 void parseMultibulkBuffer(client *c) {
     int flag = parseMultibulk(c, &c->argc, &c->argv, &c->argv_len,
-                              &c->argv_len_sum, &c->net_input_bytes_curr_cmd);
+                              &c->argv_len_sum, &c->net.net_input_bytes_curr_cmd);
     c->read_flags |= flag;
 
     /* Record qb_pos for commandProcessed(). Written unconditionally because a
@@ -4119,6 +4133,34 @@ static int parseMultibulk(client *c,
         /* The client (argc) should have been reset */
         serverAssertWithInfo(c, NULL, *argc == 0);
 
+        size_t multibulklen_slen;
+#ifdef USE_RUST_NET
+        /* Parse the `*<n>\r\n` header in Rust (resp_parse.rs). The Rust side
+         * does the memchr + bounds + integer parse over a bounds-checked slice;
+         * the C side keeps the client-state-dependent checks (auth limits) and
+         * all the state mutation below. See RUST_DEVELOPMENT_NOTES.md. */
+        valkeyNetMultibulkParse mb =
+            valkey_net_parse_multibulk((const unsigned char *)(c->querybuf + c->qb_pos), sdslen(c->querybuf) - c->qb_pos);
+        switch (mb.status) {
+        case VALKEY_NET_MBH_NEEDMORE: return 0;
+        case VALKEY_NET_MBH_ERR_BIG_MBULK: return READ_FLAGS_ERROR_BIG_MULTIBULK;
+        case VALKEY_NET_MBH_ERR_INVALID_CRLF: return READ_FLAGS_ERROR_INVALID_CRLF;
+        case VALKEY_NET_MBH_ERR_INVALID_LEN: return READ_FLAGS_ERROR_INVALID_MULTIBULK_LEN;
+        default: break; /* PARSED or NONPOSITIVE: fall through with mb filled in */
+        }
+        serverAssertWithInfo(c, NULL, c->querybuf[c->qb_pos] == '*');
+        ll = mb.count;
+        /* consumed spans `*`, the digits, and the trailing \r\n, i.e.
+         * 1 + digits + 2, so the digit length is consumed - 3. */
+        multibulklen_slen = mb.consumed - 3;
+        if (ll > 10 && auth_required) {
+            return READ_FLAGS_ERROR_UNAUTHENTICATED_MULTIBULK_LEN;
+        }
+        c->qb_pos += mb.consumed;
+        if (mb.status == VALKEY_NET_MBH_NONPOSITIVE) {
+            return READ_FLAGS_PARSING_NEGATIVE_MBULK_LEN;
+        }
+#else
         /* Multi bulk length cannot be read without a \r\n */
         newline = memchr(c->querybuf + c->qb_pos, '\r', sdslen(c->querybuf) - c->qb_pos);
         if (newline == NULL) {
@@ -4139,7 +4181,7 @@ static int parseMultibulk(client *c,
         /* We know for sure there is a whole line since newline != NULL,
          * so go ahead and find out the multi bulk length. */
         serverAssertWithInfo(c, NULL, c->querybuf[c->qb_pos] == '*');
-        size_t multibulklen_slen = newline - (c->querybuf + 1 + c->qb_pos);
+        multibulklen_slen = newline - (c->querybuf + 1 + c->qb_pos);
         ok = string2ll(c->querybuf + 1 + c->qb_pos, multibulklen_slen, &ll);
         if (!ok || ll > INT_MAX) {
             return READ_FLAGS_ERROR_INVALID_MULTIBULK_LEN;
@@ -4152,6 +4194,7 @@ static int parseMultibulk(client *c,
         if (ll <= 0) {
             return READ_FLAGS_PARSING_NEGATIVE_MBULK_LEN;
         }
+#endif
 
         c->multibulklen = ll;
         c->bulklen = -1;
@@ -4165,7 +4208,7 @@ static int parseMultibulk(client *c,
         /* Per-slot network bytes-in calculation.
          *
          * We calculate and store the current command's ingress bytes under
-         * c->net_input_bytes_curr_cmd, for which its per-slot aggregation is deferred
+         * c->net.net_input_bytes_curr_cmd, for which its per-slot aggregation is deferred
          * until c->slot is parsed later within processCommand().
          *
          * Calculation: For multi bulk buffer, we accumulate four factors, namely;
@@ -4295,7 +4338,14 @@ static int parseMultibulk(client *c,
                 c->querybuf = sdsnewlen(SDS_NOINIT, c->bulklen + 2);
                 sdsclear(c->querybuf);
             } else {
+#ifdef USE_RUST_NET
+                /* R2: construct the argument object through the Rust FFI
+                 * boundary (which calls createStringObject). This is the
+                 * per-argument hop the MSET-heavy microbench measures. */
+                (*argv)[(*argc)++] = valkey_net_make_string_arg(c->querybuf + c->qb_pos, c->bulklen);
+#else
                 (*argv)[(*argc)++] = createStringObject(c->querybuf + c->qb_pos, c->bulklen);
+#endif
                 *argv_len_sum += c->bulklen;
                 c->qb_pos += c->bulklen + 2;
             }
@@ -4534,7 +4584,7 @@ static bool consumeCommandQueue(client *c) {
     c->argv = p->argv;
     c->argv_len = p->argv_len;
     c->argv_len_sum = p->argv_len_sum;
-    c->net_input_bytes_curr_cmd = p->input_bytes;
+    c->net.net_input_bytes_curr_cmd = p->input_bytes;
     c->parsed_cmd = p->cmd;
     c->slot = p->slot;
     c->qb_applied += p->input_bytes;
@@ -4721,8 +4771,76 @@ int processInputBuffer(client *c) {
  * The function allocates query-buf for the client if required and reads to it from the network.
  * It will set c->nread to the bytes read from the network.
  * Returns true if the buffer was filled (more data may be available). */
+#ifdef USE_RUST_NET
+/* R3 shims: expose the sds operations (several are static inline in sds.h, so
+ * not linkable) and the read as real symbols the Rust read orchestration calls.
+ * sds stays entirely in C; Rust only drives it. */
+size_t vk_sdslen(const char *s) {
+    return sdslen((const_sds)s);
+}
+size_t vk_sdsavail(const char *s) {
+    return sdsavail((const_sds)s);
+}
+size_t vk_sdsalloc(const char *s) {
+    return sdsalloc((const_sds)s);
+}
+char *vk_sds_make_room(char *s, size_t addlen) {
+    return sdsMakeRoomFor((sds)s, addlen);
+}
+char *vk_sds_make_room_nongreedy(char *s, size_t addlen) {
+    return sdsMakeRoomForNonGreedy((sds)s, addlen);
+}
+void vk_sds_incr_len(char *s, long incr) {
+    sdsIncrLen((sds)s, (ssize_t)incr);
+}
+char *vk_sds_empty(void) {
+    return sdsempty();
+}
+/* The thread-shared scratch query buffer and its (re)init, so Rust can take or
+ * replace it exactly as the C path does. */
+char *vk_thread_shared_qb(void) {
+    return (char *)thread_shared_qb;
+}
+void vk_init_shared_qb(void) {
+    initSharedQueryBuf();
+}
+/* Raw read into the connection, returning bytes read (<=0 on would-block/eof/err). */
+int vk_conn_read(connection *conn, char *buf, size_t len) {
+    return connRead(conn, buf, len);
+}
+
+/* Context the Rust read orchestration needs but that lives in flag bitfields or
+ * the server struct, computed C-side so Rust never decodes those layouts. */
+typedef struct vkReadCtx {
+    int close_asap;
+    int is_replicated;
+    int replicated_client; /* isReplicatedClient(c) */
+    unsigned long long max_querybuf_len;
+    unsigned long long mstate_argv_len_sums;
+} vkReadCtx;
+void vk_read_ctx(client *c, vkReadCtx *out) {
+    out->close_asap = c->flag.close_asap ? 1 : 0;
+    out->is_replicated = (c->read_flags & READ_FLAGS_REPLICATED) ? 1 : 0;
+    out->replicated_client = isReplicatedClient(c) ? 1 : 0;
+    out->max_querybuf_len = server.client_max_querybuf_len;
+    out->mstate_argv_len_sums = c->mstate ? c->mstate->argv_len_sums : 0;
+}
+
+static bool readToQueryBuf(client *c);
+static bool readToQueryBuf(client *c) {
+    return valkey_net_read_to_query_buf(c);
+}
+
+/* The original C implementation, kept as the reference/fallback. Unused when
+ * the Rust read orchestration is active; retained for A/B and for the
+ * BUILD_RUST_NET=no build. */
+static bool readToQueryBufC(client *c) __attribute__((unused));
+static bool readToQueryBufC(client *c) {
+    int big_arg = 0;
+#else
 static bool readToQueryBuf(client *c) {
     int big_arg = 0;
+#endif
     size_t qblen, readlen;
 
     /* If the replica RDB client is marked as closed ASAP, do not try to read from it */
@@ -4895,11 +5013,11 @@ void genClientAddrString(client *client, char *addr, size_t addr_len, int remote
 char *getClientPeerId(client *c) {
     char peerid[CONN_ADDR_STR_LEN] = {0};
 
-    if (c->peerid == NULL) {
+    if (c->net.peerid == NULL) {
         genClientAddrString(c, peerid, sizeof(peerid), 1);
-        c->peerid = sdsnew(peerid);
+        c->net.peerid = sdsnew(peerid);
     }
-    return c->peerid;
+    return c->net.peerid;
 }
 
 /* This function returns the client bound socket name, by creating and caching
@@ -4909,11 +5027,11 @@ char *getClientPeerId(client *c) {
 char *getClientSockname(client *c) {
     char sockname[CONN_ADDR_STR_LEN] = {0};
 
-    if (c->sockname == NULL) {
+    if (c->net.sockname == NULL) {
         genClientAddrString(c, sockname, sizeof(sockname), 0);
-        c->sockname = sdsnew(sockname);
+        c->net.sockname = sdsnew(sockname);
     }
-    return c->sockname;
+    return c->net.sockname;
 }
 
 int isClientConnIpV6(client *c) {
@@ -5026,8 +5144,8 @@ sds catClientInfoString(sds s, client *client, int hide_user_data) {
             " resp=%i", client->resp,
             " lib-name=%s", client->lib_name ? (char *)objectGetVal(client->lib_name) : "",
             " lib-ver=%s", client->lib_ver ? (char *)objectGetVal(client->lib_ver) : "",
-            " tot-net-in=%U", client->net_input_bytes,
-            " tot-net-out=%U", client->net_output_bytes,
+            " tot-net-in=%U", client->net.net_input_bytes,
+            " tot-net-out=%U", client->net.net_output_bytes,
             " tot-cmds=%U", client->commands_processed));
     return ret;
 }
@@ -6628,7 +6746,7 @@ size_t getClientOutputBufferMemoryUsage(client *c) {
                  (list_item_size * listLength(c->deferred_reply));
     }
 
-    usage += atomic_load_explicit(&c->io_tracked_reply_len, memory_order_relaxed);
+    usage += atomic_load_explicit(&c->net.io_tracked_reply_len, memory_order_relaxed);
 
     return usage;
 }
@@ -6789,7 +6907,7 @@ int closeClientOnOutputBufferLimitReached(client *c, int async) {
     serverAssert(c->reply_bytes < SIZE_MAX - (1024 * 64));
     /* Note that c->reply_bytes is irrelevant for replica clients
      * (they use the global repl buffers). */
-    size_t tracked_len = atomic_load_explicit(&c->io_tracked_reply_len, memory_order_relaxed);
+    size_t tracked_len = atomic_load_explicit(&c->net.io_tracked_reply_len, memory_order_relaxed);
     if ((c->reply_bytes == 0 && tracked_len == 0 && getClientType(c) != CLIENT_TYPE_REPLICA) ||
         (c->flag.close_asap && !(c->flag.protected_rdb_channel)))
         return 0;

@@ -5257,7 +5257,7 @@ void replicationSendAck(void) {
 
         /* Accumulation from above replies must be reset back to 0 manually,
          * as this subroutine does not invoke resetClient(). */
-        c->net_output_bytes_curr_cmd = 0;
+        c->net.net_output_bytes_curr_cmd = 0;
     }
 }
 
@@ -5315,14 +5315,14 @@ void replicationCachePrimary(client *c) {
     server.cached_primary = server.primary;
 
     /* Invalidate the Peer ID cache. */
-    if (c->peerid) {
-        sdsfree(c->peerid);
-        c->peerid = NULL;
+    if (c->net.peerid) {
+        sdsfree(c->net.peerid);
+        c->net.peerid = NULL;
     }
     /* Invalidate the Sock Name cache. */
-    if (c->sockname) {
-        sdsfree(c->sockname);
-        c->sockname = NULL;
+    if (c->net.sockname) {
+        sdsfree(c->net.sockname);
+        c->net.sockname = NULL;
     }
 
     /* Caching the primary happens instead of the actual freeClient() call,

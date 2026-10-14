@@ -768,9 +768,55 @@ ifneq ($(strip $(PREV_FINAL_LDFLAGS)), $(strip $(FINAL_LDFLAGS)))
 .make-prerequisites: persist-settings
 endif
 
+# Rust networking layer (rust/valkey_net), built as a C static library and
+# linked into the server. See NETWORKING_MODULARIZATION.md.
+VALKEY_NET_RUST_DIR=../rust/valkey_net
+
+# The Rust networking layer is opt-outable. It is ON by default, but disabled
+# automatically for the 32-bit build (where a matching-arch Rust archive is not
+# generally available) and can be turned off explicitly with BUILD_RUST_NET=no.
+# When off, valkey_net.h supplies a behaviourally-identical C fallback, so the
+# server builds and runs with no Rust toolchain. See NETWORKING_MODULARIZATION.md.
+BUILD_RUST_NET?=yes
+ifneq (,$(findstring -m32,$(FINAL_CFLAGS)))
+    BUILD_RUST_NET:=no
+endif
+
+ifeq ($(BUILD_RUST_NET),yes)
+    SERVER_CFLAGS+= -DUSE_RUST_NET
+    # Cross-compile support: RUST_TARGET sets the cargo triple (archive lands in
+    # target/<triple>/release); CARGO_TARGET_DIR relocates the base. Default:
+    # host triple, in-tree target/.
+    VALKEY_NET_CARGO_TARGET_DIR=$(if $(CARGO_TARGET_DIR),$(CARGO_TARGET_DIR),$(VALKEY_NET_RUST_DIR)/target)
+    VALKEY_NET_RUST_TARGET_FLAG=$(if $(RUST_TARGET),--target $(RUST_TARGET),)
+    VALKEY_NET_RUST_TARGET_SUBDIR=$(if $(RUST_TARGET),$(RUST_TARGET)/release,release)
+    VALKEY_NET_RUST_LIB=$(VALKEY_NET_CARGO_TARGET_DIR)/$(VALKEY_NET_RUST_TARGET_SUBDIR)/libvalkey_net.a
+else
+    VALKEY_NET_RUST_LIB=
+endif
+
+# Rebuild the archive when ANY crate source changes, not just lib.rs: the crate
+# now has resp_parse.rs, output_buffer.rs and generated/client_layout.rs, and a
+# change to one of those must relink. cargo does its own fine-grained rebuild;
+# this prerequisite list just has to be a superset of what cargo compiles.
+VALKEY_NET_RUST_SRCS=$(wildcard $(VALKEY_NET_RUST_DIR)/src/*.rs $(VALKEY_NET_RUST_DIR)/src/generated/*.rs)
+
+# The '| .make-prerequisites' is an ORDER-ONLY prerequisite: on a fresh tree the
+# first build runs persist-settings -> distclean (which cargo-cleans the Rust
+# target). Without this ordering the archive rule races that distclean under
+# make -j and the just-built .a is deleted ("No such file or directory" at link,
+# or a cargo temp-dir race). Ordering it after .make-prerequisites makes the
+# distclean finish first; order-only means a settings rebuild does not force a
+# needless cargo rebuild.
+$(VALKEY_NET_CARGO_TARGET_DIR)/$(VALKEY_NET_RUST_TARGET_SUBDIR)/libvalkey_net.a: $(VALKEY_NET_RUST_SRCS) $(VALKEY_NET_RUST_DIR)/Cargo.toml | .make-prerequisites
+	cd $(VALKEY_NET_RUST_DIR) && cargo build --release $(VALKEY_NET_RUST_TARGET_FLAG)
+
+.PHONY: valkey-net-rust
+valkey-net-rust: $(VALKEY_NET_RUST_LIB)
+
 # valkey-server
-$(SERVER_NAME): $(ENGINE_SERVER_OBJ) $(LUA_MODULE)
-	$(SERVER_LD) -o $@ $(ENGINE_SERVER_OBJ) ../deps/libvalkey/lib/libvalkey.a ../deps/hdr_histogram/libhdrhistogram.a ../deps/fpconv/libfpconv.a ../deps/lz4/liblz4.a $(FINAL_LIBS) $(LUA_LDFLAGS)
+$(SERVER_NAME): $(ENGINE_SERVER_OBJ) $(LUA_MODULE) $(VALKEY_NET_RUST_LIB)
+	$(SERVER_LD) -o $@ $(ENGINE_SERVER_OBJ) ../deps/libvalkey/lib/libvalkey.a ../deps/hdr_histogram/libhdrhistogram.a ../deps/fpconv/libfpconv.a ../deps/lz4/liblz4.a $(VALKEY_NET_RUST_LIB) $(FINAL_LIBS) $(LUA_LDFLAGS)
 
 # Valkey static library, used to compile against for unit testing
 $(ENGINE_LIB_NAME): $(ENGINE_SERVER_OBJ)
@@ -839,6 +885,7 @@ clean:
 	rm -rf $(SERVER_NAME) $(ENGINE_SENTINEL_NAME) $(ENGINE_CLI_NAME) $(ENGINE_BENCHMARK_NAME) $(ENGINE_CHECK_RDB_NAME) $(ENGINE_CHECK_AOF_NAME) $(ENGINE_UNIT_GTESTS) $(ENGINE_LIB_NAME) trace/*.o trace/*.d *.o *.gcda *.gcno *.gcov valkey.info lcov-html Makefile.dep *.so
 	rm -f $(DEP)
 	-(cd modules/lua && $(MAKE) clean)
+	-(cd $(VALKEY_NET_RUST_DIR) && cargo clean --release 2> /dev/null) || rm -f $(VALKEY_NET_RUST_LIB)
 
 .PHONY: clean
 
@@ -849,6 +896,7 @@ distclean: clean
 	-(cd unit && $(MAKE) clean)
 	-(rm -f .make-*)
 	-(find unit -type d -name __pycache__ -exec rm -rf {} +)
+	-(cd $(VALKEY_NET_RUST_DIR) && cargo clean 2> /dev/null) || rm -rf $(VALKEY_NET_RUST_DIR)/target
 
 .PHONY: distclean
 
@@ -856,11 +904,11 @@ test: $(ALL_BUILD_PREREQUISITES)
 	@(cd ..; VALKEY_PROG_SUFFIX="$(PROG_SUFFIX)" ./runtest)
 
 test-unit:
-	@(cd unit && $(MAKE) test-unit)
+	@(cd unit && $(MAKE) test-unit VALKEY_NET_LIB="$(if $(VALKEY_NET_RUST_LIB),../$(VALKEY_NET_RUST_LIB),)")
 
 # valkey-unit-gtests
-$(ENGINE_UNIT_GTESTS): $(ENGINE_LIB_NAME)
-	@(cd unit && $(MAKE) $(ENGINE_UNIT_GTESTS))
+$(ENGINE_UNIT_GTESTS): $(ENGINE_LIB_NAME) $(VALKEY_NET_RUST_LIB)
+	@(cd unit && $(MAKE) $(ENGINE_UNIT_GTESTS) VALKEY_NET_LIB="$(if $(VALKEY_NET_RUST_LIB),../$(VALKEY_NET_RUST_LIB),)")
 
 test-modules: $(SERVER_NAME)
 	@(cd ..; ./runtest-moduleapi)

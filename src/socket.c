@@ -30,6 +30,7 @@
 #include "server.h"
 #include "connhelpers.h"
 #include "io_threads.h"
+#include "valkey_net.h"
 #include <netinet/tcp.h>
 #ifdef __APPLE__
 #include <netinet/tcp_fsm.h>
@@ -172,28 +173,30 @@ static int connSocketWrite(connection *conn, const void *data, size_t data_len) 
                       !(conn->flags & CONN_FLAG_ALLOW_ACCEPT_OFFLOAD) || !inMainThread() ||
                       ((client *)connGetPrivateData(conn))->io_write_state != CLIENT_PENDING_IO);
 
-    int ret = write(conn->fd, data, data_len);
-    if (ret < 0 && errno != EAGAIN) {
-        conn->last_errno = errno;
+    int io_errno = 0;
+    int ret = (int)valkey_net_write(conn->fd, data, data_len, &io_errno);
+    if (ret < 0 && io_errno != EAGAIN) {
+        conn->last_errno = io_errno;
 
         /* Don't overwrite the state of a connection that is not already
          * connected, not to mess with handler callbacks.
          */
-        if (errno != EINTR && conn->state == CONN_STATE_CONNECTED) conn->state = CONN_STATE_ERROR;
+        if (io_errno != EINTR && conn->state == CONN_STATE_CONNECTED) conn->state = CONN_STATE_ERROR;
     }
 
     return ret;
 }
 
 static int connSocketWritev(connection *conn, const struct iovec *iov, int iovcnt) {
-    int ret = writev(conn->fd, iov, iovcnt);
-    if (ret < 0 && errno != EAGAIN) {
-        conn->last_errno = errno;
+    int io_errno = 0;
+    int ret = (int)valkey_net_writev(conn->fd, iov, iovcnt, &io_errno);
+    if (ret < 0 && io_errno != EAGAIN) {
+        conn->last_errno = io_errno;
 
         /* Don't overwrite the state of a connection that is not already
          * connected, not to mess with handler callbacks.
          */
-        if (errno != EINTR && conn->state == CONN_STATE_CONNECTED) conn->state = CONN_STATE_ERROR;
+        if (io_errno != EINTR && conn->state == CONN_STATE_CONNECTED) conn->state = CONN_STATE_ERROR;
     }
 
     return ret;
@@ -208,16 +211,17 @@ static int connSocketRead(connection *conn, void *buf, size_t buf_len) {
                       ((client *)connGetPrivateData(conn))->io_read_state != CLIENT_PENDING_IO);
 
 
-    int ret = read(conn->fd, buf, buf_len);
+    int io_errno = 0;
+    int ret = (int)valkey_net_read(conn->fd, buf, buf_len, &io_errno);
     if (!ret) {
         conn->state = CONN_STATE_CLOSED;
-    } else if (ret < 0 && errno != EAGAIN) {
-        conn->last_errno = errno;
+    } else if (ret < 0 && io_errno != EAGAIN) {
+        conn->last_errno = io_errno;
 
         /* Don't overwrite the state of a connection that is not already
          * connected, not to mess with handler callbacks.
          */
-        if (errno != EINTR && conn->state == CONN_STATE_CONNECTED) conn->state = CONN_STATE_ERROR;
+        if (io_errno != EINTR && conn->state == CONN_STATE_CONNECTED) conn->state = CONN_STATE_ERROR;
     }
 
     return ret;

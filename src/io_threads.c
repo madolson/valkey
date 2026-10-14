@@ -358,7 +358,6 @@ static inline void processTaggedSPMCJob(void *tagged_job) {
         serverPanic("Invalid SPMC job type: %d", type);
     }
 }
-
 static void *IOThreadMain(void *myid) {
     /* The ID is the thread ID number (from 1 to server.io_threads_num-1). ID 0 is the main thread. */
     long id = (long)myid;
@@ -454,10 +453,10 @@ static void createIOThread(int id) {
     /* Initialize the private SPSC queue for this thread */
     spscInit(&io_private_inbox[id], IO_SPSC_QUEUE_SIZE);
 
-    pthread_t tid;
     pthread_mutex_init(&io_threads_mutex[id], NULL);
     pthread_mutex_lock(&io_threads_mutex[id]); /* Thread will be stopped. */
 
+    pthread_t tid;
     pthread_attr_t attr;
     serverInitThreadAttribute(&attr);
 

@@ -162,8 +162,8 @@ void commandlogPushCurrentCommand(client *c, struct serverCommand *cmd) {
      * describe the executed command. Entry creation resolves the calling client
      * for the connection identity fields. */
     commandlogPushEntryIfNeeded(c, argv, argc, c->duration, COMMANDLOG_TYPE_SLOW);
-    commandlogPushEntryIfNeeded(c, argv, argc, c->net_input_bytes_curr_cmd, COMMANDLOG_TYPE_LARGE_REQUEST);
-    commandlogPushEntryIfNeeded(c, argv, argc, c->net_output_bytes_curr_cmd, COMMANDLOG_TYPE_LARGE_REPLY);
+    commandlogPushEntryIfNeeded(c, argv, argc, c->net.net_input_bytes_curr_cmd, COMMANDLOG_TYPE_LARGE_REQUEST);
+    commandlogPushEntryIfNeeded(c, argv, argc, c->net.net_output_bytes_curr_cmd, COMMANDLOG_TYPE_LARGE_REPLY);
 }
 
 /* The SLOWLOG command. Implements all the subcommands needed to handle the
