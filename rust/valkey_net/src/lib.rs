@@ -23,6 +23,7 @@ mod output_buffer;
 #[allow(dead_code)]
 mod shadow_parser;
 mod argv_build;
+mod read_query;
 #[cfg(test)]
 mod diff_test;
 

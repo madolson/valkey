@@ -4771,8 +4771,76 @@ int processInputBuffer(client *c) {
  * The function allocates query-buf for the client if required and reads to it from the network.
  * It will set c->nread to the bytes read from the network.
  * Returns true if the buffer was filled (more data may be available). */
+#ifdef USE_RUST_NET
+/* R3 shims: expose the sds operations (several are static inline in sds.h, so
+ * not linkable) and the read as real symbols the Rust read orchestration calls.
+ * sds stays entirely in C; Rust only drives it. */
+size_t vk_sdslen(const char *s) {
+    return sdslen((const_sds)s);
+}
+size_t vk_sdsavail(const char *s) {
+    return sdsavail((const_sds)s);
+}
+size_t vk_sdsalloc(const char *s) {
+    return sdsalloc((const_sds)s);
+}
+char *vk_sds_make_room(char *s, size_t addlen) {
+    return sdsMakeRoomFor((sds)s, addlen);
+}
+char *vk_sds_make_room_nongreedy(char *s, size_t addlen) {
+    return sdsMakeRoomForNonGreedy((sds)s, addlen);
+}
+void vk_sds_incr_len(char *s, long incr) {
+    sdsIncrLen((sds)s, (ssize_t)incr);
+}
+char *vk_sds_empty(void) {
+    return sdsempty();
+}
+/* The thread-shared scratch query buffer and its (re)init, so Rust can take or
+ * replace it exactly as the C path does. */
+char *vk_thread_shared_qb(void) {
+    return (char *)thread_shared_qb;
+}
+void vk_init_shared_qb(void) {
+    initSharedQueryBuf();
+}
+/* Raw read into the connection, returning bytes read (<=0 on would-block/eof/err). */
+int vk_conn_read(connection *conn, char *buf, size_t len) {
+    return connRead(conn, buf, len);
+}
+
+/* Context the Rust read orchestration needs but that lives in flag bitfields or
+ * the server struct, computed C-side so Rust never decodes those layouts. */
+typedef struct vkReadCtx {
+    int close_asap;
+    int is_replicated;
+    int replicated_client; /* isReplicatedClient(c) */
+    unsigned long long max_querybuf_len;
+    unsigned long long mstate_argv_len_sums;
+} vkReadCtx;
+void vk_read_ctx(client *c, vkReadCtx *out) {
+    out->close_asap = c->flag.close_asap ? 1 : 0;
+    out->is_replicated = (c->read_flags & READ_FLAGS_REPLICATED) ? 1 : 0;
+    out->replicated_client = isReplicatedClient(c) ? 1 : 0;
+    out->max_querybuf_len = server.client_max_querybuf_len;
+    out->mstate_argv_len_sums = c->mstate ? c->mstate->argv_len_sums : 0;
+}
+
+static bool readToQueryBuf(client *c);
+static bool readToQueryBuf(client *c) {
+    return valkey_net_read_to_query_buf(c);
+}
+
+/* The original C implementation, kept as the reference/fallback. Unused when
+ * the Rust read orchestration is active; retained for A/B and for the
+ * BUILD_RUST_NET=no build. */
+static bool readToQueryBufC(client *c) __attribute__((unused));
+static bool readToQueryBufC(client *c) {
+    int big_arg = 0;
+#else
 static bool readToQueryBuf(client *c) {
     int big_arg = 0;
+#endif
     size_t qblen, readlen;
 
     /* If the replica RDB client is marked as closed ASAP, do not try to read from it */

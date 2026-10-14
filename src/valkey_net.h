@@ -72,6 +72,11 @@ size_t valkey_net_add_reply_plain(struct client *c, const unsigned char *payload
  * through when USE_RUST_NET is set, measured by the MSET-heavy microbench. */
 void *valkey_net_make_string_arg(const char *ptr, size_t len);
 
+/* R3: Rust owns the read into the query buffer. Mirrors readToQueryBuf; drives
+ * the C sds buffer through vk_sds_* shims and reads/writes client fields via
+ * the layout mirror. Returns true if the read filled the requested length. */
+_Bool valkey_net_read_to_query_buf(struct client *c);
+
 #ifdef __cplusplus
 }
 #endif
