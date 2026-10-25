@@ -878,6 +878,7 @@ slotMigrationJob *createSlotImportJob(client *c,
         job->client->qb_applied = job->client->qb_pos;
     }
     job->client->repl_data->read_reploff = sdslen(job->client->querybuf);
+    job->client->repl_data->repl_applied_dbid = job->client->db->id;
 
     return job;
 }
@@ -1660,6 +1661,8 @@ int childSnapshotForSyncSlot(rio *aof, slotMigrationJob *job) {
             }
         }
     }
+    /* Restore the db the parent assumes, since it doesn't see the SELECTs above. */
+    if (rewriteSelectDbRio(aof, job->client->db->id) == C_ERR) return C_ERR;
     rioWrite(aof, "*3\r\n", 4);
     rioWriteBulkString(aof, "CLUSTER", 7);
     rioWriteBulkString(aof, "SYNCSLOTS", 9);
