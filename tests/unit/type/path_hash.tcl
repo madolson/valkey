@@ -540,6 +540,83 @@ start_server {tags {pathhash}} {
         }
     }
 
+    test {PHDELPREFIX with an empty prefix frees the whole tree asynchronously} {
+        wait_lazyfree_done r
+        r config resetstat
+        r del tree
+        for {set i 0} {$i < 200} {incr i} {
+            r phset tree "path:$i" fields 2 f1 "value:$i" f2 "other:$i"
+        }
+        assert_equal 200 [r phcard tree]
+        assert_equal 200 [r phdelprefix tree {}]
+
+        # The key survives as an empty Path Hash while the detached tree is
+        # still queued for the lazy free thread.
+        assert_equal 1 [r exists tree]
+        assert_equal pathhash [r type tree]
+        assert_equal 0 [r phcard tree]
+
+        wait_for_condition 100 10 {
+            [getInfoProperty [r info memory] lazyfree_pending_objects] == 0
+        } else {
+            fail "Path Hash tree was not reclaimed by lazy free"
+        }
+        # The detached tree counts as one lazy freed object, like UNLINK.
+        assert_equal 1 [s lazyfreed_objects]
+    } {} {needs:config-resetstat}
+
+    test {PHDEL frees a payload with many fields asynchronously} {
+        wait_lazyfree_done r
+        r config resetstat
+        r del tree
+        # More fields than hash-max-listpack-entries, so the payload is a hash
+        # table and its free effort is its field count.
+        set numfields [expr {[lindex [r config get hash-max-listpack-entries] 1] + 1}]
+        set fields {}
+        for {set i 0} {$i < $numfields} {incr i} {
+            lappend fields "f$i" "v$i"
+        }
+        r phset tree onepath fields $numfields {*}$fields
+        assert_equal 1 [r phdel tree onepath]
+        assert_equal 0 [r phcard tree]
+        wait_for_condition 100 10 {
+            [getInfoProperty [r info memory] lazyfree_pending_objects] == 0
+        } else {
+            fail "Path Hash payload was not reclaimed by lazy free"
+        }
+        assert_equal 1 [s lazyfreed_objects]
+    } {} {needs:config-resetstat}
+
+    test {PHDELPREFIX frees the tree inline when lazy user deletion is disabled} {
+        wait_lazyfree_done r
+        r config resetstat
+        r config set lazyfree-lazy-user-del no
+        r del tree
+        with_cleanup {
+            for {set i 0} {$i < 200} {incr i} {
+                r phset tree "path:$i" fields 2 f1 "value:$i" f2 "other:$i"
+            }
+            assert_equal 200 [r phdelprefix tree {}]
+            assert_equal 0 [r phcard tree]
+            assert_equal 0 [getInfoProperty [r info memory] lazyfree_pending_objects]
+            assert_equal 0 [s lazyfreed_objects]
+        } {
+            r config set lazyfree-lazy-user-del yes
+        }
+    } {} {needs:config-resetstat}
+
+    test {PHDELPREFIX frees a small tree inline even when lazy user deletion is enabled} {
+        wait_lazyfree_done r
+        r config resetstat
+        r del tree
+        foreach path {a b c d e} {
+            r phset tree $path fields 1 f v
+        }
+        assert_equal 5 [r phdelprefix tree {}]
+        assert_equal 0 [getInfoProperty [r info memory] lazyfree_pending_objects]
+        assert_equal 0 [s lazyfreed_objects]
+    } {} {needs:config-resetstat}
+
     test {COPY, DUMP/RESTORE, TTL, MEMORY USAGE, and DEBUG DIGEST support path hash values} {
         set tree {tree:{pathhash-copy}}
         set tree_copy {tree-copy:{pathhash-copy}}

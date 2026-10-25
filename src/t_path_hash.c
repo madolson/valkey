@@ -386,7 +386,9 @@ void phdelCommand(client *c) {
         sds path = objectGetVal(c->argv[2]);
         void *removed = NULL;
         serverAssert(raxRemove(path_hash->index, (unsigned char *)path, sdslen(path), &removed));
-        decrRefCount(removed);
+        /* The payload is unlinked from the index, so a payload holding many
+         * fields can be released by the lazy free thread. */
+        server.lazyfree_lazy_user_del ? freeObjAsync(NULL, removed, -1) : decrRefCount(removed);
     }
     if (deleted) {
         signalModifiedKey(c, c->db, c->argv[1]);
@@ -569,10 +571,17 @@ void phdelprefixCommand(client *c) {
     if (prefix_len == 0) {
         long long deleted = raxSize(path_hash->index);
         if (deleted) {
-            rax *empty = raxNew();
-            raxFreeWithCallback(path_hash->index, freePathHashPayload);
+            /* Swap the whole index into a detached object before releasing it,
+             * so that the memory handed to the lazy free thread is already
+             * unreachable from the keyspace. */
+            robj *detached = createPathHashObject();
+            pathHashObject *old = objectGetVal(detached);
+            rax *empty = old->index;
+            old->index = path_hash->index;
+            old->num_fields = path_hash->num_fields;
             path_hash->index = empty;
             path_hash->num_fields = 0;
+            server.lazyfree_lazy_user_del ? freeObjAsync(NULL, detached, -1) : decrRefCount(detached);
             signalModifiedKey(c, c->db, c->argv[1]);
             notifyKeyspaceEvent(NOTIFY_PATH_HASH, "phdelprefix", c->argv[1], c->db->id);
             server.dirty += deleted;
