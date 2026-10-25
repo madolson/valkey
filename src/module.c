@@ -3808,8 +3808,9 @@ int VM_Replicate(ValkeyModuleCtx *ctx, const char *cmdname, const char *fmt, ...
     va_list ap;
     int slot = -1;
 
-    /* Reject replication when the server is paused for replica traffic. */
-    if (isPausedActions(PAUSE_ACTION_REPLICA)) return VALKEYMODULE_ERR;
+    /* Reject replication when the server is paused for replica traffic. A
+     * pause issued inside the running transaction only takes effect after it. */
+    if (isPausedActions(PAUSE_ACTION_REPLICA) && !server.client_pause_in_transaction) return VALKEYMODULE_ERR;
 
     bool skip_validation = ctx->module &&
                            (ctx->module->options & VALKEYMODULE_OPTIONS_SKIP_COMMAND_VALIDATION);
@@ -3868,8 +3869,9 @@ int VM_Replicate(ValkeyModuleCtx *ctx, const char *cmdname, const char *fmt, ...
  * replica traffic (e.g. during CLIENT PAUSE WRITE or CLUSTER FAILOVER),
  * otherwise VALKEYMODULE_OK is returned. */
 int VM_ReplicateVerbatim(ValkeyModuleCtx *ctx) {
-    /* Reject replication when the server is paused for replica traffic. */
-    if (isPausedActions(PAUSE_ACTION_REPLICA)) return VALKEYMODULE_ERR;
+    /* Reject replication when the server is paused for replica traffic. A
+     * pause issued inside the running transaction only takes effect after it. */
+    if (isPausedActions(PAUSE_ACTION_REPLICA) && !server.client_pause_in_transaction) return VALKEYMODULE_ERR;
 
     alsoPropagate(ctx->client->db->id, ctx->client->argv, ctx->client->argc, PROPAGATE_AOF | PROPAGATE_REPL, ctx->client->slot);
     server.dirty++;
@@ -6905,8 +6907,10 @@ static void moduleCallCommandHelper(ValkeyModuleCtx *ctx, client *c, robj **argv
 
     /* Reject write commands from modules when replica traffic is paused.
      * This prevents module timer callbacks and thread-safe contexts from
-     * bypassing the pause and hitting the assertion in propagateNow(). */
-    if (replicate && (cmd_flags & (CMD_WRITE | CMD_MAY_REPLICATE)) && isPausedActions(PAUSE_ACTION_REPLICA)) {
+     * bypassing the pause and hitting the assertion in propagateNow(). A pause
+     * issued inside the running transaction only takes effect after it. */
+    if (replicate && (cmd_flags & (CMD_WRITE | CMD_MAY_REPLICATE)) && isPausedActions(PAUSE_ACTION_REPLICA) &&
+        !server.client_pause_in_transaction) {
         errno = ENOSPC;
         if (error_as_call_replies) {
             reply_error_msg = sdscatfmt(sdsempty(),
