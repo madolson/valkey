@@ -31,8 +31,9 @@ requirements, and serves as the overall tracking for the feature.
    the topic, and the second reviews the design in detail.
 4. Adding a design document for a feature that is not yet implemented, or
    modifying one that is still pending, is a major decision. The pull request
-   should be labeled `major-decision-pending` and needs consensus or approval
-   under the [+2 rule](../GOVERNANCE.md#technical-major-decisions).
+   should be labeled `major-decision-pending` and needs consensus or a +2 from
+   the TSC, as described in
+   [GOVERNANCE.md](../GOVERNANCE.md#technical-major-decisions).
 5. Once its major decision is approved, a design document can be merged before
    its feature is implemented. Alternatively, the pull request can stay open
    with the implementation added to it, so the design and the code merge
