@@ -3529,6 +3529,23 @@ static int ACLLogMatchEntry(ACLLogEntry *a, ACLLogEntry *b) {
     return 1;
 }
 
+/* ACL log entries outlive the client that caused them and belong to no
+ * client or key, so they must not retain strings of the client's choosing at
+ * full length: key, channel and user names, and the client name inside the
+ * client info line. */
+#define ACL_LOG_ENTRY_MAX_STRING 1024
+
+/* Takes ownership of 's' and returns it, or a truncated copy if it is longer
+ * than ACL_LOG_ENTRY_MAX_STRING, noting the omitted bytes the same way the
+ * command log does. */
+static sds ACLLogTruncateString(sds s) {
+    if (sdslen(s) <= ACL_LOG_ENTRY_MAX_STRING) return s;
+    sds t = sdsnewlen(s, ACL_LOG_ENTRY_MAX_STRING);
+    t = sdscatprintf(t, "... (%lu more bytes)", (unsigned long)(sdslen(s) - ACL_LOG_ENTRY_MAX_STRING));
+    sdsfree(s);
+    return t;
+}
+
 /* Release an ACL log entry. */
 static void ACLFreeLogEntry(void *leptr) {
     ACLLogEntry *le = leptr;
@@ -3594,7 +3611,7 @@ void addACLLogEntry(client *c, int reason, int context, int argpos, sds username
     struct ACLLogEntry *le = zmalloc(sizeof(*le));
     le->count = 1;
     le->reason = reason;
-    le->username = sdsdup(username ? username : c->user->name);
+    le->username = ACLLogTruncateString(sdsdup(username ? username : c->user->name));
     le->ctime = commandTimeSnapshot();
     le->entry_id = ACLLogEntryCount;
     le->timestamp_created = le->ctime;
@@ -3611,11 +3628,12 @@ void addACLLogEntry(client *c, int reason, int context, int argpos, sds username
         default: le->object = sdsempty();
         }
     }
+    le->object = ACLLogTruncateString(le->object);
 
     /* if we have a real client from the network, use it (could be missing on module timers) */
     client *realclient = server.current_client ? server.current_client : c;
 
-    le->cinfo = catClientInfoString(sdsempty(), realclient, 0);
+    le->cinfo = ACLLogTruncateString(catClientInfoString(sdsempty(), realclient, 0));
 
     if (context == ACL_LOG_CTX_SCRIPT &&
         strcmp(scriptGetRunningEngineName(), "LUA") == 0) {
