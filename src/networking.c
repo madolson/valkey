@@ -2080,7 +2080,7 @@ int updatePrioritySubnets(const char *subnets_str) {
  * 3. Priority clients originating from priority-subnets can take up to maxclients.
  * 4. maxclients-reserved connection slots are guaranteed for priority clients.
  */
-static bool hasMaxClientsLimitReached(bool is_prioritized) {
+bool hasMaxClientsLimitReached(bool is_prioritized) {
     long long total_clients = (long long)listLength(server.clients) +
                               (long long)getClusterConnectionsCount();
     if (total_clients >= (long long)server.maxclients) {
