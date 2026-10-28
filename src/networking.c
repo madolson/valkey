@@ -6144,9 +6144,18 @@ void clientTrackingCommand(client *c) {
             /* We will require the client with the specified ID to exist
              * right now, even if it is possible that it gets disconnected
              * later. Still a valid sanity check. */
-            if (lookupClientByID(redir) == NULL) {
+            client *target = lookupClientByID(redir);
+            if (target == NULL) {
                 addReplyError(c, "The client ID you want redirect to "
                                  "does not exist");
+                zfree(prefix);
+                return;
+            }
+            /* Invalidations are written into the target's connection, so
+             * it must belong to the same user as the tracking client. */
+            if (target->user != c->user) {
+                addReplyError(c, "The client ID you want redirect to "
+                                 "belongs to another user");
                 zfree(prefix);
                 return;
             }
