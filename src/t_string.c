@@ -726,6 +726,13 @@ void msetexCommand(client *c) {
     if (expire && !(flags & ARGS_PXAT)) {
         serverAssert(expire_idx != -1);
         robj *milliseconds_obj = createStringObjectFromLongLong(milliseconds);
+        /* EX/PX/EXAT may be repeated, and the last one wins. Rewrite the earlier
+         * occurrences too, since receivers reject EX/PX/EXAT next to PXAT. */
+        for (int j = (int)args_start_idx; j < expire_idx; j++) {
+            if (strcasecmp(objectGetVal(c->argv[j]), objectGetVal(c->argv[expire_idx]))) continue;
+            rewriteClientCommandArgument(c, j, shared.pxat);
+            rewriteClientCommandArgument(c, ++j, milliseconds_obj);
+        }
         rewriteClientCommandArgument(c, expire_idx, shared.pxat);
         rewriteClientCommandArgument(c, expire_idx + 1, milliseconds_obj);
         decrRefCount(milliseconds_obj);
