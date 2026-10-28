@@ -841,6 +841,18 @@ start_server {tags {"hashexpire"}} {
         close_replication_stream $repl
     }
 
+    test {HSETEX propagates every repeated EX, PX and EXAT as PXAT} {
+        r flushall
+        set repl [attach_to_replication_stream]
+        # The key is named like the option, and must not be rewritten.
+        r HSETEX ex EX 100 EX 200 FIELDS 1 f1 v1
+        assert_replication_stream $repl {
+            {select *}
+            {hsetex ex PXAT * PXAT * FIELDS 1 f1 v1}
+        }
+        close_replication_stream $repl
+    }
+
     ###### Test EXPIRE #############
 
 

@@ -588,6 +588,17 @@ start_server {tags {"string"}} {
         close_replication_stream $repl
     } {} {needs:repl}
 
+    test {MSETEX propagates every repeated EX, PX and EXAT as PXAT} {
+        r del key1{t}
+        set repl [attach_to_replication_stream]
+        r msetex 1 key1{t} val1 ex 100 ex 200
+        assert_replication_stream $repl {
+            {select *}
+            {msetex 1 key1{t} val1 PXAT * PXAT *}
+        }
+        close_replication_stream $repl
+    } {} {needs:repl}
+
     test {MSETEX keyspace notifications} {
         r config set notify-keyspace-events KEA
         r del key1{t} key2{t}
