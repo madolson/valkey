@@ -446,6 +446,13 @@ start_server {tags {"scripting"}} {
         } 0
     }
 
+    test {EVAL - Lua pattern matching limits recursion depth} {
+        assert_error {*pattern too complex*} {
+            run_script {return string.find('', string.rep('a*', 1000000))} 0
+        }
+        assert_equal PONG [r ping]
+    }
+
     test {EVAL - cmsgpack can pack double?} {
         run_script {local encoded = cmsgpack.pack(0.1)
                 local h = ""
