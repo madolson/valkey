@@ -1379,6 +1379,28 @@ start_server {tags {"scripting"}} {
         assert_match {*killed by user*} $res
     }
 
+    test {Timed out scripts can be killed inside a long-running library call} {
+        r config set lua-time-limit 10
+        foreach script {
+            {return string.find(string.rep('a', 30), string.rep('a*', 10) .. 'b')}
+            {table.insert({}, -2^31, 1)}
+            {(''):rep(2^31-1)}
+        } {
+            set rd [valkey_deferring_client]
+            run_script_on_connection $rd $script 0
+            wait_for_condition 50 100 {
+                [catch {r ping} e] == 1
+            } else {
+                fail "Script did not time out: $script"
+            }
+            assert_match {BUSY*} $e
+            kill_script
+            catch {$rd read} res
+            assert_match {*killed by user*} $res
+            $rd close
+        }
+    }
+
     test {Timed out script does not cause a false dead client} {
         set rd [valkey_deferring_client]
         r config set lua-time-limit 10
