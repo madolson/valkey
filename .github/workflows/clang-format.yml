@@ -21,8 +21,7 @@ concurrency:
 
 jobs:
   clang-format-check:
-    # The tree is formatted with clang-format 18.1.8, which 26.04 ships. 24.04 ships 18.1.3, which
-    # formats braced initializers differently.
+    # The tree is formatted with clang-format 18.1.8 which was shipped in 26.04
     runs-on: ubuntu-26.04
 
     steps:
