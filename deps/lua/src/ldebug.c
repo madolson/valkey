@@ -80,6 +80,12 @@ LUA_API int lua_gethookcount (lua_State *L) {
   return L->basehookcount;
 }
 
+
+void luaG_counthook (lua_State *L) {
+  resethookcount(L);
+  luaD_callhook(L, LUA_HOOKCOUNT, -1);
+}
+
 LUA_API int lua_getstack (lua_State *L, int level, lua_Debug *ar) {
   int status;
   CallInfo *ci;

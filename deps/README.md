@@ -104,6 +104,7 @@ and our version:
 5. Support for readonly tables (`lua_enablereadonlytable` API) is added across `lapi.c`, `lvm.c`, `lobject.h`, and `ltable.c`.
 6. Protection of tables reachable from globals, with a globals whitelist.
 7. Multiple CVE security patches (CVE-2022-24834, CVE-2024-31449, CVE-2024-31227, CVE-2024-31228) in cjson, cmsgpack, and the parser.
+8. `luaG_countstep` in `ldebug.h` counts steps of the pattern matcher and the `string.rep` and `table.insert` loops in `lstrlib.c` and `ltablib.c` as VM instructions, so the script timeout's count hook can fire inside a single long library call.
 
 Hdr_Histogram
 ---

@@ -17,6 +17,15 @@
 
 #define resethookcount(L)	(L->hookcount = L->basehookcount)
 
+/*
+** Count one step of a long-running C library loop as one VM instruction,
+** so the count hook still fires inside a single C call. Without this the
+** script timeout never interrupts a script stuck in one library call.
+*/
+#define luaG_countstep(L) \
+  { if (((L)->hookmask & LUA_MASKCOUNT) && --(L)->hookcount == 0) \
+      luaG_counthook(L); }
+
 
 LUAI_FUNC void luaG_typeerror (lua_State *L, const TValue *o,
                                              const char *opname);
@@ -29,5 +38,6 @@ LUAI_FUNC void luaG_runerror (lua_State *L, const char *fmt, ...);
 LUAI_FUNC void luaG_errormsg (lua_State *L);
 LUAI_FUNC int luaG_checkcode (const Proto *pt);
 LUAI_FUNC int luaG_checkopenop (Instruction i);
+LUAI_FUNC void luaG_counthook (lua_State *L);
 
 #endif
