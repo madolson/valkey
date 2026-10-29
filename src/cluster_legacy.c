@@ -2441,24 +2441,40 @@ void clusterDelNode(clusterNode *delnode) {
     serverAssert(delnode != NULL);
     serverLog(LL_DEBUG, "Deleting node %.40s (%s) from cluster view", delnode->name, humanNodename(delnode));
 
-    int j;
     dictIterator *di;
     dictEntry *de;
 
-    /* 1) Mark slots as unassigned. */
-    for (j = 0; j < CLUSTER_SLOTS; j++) {
-        if (getImportingSlotSource(j) == delnode) setImportingSlotSource(j, NULL);
-        if (getMigratingSlotDest(j) == delnode) setMigratingSlotDest(j, NULL);
-        if (server.cluster->slots[j] == delnode) clusterDelSlot(j);
+    /* 1) Mark slots as unassigned. Iterate the migration dicts directly
+     * rather than scanning all CLUSTER_SLOTS entries; these dicts hold
+     * only active migrations and are generally empty. For owned slots,
+     * clusterDelNodeSlots() uses the node's bitmap and exits early when
+     * numslots is zero, making each deletion proportional to what the
+     * node actually holds. */
+    di = dictGetSafeIterator(server.cluster->importing_slots_from);
+    while ((de = dictNext(di)) != NULL) {
+        if (dictGetVal(de) == delnode)
+            dictDelete(server.cluster->importing_slots_from, dictGetKey(de));
     }
+    dictReleaseIterator(di);
 
-    /* 2) Remove failure reports. */
+    di = dictGetSafeIterator(server.cluster->migrating_slots_to);
+    while ((de = dictNext(di)) != NULL) {
+        if (dictGetVal(de) == delnode)
+            dictDelete(server.cluster->migrating_slots_to, dictGetKey(de));
+    }
+    dictReleaseIterator(di);
+
+    clusterDelNodeSlots(delnode);
+
+    /* 2) Remove failure reports. Skip nodes whose fail_reports rax is
+     * empty; the rax traversal is only needed when there is actually
+     * something to remove. */
     di = dictGetSafeIterator(server.cluster->nodes);
     while ((de = dictNext(di)) != NULL) {
         clusterNode *node = dictGetVal(de);
 
         if (node == delnode) continue;
-        clusterNodeDelFailureReport(node, delnode);
+        if (raxSize(node->fail_reports) > 0) clusterNodeDelFailureReport(node, delnode);
     }
     dictReleaseIterator(di);
 
