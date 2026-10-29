@@ -489,6 +489,18 @@ start_server {tags {"tracking network logreqres:skip"}} {
         }
     }
 
+    test {BCAST prefix removed after a matching write in the same event loop cycle} {
+        set rc [valkey_client]
+        $rc CLIENT TRACKING on BCAST PREFIX gone:
+        $rc MULTI
+        $rc SET gone:key 1
+        $rc CLIENT TRACKING off
+        $rc CLIENT TRACKING on
+        $rc EXEC
+        assert_equal PONG [$rc PING]
+        $rc close
+    }
+
     test {hdel deliver invalidate message after response in the same connection} {
         r CLIENT TRACKING off
         r HELLO 3
