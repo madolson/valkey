@@ -1799,22 +1799,15 @@ start_server {tags {"scripting needs:debug external:skip"}} {
 
     test {Test scripting debug kills a looping script once its client is gone} {
         r config set busy-reply-threshold 100
+        set loglines [count_log_lines 0]
         set dbg [valkey [srv 0 host] [srv 0 port] 0 $::tls]
         $dbg script debug sync
         $dbg eval {while true do end} 0
         $dbg close
 
-        # A blocking PING would hang the test if the server is stuck.
-        set rd [valkey [srv 0 host] [srv 0 port] 1 $::tls]
-        set fd [$rd channel]
-        fconfigure $fd -blocking 0
-        $rd ping
-        wait_for_condition 50 100 {
-            [string match {+PONG*} [gets $fd]]
-        } else {
-            fail "Server did not stop the debugged script"
-        }
-        $rd close
+        # Wait on the log, since a command would hang if the server is stuck.
+        wait_for_log_messages 0 {"*debugging eval session ended*"} $loglines 50 100
+        assert_equal [r ping] {PONG}
     }
 }
 
