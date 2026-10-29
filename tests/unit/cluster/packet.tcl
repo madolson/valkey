@@ -277,3 +277,59 @@ start_cluster 10 0 {tags {external:skip cluster tls:skip}} {
         assert_lessthan_equal $count 10
     }
 }
+
+start_cluster 1 0 {tags {external:skip cluster tls:skip}} {
+    test "Many FORGOTTEN_NODE extensions in one PING do not stall the node" {
+        set base_port [srv 0 port]
+        set cluster_port [expr {$base_port + 10000}]
+        # Extensions are only processed from a known sender; use our own id.
+        set sender_node_id [R 0 cluster myid]
+        set n 20000
+
+        # Build a PING that gossips n unknown nodes and then forgets each of
+        # them via a FORGOTTEN_NODE extension.  Without the fix, each
+        # clusterDelNode() call scans all CLUSTER_SLOTS (16384) entries plus
+        # every known node for failure-report cleanup, giving O(n*CLUSTER_SLOTS)
+        # work on the main thread.  With the fix the cost is proportional to
+        # the slots and failure reports the node actually holds.
+        # CLUSTERMSG_FLAG0_EXT_DATA = (1<<2) = 4 must be set to enable extensions.
+        set packet [create_cluster_meet_packet $sender_node_id $base_port $cluster_port $n $n 4]
+        # Change type to PING (CLUSTERMSG_TYPE_PING = 0); type is at byte offset 12.
+        set packet [string replace $packet 12 13 [binary format S 0]]
+
+        # Append n gossip entries (clusterMsgDataGossip, 104 bytes each):
+        # nodename[40], ping_sent(u32), pong_received(u32), ip[46],
+        # port(u16), cport(u16), flags(u16), pport(u16), notused1(u16).
+        for {set i 0} {$i < $n} {incr i} {
+            append packet [format %040x $i] \
+                [binary format IIa46SSSSS 0 0 "127.0.0.1" 1 2 1 0 0]
+        }
+
+        # Append n FORGOTTEN_NODE extensions (56 bytes each):
+        # clusterMsgPingExt header (length=56, type=2, unused=0) followed by
+        # clusterMsgPingExtForgottenNode (name[40], ttl(u64)).
+        for {set i 0} {$i < $n} {incr i} {
+            append packet [binary format ISS 56 2 0] \
+                [format %040x $i] [binary format W 60]
+        }
+
+        # Fix totlen now that gossip and extension payloads are appended.
+        set packet [string replace $packet 4 7 [binary format I [string length $packet]]]
+
+        set start [clock milliseconds]
+        set sock [socket 127.0.0.1 $cluster_port]
+        fconfigure $sock -translation binary -buffering none -blocking 1
+        puts -nonewline $sock $packet
+        flush $sock
+        close $sock
+
+        # CLUSTER INFO blocks until the main thread finishes clusterProcessPacket,
+        # so the elapsed time includes the full cost of all clusterDelNode calls.
+        wait_for_condition 1000 50 {
+            [CI 0 cluster_stats_messages_ping_received] == 1
+        } else {
+            fail "PING was never received"
+        }
+        assert_lessthan [expr {[clock milliseconds] - $start}] 5000
+    }
+}
