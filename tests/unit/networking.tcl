@@ -356,8 +356,10 @@ start_server {tags {}} {
             lappend keys k:iov:$i
         }
 
-        # Before the fix, the overflow corrupts iov_arr entries that writev
-        # reads, causing EFAULT which drops this connection.
+        # Before the fix, the overflow writes past the prefix array into
+        # adjacent stack data.  Under ASAN this is caught directly; on a
+        # plain build the corrupted iov entries typically cause writev to
+        # return EFAULT and drop this connection.
         set results [r mget {*}$keys]
         r config set min-io-threads-avoid-copy-reply $orig
 
