@@ -344,7 +344,7 @@ start_server {tags {}} {
         #
         # Setting min-io-threads-avoid-copy-reply to 1 enables copy avoidance
         # on the default single-threaded server so the test does not need
-        # io-threads 7.  SET creates an EMBSTR object; APPEND on the existing
+        # io-threads 7. SET creates an EMBSTR object; APPEND on the existing
         # key calls dbUnshareStringValue which converts it to RAW encoding.
         set orig [lindex [r config get min-io-threads-avoid-copy-reply] 1]
         r config set min-io-threads-avoid-copy-reply 1
@@ -357,7 +357,7 @@ start_server {tags {}} {
         }
 
         # Before the fix, the overflow writes past the prefix array into
-        # adjacent stack data.  Under ASAN this is caught directly; on a
+        # adjacent stack data. Under ASAN this is caught directly; on a
         # plain build the corrupted iov entries typically cause writev to
         # return EFAULT and drop this connection.
         set results [r mget {*}$keys]
