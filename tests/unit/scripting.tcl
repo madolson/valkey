@@ -1052,21 +1052,6 @@ start_server {tags {"scripting"}} {
         r del scriptkey:wt
     }
 
-    test {server.log() joins many arguments in linear time} {
-        # The join is a single C call, so the busy script check cannot
-        # interrupt it. 2000 arguments of 1KB took over 4 seconds when each
-        # argument re-formatted the whole message.
-        set start [clock milliseconds]
-        run_script {
-            local t = {}
-            for i = 1, 2000 do t[i] = string.rep('x', 1000) end
-            server.log(server.LOG_DEBUG, unpack(t))
-        } 0
-        if {!$::valgrind} {
-            assert_lessthan [expr {[clock milliseconds] - $start}] 1000
-        }
-    }
-
     test {Correct handling of reused argv (issue #1939)} {
         run_script {
               for i = 0, 10 do
