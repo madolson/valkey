@@ -1797,6 +1797,7 @@ start_server {tags {"scripting needs:debug external:skip"}} {
         reconnect
     }
 
+    # tls:skip since the sync debugger drops a reply past the first TLS record.
     test {Test scripting debug print of a table holding itself is bounded} {
         r script debug sync
         r eval {return 'hello'} 0
@@ -1810,7 +1811,7 @@ start_server {tags {"scripting needs:debug external:skip"}} {
         assert_lessthan [string length $ret] 100000
         reconnect
         assert_equal [r ping] {PONG}
-    }
+    } {} {tls:skip}
 }
 
 start_server {tags {"scripting external:skip"}} {
