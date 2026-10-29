@@ -4526,6 +4526,19 @@ int clusterProcessPacket(clusterLink *link) {
                 /* Node is a replica. */
                 clusterNode *sender_claimed_primary = clusterLookupNode(msg->replicaof, CLUSTER_NAMELEN);
 
+                /* A node cannot be its own primary.  Without this guard, the
+                 * primary-to-replica transition would strip the PRIMARY flag
+                 * while the node still owns its slots, then set
+                 * sender->replicaof = sender, creating a replicaof cycle
+                 * that corrupts all subsequent replicaof lookups. */
+                if (sender_claimed_primary == sender) {
+                    serverLog(LL_WARNING,
+                              "Node %.40s (%s) sent a packet claiming to be a "
+                              "replica of itself; discarding",
+                              sender->name, humanNodename(sender));
+                    return 1;
+                }
+
                 if (sender_last_reported_as_primary) {
                     serverLog(LL_DEBUG, "Node %.40s (%s) announces that it is a replica in shard %.40s",
                               sender->name, humanNodename(sender), sender->shard_id);

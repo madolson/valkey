@@ -277,3 +277,101 @@ start_cluster 10 0 {tags {external:skip cluster tls:skip}} {
         assert_lessthan_equal $count 10
     }
 }
+
+# Build a PING packet whose replicaof field names the sender itself.
+# Without the guard in clusterProcessPacket(), the server enters the
+# "failover occurred in shard" branch, calls clusterMoveNodeSlots(sender,
+# sender) which is a no-op, then fires serverAssert(sender->numslots == 0).
+proc create_cluster_ping_self_replicaof {sender_name sender_port sender_cport config_epoch} {
+    set CLUSTER_NAMELEN 40
+    set CLUSTER_SLOTS 16384
+    set NET_IP_STR_LEN 46
+    set CLUSTERMSG_TYPE_PING 0
+
+    set packet ""
+
+    # sig "RCmb" (4 bytes)
+    append packet "RCmb"
+    # totlen (uint32_t) - filled in below
+    append packet [binary format I 0]
+    # ver (uint16_t)
+    append packet [binary format S 1]
+    # port (uint16_t)
+    append packet [binary format S $sender_port]
+    # type (uint16_t) - PING
+    append packet [binary format S $CLUSTERMSG_TYPE_PING]
+    # count (uint16_t) - no gossip entries
+    append packet [binary format S 0]
+    # currentEpoch (uint64_t)
+    append packet [binary format W $config_epoch]
+    # configEpoch (uint64_t)
+    append packet [binary format W $config_epoch]
+    # offset (uint64_t)
+    append packet [binary format W 0]
+    # sender[40]
+    set padded_name [string range "${sender_name}[string repeat "\x00" $CLUSTER_NAMELEN]" \
+                     0 [expr {$CLUSTER_NAMELEN - 1}]]
+    append packet $padded_name
+    # myslots[2048] - all zeros (not claiming slots as primary)
+    append packet [string repeat "\x00" [expr {$CLUSTER_SLOTS / 8}]]
+    # replicaof[40] = sender's own name (the self-referencing claim)
+    append packet $padded_name
+    # myip[46] - all zeros
+    append packet [string repeat "\x00" $NET_IP_STR_LEN]
+    # extensions (uint16_t)
+    append packet [binary format S 0]
+    # notused1[30]
+    append packet [string repeat "\x00" 30]
+    # pport (uint16_t)
+    append packet [binary format S 0]
+    # cport (uint16_t)
+    append packet [binary format S $sender_cport]
+    # flags (uint16_t) - CLUSTER_NODE_PRIMARY
+    append packet [binary format S 1]
+    # state (unsigned char)
+    append packet [binary format c 0]
+    # mflags[3]
+    append packet [binary format ccc 0 0 0]
+
+    set totlen [string length $packet]
+    set packet [string replace $packet 4 7 [binary format I $totlen]]
+    return $packet
+}
+
+start_cluster 1 0 {tags {external:skip cluster tls:skip}} {
+    test "Self-replicaof packet does not corrupt the primary's slot assignment" {
+        set base_port [srv 0 port]
+        set cluster_port [expr {$base_port + 10000}]
+        set my_id [R 0 cluster myid]
+
+        # Use the node's real configEpoch so the packet is not discarded by
+        # the stale-message check before it reaches the vulnerable branch.
+        set my_epoch [dict get [get_myself 0] config_epoch]
+
+        # Sanity: server is up and owns all slots.
+        assert_equal "PONG" [R 0 ping]
+        assert_equal 16384 [CI 0 cluster_slots_assigned]
+
+        set ping_count_before [CI 0 cluster_stats_messages_ping_received]
+
+        set packet [create_cluster_ping_self_replicaof \
+                        $my_id $base_port $cluster_port $my_epoch]
+
+        set sock [socket 127.0.0.1 $cluster_port]
+        fconfigure $sock -translation binary -buffering none -blocking 1
+        puts -nonewline $sock $packet
+        flush $sock
+        close $sock
+
+        # Wait until the packet has been processed.
+        wait_for_condition 1000 10 {
+            [CI 0 cluster_stats_messages_ping_received] > $ping_count_before
+        } else {
+            fail "Forged self-replicaof PING was never received"
+        }
+
+        # The server must stay alive and the primary must keep all its slots.
+        assert_equal "PONG" [R 0 ping]
+        assert_equal 16384 [CI 0 cluster_slots_assigned]
+    }
+}
