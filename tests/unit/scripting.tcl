@@ -1286,6 +1286,42 @@ start_server {tags {"scripting"}} {
     } {*Script attempted to access nonexistent global variable 'print'*}
 }
 
+start_server {tags {"scripting"}} {
+    test "Script cannot detect a string another user's script handled" {
+        r acl setuser alice on nopass +@all ~alice:*
+        r acl setuser bob on nopass +@all ~bob:*
+        r set alice:pin 590417
+        set alice [valkey_deferring_client]
+        set bob [valkey_deferring_client]
+        $alice auth alice x
+        $alice read
+        $bob auth bob x
+        $bob read
+
+        run_script_on_connection $bob {collectgarbage('stop')} 0
+        $bob read
+        run_script_on_connection $alice {redis.call('GET', KEYS[1])} 1 alice:pin
+        $alice read
+
+        # Bob builds the pin and a value nobody used at runtime, so neither is
+        # a constant of his own script, and compares what interning each costs.
+        run_script_on_connection $bob {
+            local function cost(n)
+                local before = collectgarbage('count')
+                local s = string.format('%d', n)
+                return tostring(collectgarbage('count') - before)
+            end
+            local costs = {cost(ARGV[1] + 1), cost(ARGV[1] + 2)}
+            collectgarbage('restart')
+            return costs
+        } 0 590416
+        lassign [$bob read] pin_cost unused_cost
+        assert_equal $unused_cost $pin_cost
+        $alice close
+        $bob close
+    }
+}
+
 start_server {tags {"scripting external:skip large-memory"}} {
     test {EVAL - JSON string encoding a string larger than 2GB} {
         run_script {
