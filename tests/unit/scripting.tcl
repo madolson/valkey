@@ -1286,7 +1286,7 @@ start_server {tags {"scripting"}} {
     } {*Script attempted to access nonexistent global variable 'print'*}
 }
 
-start_server {tags {"scripting"}} {
+start_server {tags {"scripting external:skip"}} {
     test "Script cannot detect a string another user's script handled" {
         r acl setuser alice on nopass +@all ~alice:*
         r acl setuser bob on nopass +@all ~bob:*
@@ -1316,7 +1316,7 @@ start_server {tags {"scripting"}} {
             return costs
         } 0 590416
         lassign [$bob read] pin_cost unused_cost
-        assert_equal $unused_cost $pin_cost
+        assert_equal $pin_cost $unused_cost
         $alice close
         $bob close
     }
