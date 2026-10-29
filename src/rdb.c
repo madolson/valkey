@@ -3008,6 +3008,21 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error, int rd
                 return NULL;
             }
 
+            /* Hard size cap: a listpack near UINT32_MAX causes lpReplaceInteger()
+             * to return NULL when XDEL increments the deleted counter, then
+             * streamIteratorRemoveEntry() crashes on lpFirst(NULL).  XADD
+             * rejects any single entry larger than STREAM_LISTPACK_MAX_SIZE, so
+             * no node it writes exceeds 2 * STREAM_LISTPACK_MAX_SIZE (the extra
+             * factor covers master-entry headers).  A larger node can only come
+             * from a crafted payload. */
+            if (lp_size > (size_t)2 * STREAM_LISTPACK_MAX_SIZE) {
+                rdbReportCorruptRDB("Stream node too large: %zu bytes", lp_size);
+                sdsfree(nodekey);
+                decrRefCount(o);
+                zfree(lp);
+                return NULL;
+            }
+
             unsigned char *first = lpFirst(lp);
             if (first == NULL) {
                 /* Serialized listpacks should never be empty, since on
@@ -3018,6 +3033,25 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error, int rd
                 decrRefCount(o);
                 zfree(lp);
                 return NULL;
+            }
+
+            /* Enforce per-node entry count limit, matching XADD's check.  An
+             * oversized node makes XDEL, XCLAIM and XAUTOCLAIM scan
+             * O(node_entries) per ID. */
+            if (server.stream_node_max_entries) {
+                int64_t live_count, del_count;
+                lpGet(first, &live_count, NULL);
+                lpGet(lpNext(lp, first), &del_count, NULL);
+                int64_t count = live_count + del_count;
+                if (count > server.stream_node_max_entries) {
+                    rdbReportCorruptRDB(
+                        "Stream node entry count %lld exceeds limit %lld",
+                        (long long)count, server.stream_node_max_entries);
+                    sdsfree(nodekey);
+                    decrRefCount(o);
+                    zfree(lp);
+                    return NULL;
+                }
             }
 
             /* Insert the key in the radix tree. */
