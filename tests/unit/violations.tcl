@@ -62,6 +62,22 @@ start_server [list overrides [list save ""] tags {"large-memory"}] {
     } {0}
 }
 
+# A refused XADD must not create the key, since nothing is propagated
+start_server [list overrides [list save ""] tags {"large-memory"}] {
+    test {XADD over the size limit does not create the key} {
+        # Two 512MiB values plus the field names are just over the 1GiB limit
+        r write "*7\r\n\$4\r\nXADD\r\n\$1\r\nS\r\n\$1\r\n*\r\n"
+        for {set j 0} {$j<2} {incr j} {
+            r write "\$1\r\n$j\r\n"
+            write_big_bulk 536870912 "" yes
+        }
+        r flush
+        catch {r read} err
+        assert_match {*too large*} $err
+        r exists S
+    } {0}
+}
+
 # Gradually add big hash fields using repeated HSET calls
 # This reproduces the overflow in the call to ziplistResize
 # Object will be converted to hashtable encoding
