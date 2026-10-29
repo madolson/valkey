@@ -2922,7 +2922,21 @@ void xsetidCommand(client *c) {
     }
 
     s->last_id = id;
-    if (entries_added != -1) s->entries_added = entries_added;
+    if (entries_added != -1 && (uint64_t)entries_added != s->entries_added) {
+        s->entries_added = entries_added;
+        /* Every group's entries_read counts against the old entries_added, so
+         * invalidate it and let the lag be estimated from the stream again. */
+        if (s->cgroups) {
+            raxIterator ri;
+            raxStart(&ri, s->cgroups);
+            raxSeek(&ri, "^", NULL, 0);
+            while (raxNext(&ri)) {
+                streamCG *cg = ri.data;
+                cg->entries_read = SCG_INVALID_ENTRIES_READ;
+            }
+            raxStop(&ri);
+        }
+    }
     if (!streamIDEqZero(&max_xdel_id)) s->max_deleted_entry_id = max_xdel_id;
     signalModifiedKey(c, c->db, c->argv[1]);
     server.dirty++;

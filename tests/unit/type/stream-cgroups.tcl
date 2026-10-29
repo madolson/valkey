@@ -1424,6 +1424,8 @@ start_server {
         r XADD x 3-0 data c
         r XGROUP CREATE x g1 0
         r XREADGROUP GROUP g1 c1 STREAMS x >
+        r XSETID x 3-0 ENTRIESADDED 3
+        assert_equal [dict get [lindex [r XINFO GROUPS x] 0] entries-read] 3
         r XDEL x 1-0 2-0
         r XSETID x 3-0 ENTRIESADDED 1
         set group [lindex [r XINFO GROUPS x] 0]
