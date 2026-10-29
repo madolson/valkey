@@ -351,9 +351,9 @@ start_server {tags {}} {
 
         set keys {}
         for {set i 0} {$i < 343} {incr i} {
-            r set k:iov:$i ""
-            r append k:iov:$i ""
-            lappend keys k:iov:$i
+            r set "{k:iov}:$i" ""
+            r append "{k:iov}:$i" ""
+            lappend keys "{k:iov}:$i"
         }
 
         # Before the fix, the overflow writes past the prefix array into
