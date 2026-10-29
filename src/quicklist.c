@@ -1755,3 +1755,7 @@ int testOnlyQuicklistCompressNode(quicklistNode *node) {
 int testOnlyQuicklistDecompressNode(quicklistNode *node) {
     return __quicklistDecompressNode(node);
 }
+
+int testOnlyQuicklistNodeAllowMerge(const quicklistNode *a, const quicklistNode *b, int fill) {
+    return _quicklistNodeAllowMerge(a, b, fill);
+}
