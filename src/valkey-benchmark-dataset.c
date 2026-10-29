@@ -389,9 +389,12 @@ static sds replaceOccurrence(sds processed_arg, const char *pos, const char *rep
 static sds processFieldsInArg(dataset *ds, sds arg, int record_index) {
     if (!strstr(arg, FIELD_PREFIX)) return arg;
 
-    /* Loop through all field placeholders in the argument */
-    while (strstr(arg, FIELD_PREFIX)) {
-        const char *field_pos = strstr(arg, FIELD_PREFIX);
+    /* Loop through all field placeholders in the argument. Resume scanning
+     * after each inserted value, so placeholder text inside dataset values
+     * is kept literally instead of being expanded again. */
+    size_t search_offset = 0;
+    const char *field_pos;
+    while ((field_pos = strstr(arg + search_offset, FIELD_PREFIX))) {
         const char *field_start = field_pos + FIELD_PREFIX_LEN;
         const char *field_end = strstr(field_start, FIELD_SUFFIX);
         if (!field_end) break;
@@ -407,6 +410,7 @@ static sds processFieldsInArg(dataset *ds, sds arg, int record_index) {
         sds result = sdsnewlen(arg, before_len);
         result = sdscat(result, field_value);
         result = sdscat(result, after_start);
+        search_offset = before_len + strlen(field_value);
 
         sdsfree(arg);
         arg = result;
