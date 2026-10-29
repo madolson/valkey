@@ -1417,6 +1417,19 @@ start_server {
         assert_equal [dict get $group lag] 0
     }
 
+    test {Consumer group lag after XSETID lowers ENTRIESADDED} {
+        r DEL x
+        r XADD x 1-0 data a
+        r XADD x 2-0 data b
+        r XADD x 3-0 data c
+        r XGROUP CREATE x g1 0
+        r XREADGROUP GROUP g1 c1 STREAMS x >
+        r XDEL x 1-0 2-0
+        r XSETID x 3-0 ENTRIESADDED 1
+        set group [lindex [r XINFO GROUPS x] 0]
+        assert_equal [dict get $group lag] 0
+    }
+
     test {Loading from legacy (Redis <= v6.2.x, rdb_ver < 10) persistence} {
         # The payload was DUMPed from a v5 instance after:
         # XADD x 1-0 data a
