@@ -497,7 +497,7 @@ CallReply *callReplyGetAttribute(CallReply *rep) {
  * explicitly or used after CallReply itself is freed.
  */
 int callReplyGetAttributeElement(CallReply *rep, size_t idx, CallReply **key, CallReply **val) {
-    return callReplyGetMapElementInternal(rep, idx, key, val, VALKEYMODULE_REPLY_MAP);
+    return callReplyGetMapElementInternal(rep, idx, key, val, VALKEYMODULE_REPLY_ATTRIBUTE);
 }
 
 /* Return a big number reply value. Applicable to:
