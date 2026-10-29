@@ -3293,8 +3293,7 @@ static sds ACLLoadFromFile(const char *filename) {
             new_default = ACLCreateDefaultUser();
         }
 
-        /* The loop below cannot see what the default user lost, since after
-         * the copy its old and new rules are the same object. */
+        /* The default user is special since after the copy its old and new rules are the same object. */
         ACLKillPubsubClientsIfNeeded(new_default, DefaultUser);
         ACLCopyUser(DefaultUser, new_default);
         ACLFreeUser(new_default);
