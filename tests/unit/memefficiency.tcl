@@ -380,6 +380,56 @@ run_solo {defrag} {
         }
     }
 
+    proc test_big_hash_volatile_set_freed {type} {
+        test "Active Defrag big hash: volatile set freed mid-scan: $type" {
+            # 20k fields, each expiring in its own volatile set bucket, so the
+            # volatile set phase of the deferred scan is longer than the
+            # hashtable phase.
+            set n 20000
+            r eval {
+                local t = tonumber(ARGV[1])
+                for i = 1, tonumber(ARGV[2]) do
+                    redis.call('hset', KEYS[1], 'f' .. i, 'v')
+                    redis.call('hpexpireat', KEYS[1], t + i * 10000, 'FIELDS', 1, 'f' .. i)
+                end
+                redis.call('hset', KEYS[1], 'plain', 'v')
+            } 1 h [expr {[clock milliseconds] + 3600000}] $n
+            assert_encoding hashtable h
+
+            # Defrag regardless of fragmentation, slowly, so the hash is
+            # scanned over many cycles.
+            r config set active-defrag-threshold-lower 0
+            r config set active-defrag-ignore-bytes 1
+            r config set active-defrag-cycle-min 1
+            r config set active-defrag-cycle-max 1
+            set steps [expr {[s active_defrag_key_hits] + [s active_defrag_key_misses]}]
+            r config set activedefrag yes
+
+            # Each deferred step scans one hashtable bucket, then one volatile
+            # set bucket. The hashtable has at most 4096 buckets.
+            wait_for_condition 1000 10 {
+                [s active_defrag_key_hits] + [s active_defrag_key_misses] > $steps + 8192
+            } else {
+                fail "defrag did not reach the volatile set"
+            }
+
+            # Drop the last field expiry, which frees the volatile set.
+            r eval {
+                for i = 1, tonumber(ARGV[1]) do
+                    redis.call('hpersist', KEYS[1], 'FIELDS', 1, 'f' .. i)
+                end
+            } 1 h $n
+            set steps [expr {[s active_defrag_key_hits] + [s active_defrag_key_misses]}]
+            wait_for_condition 100 50 {
+                [s active_defrag_key_hits] + [s active_defrag_key_misses] > $steps
+            } else {
+                fail "defrag did not resume on the hash"
+            }
+            r config set activedefrag no
+            assert_equal PONG [r ping]
+        }
+    }
+
     proc test_big_list {type} {
         set title "Active Defrag big list: $type"
         test $title {
@@ -669,6 +719,7 @@ run_solo {defrag} {
     lappend tests [list test_main_dictionary standalone $aof_overrides] ;# only need AOF for main dict, standalone
     lappend tests [list test_eval_scripts standalone $std_overrides]
     lappend tests [list test_big_hash standalone $std_overrides]
+    lappend tests [list test_big_hash_volatile_set_freed standalone $std_overrides]
     lappend tests [list test_big_list standalone $std_overrides]
     lappend tests [list test_big_set standalone $std_overrides]
     lappend tests [list test_big_zset_random_score standalone $std_overrides]
