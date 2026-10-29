@@ -117,5 +117,7 @@ start_cluster 1 2 {tags {external:skip cluster} overrides {repl-diskless-load di
         } else {
             fail "Replica kept the old primary's dataset"
         }
+        # The takeover must have landed mid-load for this test to mean anything.
+        verify_log_message -1 "*Sync was cancelled while loading the DB*" 0
     }
 }
