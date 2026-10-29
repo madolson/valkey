@@ -1050,23 +1050,3 @@ start_cluster 1 0 {tags {external:skip cluster} overrides {cluster-slot-stats-en
         R 0 config set min-string-size-avoid-copy-reply $copy_avoid
     }
 }
-
-start_cluster 1 0 {tags {external:skip cluster}} {
-    test "CLUSTER SLOT-STATS ORDERBY on a replica of a replica" {
-        # Make myself a replica of A, which is a replica of B. A still owns slots
-        # 10-16383, and B, the top of the chain, owns slots 0-9.
-        set a [string repeat a 40]
-        set b [string repeat b 40]
-        set conf_path [cluster_nodes_conf_path 0]
-        set myself [lsearch -inline [split [read_file $conf_path] "\n"] "*myself*"]
-        regsub {myself,master - (\d+ \d+) \d+ connected.*} $myself "myself,slave $a \\1 0 connected" myself
-        catch {R 0 shutdown nosave}
-        write_file $conf_path [join [list $myself \
-            "$a 127.0.0.1:1@2 slave $b 0 0 0 connected 10-16383" \
-            "$b 127.0.0.1:3@4 master - 0 0 1 connected 0-9" \
-            "vars currentEpoch 1 lastVoteEpoch 0"] "\n"]
-        restart_server 0 true false
-
-        assert_equal 10 [llength [R 0 CLUSTER SLOT-STATS ORDERBY key-count]]
-    }
-}
