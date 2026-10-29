@@ -3120,6 +3120,7 @@ void setDeferredAttributeLen(client *c, void *node, long length);
 void setDeferredPushLen(client *c, void *node, long length);
 int processInputBuffer(client *c);
 void acceptCommonHandler(connection *conn, struct ClientFlags flags, char *ip);
+bool hasMaxClientsLimitReached(bool is_prioritized);
 int validatePrioritySubnets(const char *subnets_str, const char **err);
 int updatePrioritySubnets(const char *subnets_str);
 void readQueryFromClient(connection *conn);

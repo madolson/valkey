@@ -313,3 +313,29 @@ start_cluster 3 0 {tags {external:skip cluster network}} {
         }
     }
 }
+
+start_server {tags {external:skip cluster} overrides {cluster-enabled yes cluster-databases 16 maxclients 10}} {
+    test "Inbound cluster bus connections count against maxclients" {
+        set sockets {}
+        for {set i 0} {$i < 100} {incr i} {
+            set s [socket [srv 0 host] [expr {[srv 0 port] + 10000}]]
+            fconfigure $s -blocking 0
+            lappend sockets $s
+        }
+
+        # Idle connections that never identify a node must not pile up past maxclients.
+        wait_for_condition 50 100 {
+            [llength [lmap s $sockets {read $s; if {[eof $s]} continue; set s}]] <= 10
+        } else {
+            fail "Server kept every idle cluster bus connection"
+        }
+        assert_equal PONG [r ping]
+
+        foreach s $sockets {close $s}
+        wait_for_condition 50 100 {
+            [status r cluster_connections] == 0
+        } else {
+            fail "Closed cluster bus connections are still counted"
+        }
+    }
+}

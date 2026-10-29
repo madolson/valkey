@@ -64,6 +64,15 @@
  * that represents this node. */
 clusterNode *myself = NULL;
 
+/* Open inbound cluster bus connections, from accept to close, including the
+ * ones that have not identified a node yet. */
+static unsigned long inbound_conns = 0;
+
+/* Inbound bus connections may go this far past maxclients once client
+ * connections fill it, so a peer can still reconnect or MEET us. It must stay
+ * well inside CONFIG_MIN_RESERVED_FDS, which nodes.conf saves rely on. */
+#define CLUSTER_INBOUND_CONNS_HEADROOM 8
+
 clusterNode *createClusterNode(char *nodename, int flags);
 void clusterAddNode(clusterNode *node);
 void clusterAcceptHandler(aeEventLoop *el, int fd, void *privdata, int mask);
@@ -1939,6 +1948,9 @@ int freeClusterLink(clusterLink *link) {
               link->inbound ? "inbound" : "outbound",
               clusterLinkGetHumanNodeName(link));
 
+    /* A deferred free calls us again; count the connection only once. */
+    if (link->inbound && !link->async_close) inbound_conns--;
+
     /* Detach from node regardless of whether we free now or defer. */
     if (link->node) {
         if (link->node->link == link) {
@@ -2026,6 +2038,7 @@ void clusterConnAcceptHandler(connection *conn) {
     if (connGetState(conn) != CONN_STATE_CONNECTED) {
         serverLog(LL_VERBOSE, "Error accepting cluster node connection: %s", connGetLastError(conn));
         connClose(conn);
+        inbound_conns--;
         return;
     }
 
@@ -2049,6 +2062,17 @@ void clusterConnAcceptHandler(connection *conn) {
     server.cluster->stat_cluster_links_established_inbound++;
 }
 
+/* Accept inbound bus connections into the client slots their source may use,
+ * and past that only up to the headroom beyond what known nodes are already
+ * counted for. */
+static bool clusterInboundConnsLimitReached(const char *ip) {
+    unsigned long peers = dictSize(server.cluster->nodes) - 1;
+    if (inbound_conns < peers + CLUSTER_INBOUND_CONNS_HEADROOM) return false;
+    bool is_prioritized = (server.priority_subnets_count > 0 &&
+                           anetMatchIpSubnet(ip, server.priority_subnets_array, server.priority_subnets_count));
+    return hasMaxClientsLimitReached(is_prioritized);
+}
+
 void clusterAcceptHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
     int cport, cfd;
     int max = server.tls_cluster ? server.max_new_tls_conns_per_cycle : server.max_new_conns_per_cycle;
@@ -2070,6 +2094,15 @@ void clusterAcceptHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
             return;
         }
 
+        /* Until a connection identifies a node nothing else frees it, so
+         * without a limit idle connections exhaust our file descriptors. */
+        if (clusterInboundConnsLimitReached(cip)) {
+            serverLog(LL_VERBOSE, "Rejecting cluster node connection from %s:%d: max number of clients + cluster connections reached",
+                      cip, cport);
+            close(cfd);
+            continue;
+        }
+
         connection *conn = connCreateAccepted(connTypeOfCluster(), cfd, &require_auth);
         /* Tag inbound cluster bus link as high-priority so cluster gossip and heartbeats
          * are processed via QoS ahead of normal client traffic. */
@@ -2089,6 +2122,7 @@ void clusterAcceptHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
             connClose(conn);
             return;
         }
+        inbound_conns++;
 
         connKeepAlive(conn, server.cluster_node_timeout / 1000 * 2);
 
@@ -2111,6 +2145,7 @@ void clusterAcceptHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
             if (connGetState(conn) == CONN_STATE_ERROR)
                 serverLog(LL_VERBOSE, "Error accepting cluster node connection: %s", connGetLastError(conn));
             connClose(conn);
+            inbound_conns--;
             return;
         }
     }
@@ -2119,10 +2154,14 @@ void clusterAcceptHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
 /* Return the approximated number of sockets we are using in order to
  * take the cluster bus connections. */
 unsigned long getClusterConnectionsCount(void) {
+    if (!server.cluster_enabled) return 0;
     /* We decrement the number of nodes by one, since there is the
      * "myself" node too in the list. Each node uses two file descriptors,
-     * one incoming and one outgoing, thus the multiplication by 2. */
-    return server.cluster_enabled ? ((dictSize(server.cluster->nodes) - 1) * 2) : 0;
+     * one incoming and one outgoing, thus the multiplication by 2. Inbound
+     * connections beyond one per node, such as ones that never identify a
+     * node, are counted on top. */
+    unsigned long peers = dictSize(server.cluster->nodes) - 1;
+    return peers * 2 + (inbound_conns > peers ? inbound_conns - peers : 0);
 }
 
 /* -----------------------------------------------------------------------------
