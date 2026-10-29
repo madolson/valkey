@@ -16,9 +16,8 @@ start_server {tags {"scripting"}} {
         # up under the registered engine name "LUA", gets NULL, and fires
         # serverAssert(stats). The bug only manifests on the very first
         # FUNCTION LOAD after startup, before any earlier load has created the
-        # "LUA" stats entry. A plain PING would succeed even after a crash
-        # because the harness restarts the server; instead, store a key before
-        # the attempt and check it survives.
+        # "LUA" stats entry. Store a key before the attempt; if the server
+        # crashes the connection drops and the read below returns empty.
         r set pre_crash_sentinel alive
         catch {
             r function load "#!\"lua\\x00zz\" name=nultest\nserver.register_function('nulfunc', function(KEYS, ARGV) return 1 end)"
@@ -27,7 +26,7 @@ start_server {tags {"scripting"}} {
         # error and leave sentinel empty so the assert below fires gracefully.
         set sentinel {}
         catch {set sentinel [r get pre_crash_sentinel]}
-        assert_equal alive $sentinel
+        assert_equal $sentinel alive
     }
 }
 
