@@ -1818,6 +1818,15 @@ start_server {tags {"scripting needs:debug external:skip"}} {
     }
 }
 
+start_server {tags {"scripting external:skip"} overrides {rename-command {CONFIG ""}}} {
+    test {Test scripting debug works with CONFIG disabled} {
+        r script debug sync
+        r eval {return 'hello'} 0
+        reconnect
+        assert_equal [r ping] {PONG}
+    }
+}
+
 start_server {tags {"scripting external:skip"}} {
     test {Lua scripts eviction does not generate many scripts} {
         r script flush
