@@ -2183,6 +2183,20 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error, int rd
         if ((len = rdbLoadLen(rdb, NULL)) == RDB_LENERR) return NULL;
         if (len == 0) goto emptykey;
 
+        /* Each element takes at least one byte, so a declared count larger than
+         * the remaining payload is impossible in any valid RDB.  In a RESTORE
+         * payload (buffer-backed rio) an oversized count would cause
+         * hashtableTryExpand() to pre-allocate tens of gigabytes of virtual
+         * memory via jemalloc MAP_NORESERVE; when the first parse failure then
+         * frees the object, hashtableEmpty() walks every pre-allocated bucket. */
+        if (rioCheckType(rdb) == RIO_TYPE_BUFFER) {
+            size_t remaining = sdslen(rdb->io.buffer.ptr) - (size_t)rdb->io.buffer.pos;
+            if (len > remaining) {
+                rdbReportCorruptRDB("Set count %llu exceeds remaining payload %zu", (unsigned long long)len, remaining);
+                return NULL;
+            }
+        }
+
         /* Use a regular set when there are too many entries. */
         size_t max_entries = server.set_max_intset_entries;
         if (max_entries >= 1 << 30) max_entries = 1 << 30;
@@ -2280,6 +2294,17 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error, int rd
 
         if ((zsetlen = rdbLoadLen(rdb, NULL)) == RDB_LENERR) return NULL;
         if (zsetlen == 0) goto emptykey;
+
+        /* Same payload-size guard as for SET: each zset member occupies at least
+         * one byte, so a declared count larger than the remaining payload bytes
+         * means the RDB is invalid. */
+        if (rioCheckType(rdb) == RIO_TYPE_BUFFER) {
+            size_t remaining = sdslen(rdb->io.buffer.ptr) - (size_t)rdb->io.buffer.pos;
+            if (zsetlen > remaining) {
+                rdbReportCorruptRDB("Zset count %llu exceeds remaining payload %zu", (unsigned long long)zsetlen, remaining);
+                return NULL;
+            }
+        }
 
         o = createZsetObject();
         zs = objectGetVal(o);
@@ -2496,6 +2521,15 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error, int rd
         }
 
         if (objectGetEncoding(o) == OBJ_ENCODING_HASHTABLE) {
+            /* Same payload-size guard as for SET and ZSET. */
+            if (rioCheckType(rdb) == RIO_TYPE_BUFFER) {
+                size_t remaining = sdslen(rdb->io.buffer.ptr) - (size_t)rdb->io.buffer.pos;
+                if (len > remaining) {
+                    rdbReportCorruptRDB("Hash count %llu exceeds remaining payload %zu", (unsigned long long)len, remaining);
+                    decrRefCount(o);
+                    return NULL;
+                }
+            }
             if (!hashtableTryExpand(objectGetVal(o), len)) {
                 rdbReportCorruptRDB("OOM in hashtableTryExpand %llu", (unsigned long long)len);
                 decrRefCount(o);
