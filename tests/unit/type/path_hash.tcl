@@ -239,7 +239,7 @@ start_server {tags {pathhash}} {
         set after [r debug mallctl thread.peak.read]
         # Copying every path would raise the peak by 32 MB.
         assert_lessthan [expr {$after - $before}] 4000000
-    }
+    } {} {needs:debug}
 
     test {Path Hash write commands account server dirty by logical mutations} {
         r del dirty-tree
