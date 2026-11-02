@@ -86,11 +86,16 @@ Rust to engine, per connection:
    thread's notify list. After the epoll iteration the list is appended to the
    global ready list and the main eventfd is written only if
    `main_signaled` was clear. One wakeup per poll iteration, not per command.
-3. The main thread's ae handler calls `vio_main_begin_drain()` (clears
-   `main_signaled`, reads the eventfd, takes the ready list), then for each
-   handle `vio_main_next_ready()` (clears `in_ready`),
-   `vio_conn_take_events()`, and pulls commands. The clear-before-read order
-   on both flags means a producer that races with the drain always re-queues.
+3. The main thread's ae handler calls `vio_main_begin_drain()` (reads the
+   eventfd, then clears `main_signaled`, then takes the ready list), then for
+   each handle `vio_main_next_ready()` (clears `in_ready`),
+   `vio_conn_take_events()`, and pulls commands. Order matters: a producer
+   that finds `main_signaled` set skips the eventfd write, so clearing the
+   flag before draining the eventfd can lose the last wakeup forever (this
+   happened; fixed in "fix lost wakeup in the eventfd handoff"). Clearing a
+   flag before reading the data it guards (`in_ready` before events and
+   commands) means a racing producer always re-queues. The IO-thread inbox
+   uses the same drain-clear-take order.
 4. `rustIoPull()` moves up to 1024 commands into `c->cmd_queue` as
    `parsedCommand` with `READ_FLAGS_PARSING_COMPLETED`, runs
    `prepareCommandGeneric()` (lookup, arity, cluster slot) on each, and
@@ -226,6 +231,18 @@ thread per main-loop iteration.
 Not on the main thread any more: `read(2)`, `write(2)`/`writev(2)`, RESP
 parsing, argv allocation and copy, `epoll` registration changes for client
 sockets.
+
+Measured (valkey-benchmark, 64-byte values, see the stage report for the
+full matrix): main-thread CPU per million requests at `-P 1` is ~14 s for
+C with `io-threads 1`, ~4.4 s for C with `io-threads 4`, 1.1-1.6 s for Rust
+with 1 IO thread (the IO thread is the bottleneck, so batches are large),
+and ~4.0 s for Rust with 4 IO threads (the main thread is the bottleneck at
+~222k RPS). The per-request main-thread cost is dominated by per-iteration
+fixed costs (epoll, eventfd read, one eventfd write per IO thread kicked)
+that amortize only when batches are large. Not profiled (no `perf` on the
+build host); this attribution is inferred from how the cost moves with
+batch size. Candidate for later stages: defer IO-thread kicks to one pass
+at the end of `beforeSleep()` and let busy IO threads skip the eventfd.
 
 ## Known gaps
 
