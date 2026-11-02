@@ -15200,6 +15200,11 @@ size_t moduleCount(void) {
     return listLength(modules);
 }
 
+/* Return the number of registered command filters. */
+size_t moduleCommandFilterCount(void) {
+    return listLength(moduleCommandFilters);
+}
+
 /* --------------------------------------------------------------------------
  * ## Key eviction API
  * -------------------------------------------------------------------------- */

@@ -35,5 +35,7 @@ int rustIoTakesOverPort(void);
 int rustIoInitListeners(void);
 void rustIoLogReady(void);
 
+#include "rust_io_precheck.h"
+
 #endif /* USE_RUST_IO */
 #endif /* RUST_IO_H */
