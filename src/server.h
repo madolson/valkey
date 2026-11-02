@@ -81,6 +81,7 @@
 #include "expire.h"     /* Expiration public API */
 #include "rax.h"        /* Radix tree */
 #include "connection.h" /* Connection abstraction */
+#include "rust_io.h"   /* Rust IO layer bridge, USE_RUST_IO only */
 #include "memory_prefetch.h"
 #include "vset.h"
 #include "trace/trace.h"
@@ -3679,6 +3680,7 @@ int overMaxmemoryAfterAlloc(size_t moremem);
 uint64_t getCommandFlags(client *c);
 void prepareCommand(client *c);
 void prepareCommandQueue(client *c);
+void prepareCommandGeneric(robj **argv, int argc, int *read_flags, struct serverCommand **cmd, int *slot);
 void unprepareCommand(client *c);
 int processCommand(client *c);
 int processPendingCommandAndInputBuffer(client *c);

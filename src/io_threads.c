@@ -694,6 +694,10 @@ int trySendReadToIOThreads(client *c) {
     if (server.active_io_threads_num <= 1) return C_ERR;
     /* Fake/teardown clients may have no connection; never offload those. */
     if (!c->conn) return C_ERR;
+#ifdef USE_RUST_IO
+    /* Rust connections do their own IO. */
+    if (connIsRust(c->conn)) return C_ERR;
+#endif
     /* If IO thread is still reading, return C_OK so the main thread does not race it. */
     if (c->io_read_state == CLIENT_PENDING_IO) return C_OK;
     /* A completed read must be finished by processClientIOReadsDone on the main thread
@@ -742,6 +746,9 @@ int trySendReadToIOThreads(client *c) {
 int trySendWriteToIOThreads(client *c) {
     if (server.active_io_threads_num <= 1) return C_ERR;
     if (!c->conn) return C_ERR;
+#ifdef USE_RUST_IO
+    if (connIsRust(c->conn)) return C_ERR;
+#endif
     /* The I/O thread is already writing for this client. */
     if (c->io_write_state != CLIENT_IDLE) return C_OK;
     if (c->io_read_state == CLIENT_PENDING_IO) return C_ERR;

@@ -429,6 +429,14 @@ ifeq ($(BUILD_RDMA),yes)
 	FINAL_LIBS += ../deps/libvalkey/lib/libvalkey_rdma.a $(RDMA_LIBS)
 endif
 
+# Rust IO layer (src/rust/valkey-io). Off by default.
+RUST_IO_LIB=rust/valkey-io/target/release/libvalkey_io.a
+CARGO?=$(shell command -v cargo 2>/dev/null || echo $(HOME)/.cargo/bin/cargo)
+ifeq ($(BUILD_RUST_IO),yes)
+	FINAL_CFLAGS+=-DUSE_RUST_IO
+	FINAL_LIBS := $(RUST_IO_LIB) $(FINAL_LIBS) -lpthread -ldl -lrt -lm -lgcc_s
+endif
+
 RDMA_MODULE=
 RDMA_MODULE_NAME:=valkey-rdma$(PROG_SUFFIX).so
 RDMA_MODULE_CFLAGS:=$(FINAL_CFLAGS)
@@ -737,6 +745,7 @@ persist-settings: distclean
 	echo BUILD_TLS=$(BUILD_TLS) >> .make-settings
 	echo OPENSSL_PREFIX=$(OPENSSL_PREFIX) >> .make-settings
 	echo BUILD_RDMA=$(BUILD_RDMA) >> .make-settings
+	echo BUILD_RUST_IO=$(BUILD_RUST_IO) >> .make-settings
 	echo BUILD_ZSTD=$(BUILD_ZSTD) >> .make-settings
 	echo ZSTD_PREFIX=$(ZSTD_PREFIX) >> .make-settings
 	echo USE_SYSTEMD=$(USE_SYSTEMD) >> .make-settings
@@ -766,6 +775,16 @@ endif
 
 ifneq ($(strip $(PREV_FINAL_LDFLAGS)), $(strip $(FINAL_LDFLAGS)))
 .make-prerequisites: persist-settings
+endif
+
+ifeq ($(BUILD_RUST_IO),yes)
+ENGINE_SERVER_OBJ += rust_io.o
+$(SERVER_NAME): $(RUST_IO_LIB)
+# Always ask cargo; it is a no-op when the crate is up to date.
+$(RUST_IO_LIB): rust-io-cargo
+rust-io-cargo:
+	cd rust/valkey-io && $(CARGO) build --release --quiet
+.PHONY: rust-io-cargo
 endif
 
 # valkey-server
