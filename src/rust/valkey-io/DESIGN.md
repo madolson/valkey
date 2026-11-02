@@ -80,7 +80,8 @@ Rust to engine, per connection:
    command, and appends the batch to `Shared.cmds` under the lock. A protocol
    error is appended as a final item with `err != 0`, and the IO thread stops
    reading that socket.
-2. It sets event bits (`VIO_EV_NEW`, `VIO_EV_CLOSED`, `VIO_EV_WRITABLE`) and,
+2. It sets event bits (`VIO_EV_NEW`, `VIO_EV_CLOSED`, `VIO_EV_WRITABLE`,
+   `VIO_EV_QBLIMIT`) and,
    if the connection is not already queued (`in_ready`), adds it to the
    thread's notify list. After the epoll iteration the list is appended to the
    global ready list and the main eventfd is written only if
@@ -135,6 +136,11 @@ Close:
   engine pulls at most 1024 into `cmd_queue`. A slow or blocked client
   therefore costs at most ~2048 parsed commands plus one 16 KiB read.
 - Output: 1 MiB in Rust, the rest in the engine's reply list (see above).
+- Query buffer: after each read the IO thread compares its unparsed bytes
+  with the live `client-query-buffer-limit` (1 MiB while unauthenticated),
+  like `readToQueryBuf()`, and reports `VIO_EV_QBLIMIT`; the engine logs,
+  counts `client_query_buffer_limit_disconnections` and frees the client.
+  Unlike C, the MULTI queue (`mstate->argv_len_sums`) is not added in.
 - Clients whose input is held in Rust (queue full, blocked, or
   `protectClient()` removed the read handler) are kept in `rust_stalled` and
   retried from `beforeSleep()` through the connection type's
@@ -175,7 +181,8 @@ Rust links no engine symbol directly; both are passed in `vio_start()`. That
 keeps `cargo test` linkable without the engine and keeps the dependency
 explicit. The IO threads also read `server.proto_max_bulk_len` through a
 pointer given in `VioConfig` (a racy aligned 64-bit read, as the C IO threads
-do), so `CONFIG SET proto-max-bulk-len` takes effect.
+do), so `CONFIG SET proto-max-bulk-len` takes effect. Same for
+`server.client_max_querybuf_len`.
 
 ## Changes outside the bridge and the crate
 
@@ -224,8 +231,8 @@ sockets.
 
 - `CLIENT LIST` `qbuf`/`qbuf-free` are always 0: buffered input lives in Rust.
 - Rust read and write buffers use the system allocator and are not in
-  `used_memory`, `client-query-buffer-limit` or client eviction accounting.
-  Parsed-but-unexecuted commands are bounded instead (see Backpressure).
+  `used_memory` or client eviction accounting. Parsed-but-unexecuted
+  commands are bounded instead (see Backpressure).
 - `CONFIG SET bind` / `port` under takeover try to bind a C listener on the
   port Rust holds and fail.
 - Only TCP. No TLS, no Unix socket, no outbound connections (replication and
