@@ -590,8 +590,11 @@ impl Worker {
                 let tok = events[i].u64;
                 let mask = events[i].events;
                 if tok == TOK_WAKE {
-                    me.signaled.store(false, Ordering::Release);
+                    /* Drain before clearing: a producer that sees the flag
+                     * set skips the eventfd write, so the flag must not be
+                     * cleared after its write was consumed. */
                     eventfd_drain(me.wakefd);
+                    me.signaled.store(false, Ordering::Release);
                     let msgs = std::mem::take(&mut *me.inbox.lock().unwrap());
                     for m in msgs {
                         match m {
@@ -693,8 +696,10 @@ thread_local! {
 #[no_mangle]
 pub extern "C" fn vio_main_begin_drain() {
     let g = global();
-    g.main_signaled.store(false, Ordering::Release);
+    /* Drain, then clear, then take the list. Clearing first loses a wakeup
+     * when a producer signals between the clear and the drain. */
     eventfd_drain(g.main_efd);
+    g.main_signaled.store(false, Ordering::Release);
     let batch = std::mem::take(&mut *g.ready.lock().unwrap());
     MAIN_READY.with(|r| r.borrow_mut().extend(batch));
 }
