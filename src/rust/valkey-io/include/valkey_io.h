@@ -28,6 +28,7 @@ typedef struct VioConfig {
     int port;
     int threads;
     const long long *proto_max_bulk_len; /* read live by IO threads */
+    const size_t *client_max_querybuf_len; /* read live by IO threads */
     VioCallbacks cbs;
 } VioConfig;
 
@@ -60,6 +61,7 @@ typedef struct VioCmd {
 #define VIO_EV_NEW (1u << 0)      /* accepted; engine must adopt or close it */
 #define VIO_EV_CLOSED (1u << 1)   /* peer closed or socket error */
 #define VIO_EV_WRITABLE (1u << 2) /* outbound buffer drained (after want_writable) */
+#define VIO_EV_QBLIMIT (1u << 3)  /* unparsed input exceeded client-query-buffer-limit */
 
 /* Startup. Returns an eventfd to poll for readability, or -1 with errno. */
 int vio_start(const VioConfig *cfg);

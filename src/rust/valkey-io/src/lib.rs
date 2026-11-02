@@ -36,6 +36,7 @@ pub struct VioConfig {
     pub port: c_int,
     pub threads: c_int,
     pub proto_max_bulk_len: *const i64,
+    pub client_max_querybuf_len: *const usize,
     pub cbs: VioCallbacks,
 }
 
@@ -56,6 +57,7 @@ unsafe impl Send for VioCmd {}
 pub const VIO_EV_NEW: u32 = 1 << 0;
 pub const VIO_EV_CLOSED: u32 = 1 << 1;
 pub const VIO_EV_WRITABLE: u32 = 1 << 2;
+pub const VIO_EV_QBLIMIT: u32 = 1 << 3;
 
 /* Backpressure thresholds. */
 const CMDS_HIGH: usize = 1024; /* stop reading when this many commands are queued */
@@ -124,6 +126,7 @@ struct IoThread {
 struct Global {
     cbs: VioCallbacks,
     max_bulk_len: *const i64,
+    max_querybuf_len: *const usize,
     threads: Vec<IoThread>,
     main_efd: RawFd,
     main_signaled: AtomicBool,
@@ -353,7 +356,21 @@ impl Worker {
         }
         unsafe { l.rbuf.set_len(l.rbuf.len() + n as usize) };
 
-        let lim = Limits { max_bulk_len: unsafe { std::ptr::read_volatile(g.max_bulk_len) }, auth_required: conn.auth_required.load(Ordering::Relaxed) };
+        /* client-query-buffer-limit, checked like readToQueryBuf(): on the
+         * unparsed bytes, before parsing what this read added. */
+        let auth_required = conn.auth_required.load(Ordering::Relaxed);
+        let unparsed = l.rbuf.len() - l.rpos;
+        let qb_limit = unsafe { std::ptr::read_volatile(g.max_querybuf_len) };
+        if unparsed > qb_limit || (auth_required && unparsed > 1024 * 1024) {
+            l.proto_err = true;
+            l.rbuf = Vec::new();
+            l.rpos = 0;
+            self.notify(&conn, VIO_EV_QBLIMIT);
+            self.update_interest(idx);
+            return;
+        }
+
+        let lim = Limits { max_bulk_len: unsafe { std::ptr::read_volatile(g.max_bulk_len) }, auth_required };
         let mut batch: Vec<VioCmd> = Vec::new();
         let mut ptrs: Vec<*const u8> = Vec::new();
         let mut lens: Vec<usize> = Vec::new();
@@ -642,6 +659,7 @@ pub extern "C" fn vio_start(cfg: *const VioConfig) -> c_int {
     let g = Global {
         cbs: cfg.cbs,
         max_bulk_len: cfg.proto_max_bulk_len,
+        max_querybuf_len: cfg.client_max_querybuf_len,
         threads,
         main_efd,
         main_signaled: AtomicBool::new(false),

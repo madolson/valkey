@@ -239,6 +239,21 @@ static void rustIoHandleReady(const VioConn *h) {
 
     rustIoDeliver(rc);
 
+    if (ev & VIO_EV_QBLIMIT) {
+        rc = vio_conn_udata(h);
+        if (!rc) return;
+        client *c = connGetPrivateData(&rc->c);
+        if (c) {
+            /* handleQbLimitReached() dumps c->querybuf, which is NULL here. */
+            sds ci = catClientInfoString(sdsempty(), c, server.hide_user_data_from_log);
+            serverLog(LL_WARNING, "Closing client that reached max query buffer length: %s", ci);
+            sdsfree(ci);
+            freeClientAsync(c);
+            server.stat_client_qbuf_limit_disconnections++;
+        }
+        return;
+    }
+
     if (ev & VIO_EV_CLOSED) {
         rc = vio_conn_udata(h);
         if (!rc) return;
@@ -495,6 +510,7 @@ int rustIoInitListeners(void) {
         .port = port,
         .threads = rust_io_config.threads,
         .proto_max_bulk_len = &server.proto_max_bulk_len,
+        .client_max_querybuf_len = &server.client_max_querybuf_len,
         .cbs = {.create_argv = rustIoCreateArgv, .free_argv = rustIoFreeArgv},
     };
     int efd = vio_start(&cfg);
