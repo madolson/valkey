@@ -471,8 +471,9 @@ impl Worker {
             self.peer_gone(idx);
             return;
         }
+        /* Level triggered, like a socket write handler: keep firing after
+         * each flush while the engine keeps its handler installed. */
         if conn.want_writable.load(Ordering::Acquire) && conn.out_bytes.load(Ordering::Acquire) < OUT_LOW {
-            conn.want_writable.store(false, Ordering::Release);
             self.notify(&conn, VIO_EV_WRITABLE);
         }
         self.update_interest(idx);
