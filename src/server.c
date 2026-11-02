@@ -3322,7 +3322,11 @@ void initListeners(void) {
     /* Setup listeners from server config for TCP/TLS/Unix */
     ConnectionType *ct;
     connListener *listener;
+#ifdef USE_RUST_IO
+    if (server.port != 0 && !rustIoTakesOverPort()) {
+#else
     if (server.port != 0) {
+#endif
         ct = connectionByType(CONN_TYPE_SOCKET);
         if (!ct) serverPanic("Failed finding connection listener of %s", getConnectionTypeName(CONN_TYPE_SOCKET));
         listener = &server.listeners[CONN_TYPE_SOCKET];
@@ -3391,6 +3395,10 @@ void initListeners(void) {
 
         listen_fds += listener->count;
     }
+
+#ifdef USE_RUST_IO
+    listen_fds += rustIoInitListeners();
+#endif
 
     if (listen_fds == 0) {
         serverLog(LL_WARNING, "Configured to not listen anywhere, exiting.");
@@ -4592,7 +4600,7 @@ uint64_t getCommandFlags(client *c) {
  * processing, including looking up the command, checking arity and calculating
  * cluster slot. This should be done before calling processCommand() and can be
  * done by I/O threads to offload the main-thread. */
-static void prepareCommandGeneric(robj **argv, int argc, int *read_flags, struct serverCommand **cmd, int *slot) {
+void prepareCommandGeneric(robj **argv, int argc, int *read_flags, struct serverCommand **cmd, int *slot) {
     if (!(*read_flags & READ_FLAGS_PARSING_COMPLETED) || argc == 0) return;
     /* Make sure we don't do this twice. */
     debugServerAssert(*cmd == NULL && !(*read_flags & READ_FLAGS_COMMAND_NOT_FOUND));
@@ -8235,6 +8243,9 @@ __attribute__((weak)) int main(int argc, char **argv) {
 
             serverLog(LL_NOTICE, "Ready to accept connections %s", getConnectionTypeName(listener->ct->get_type()));
         }
+#ifdef USE_RUST_IO
+        rustIoLogReady();
+#endif
 
         if (server.supervised_mode == SUPERVISED_SYSTEMD) {
             if (!server.primary_host) {

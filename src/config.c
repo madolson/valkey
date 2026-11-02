@@ -70,6 +70,10 @@ configEnum maxmemory_policy_enum[] = {
     {"noeviction", MAXMEMORY_NO_EVICTION},
     {NULL, 0}};
 
+#ifdef USE_RUST_IO
+extern configEnum rust_io_mode_enum[]; /* rust_io.c */
+#endif
+
 configEnum syslog_facility_enum[] = {
     {"user", LOG_USER},
     {"local0", LOG_LOCAL0},
@@ -3715,6 +3719,13 @@ standardConfig static_configs[] = {
     createSpecialConfig("rdma-bind", NULL, MODIFIABLE_CONFIG | MULTI_ARG_CONFIG, setConfigRdmaBindOption, getConfigRdmaBindOption, rewriteConfigRdmaBindOption, applyRdmaBind),
     createSpecialConfig("replicaof", "slaveof", IMMUTABLE_CONFIG | MULTI_ARG_CONFIG, setConfigReplicaOfOption, getConfigReplicaOfOption, rewriteConfigReplicaOfOption, NULL),
     createSpecialConfig("latency-tracking-info-percentiles", NULL, MODIFIABLE_CONFIG | MULTI_ARG_CONFIG, setConfigLatencyTrackingInfoPercentilesOutputOption, getConfigLatencyTrackingInfoPercentilesOutputOption, rewriteConfigLatencyTrackingInfoPercentilesOutputOption, NULL),
+
+#ifdef USE_RUST_IO
+    createEnumConfig("rust-io-mode", NULL, IMMUTABLE_CONFIG, rust_io_mode_enum, rust_io_config.mode, RUST_IO_MODE_OFF, NULL, NULL),
+    createIntConfig("rust-io-port", NULL, IMMUTABLE_CONFIG, 0, 65535, rust_io_config.port, 0, INTEGER_CONFIG, NULL, NULL),
+    createIntConfig("rust-io-threads", NULL, IMMUTABLE_CONFIG, 1, 128, rust_io_config.threads, 1, INTEGER_CONFIG, NULL, NULL),
+    createBoolConfig("rust-io-takeover", NULL, IMMUTABLE_CONFIG, rust_io_config.takeover, 0, NULL, NULL),
+#endif
 
     /* NULL Terminator, this is dropped when we convert to the runtime array. */
     {NULL},
