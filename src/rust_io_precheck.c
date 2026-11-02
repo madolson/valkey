@@ -59,13 +59,16 @@ static struct {
 } pc_stats;
 
 /* Session barrier commands: they change state that later commands on the
- * same connection are prechecked against. Resolved once, compared by proc. */
-static serverCommandProc *pc_barrier_procs[] = {
-    authCommand, helloCommand, selectCommand, multiCommand, execCommand, discardCommand,
-    resetCommand, subscribeCommand, unsubscribeCommand, psubscribeCommand, punsubscribeCommand,
-    ssubscribeCommand, sunsubscribeCommand, readonlyCommand, readwriteCommand, clientCommand,
-    aclCommand, syncCommand, replconfCommand, quitCommand, NULL,
+ * same connection are prechecked against. Resolved once by name and compared
+ * by pointer (container commands such as ACL and CLIENT have no proc of
+ * their own, so a proc comparison would miss their subcommands). */
+static const char *pc_barrier_names[] = {
+    "auth", "hello", "select", "multi", "exec", "discard", "reset", "subscribe", "unsubscribe",
+    "psubscribe", "punsubscribe", "ssubscribe", "sunsubscribe", "readonly", "readwrite", "client",
+    "acl", "sync", "psync", "replconf", "quit", NULL,
 };
+#define PC_MAX_BARRIERS 32
+static struct serverCommand *pc_barrier_cmds[PC_MAX_BARRIERS];
 
 /* Commands whose checks read more than (cmd, argv, session, ACL, slot):
  * EXEC reads the MULTI queue, scripts read declared script flags. */
@@ -165,6 +168,12 @@ static void pcLogAtExit(void) {
 
 void rustPrecheckInit(void) {
     atexit(pcLogAtExit);
+    int n = 0;
+    for (int i = 0; pc_barrier_names[i] && n < PC_MAX_BARRIERS - 1; i++) {
+        struct serverCommand *cmd = lookupCommandByCString(pc_barrier_names[i]);
+        if (cmd) pc_barrier_cmds[n++] = cmd;
+    }
+    pc_barrier_cmds[n] = NULL;
     for (int i = 0; i < PC_MAX_THREADS; i++) atomic_init(&pc_hazard[i], NULL);
     atomic_init(&pc_current, NULL);
 }
@@ -256,7 +265,9 @@ static int rustPrecheckCmd(void *snap, const VioSession *sess, int barrier_activ
     v->token = (epoch << 32) | ((uint64_t)(sess->gen & 0xffffff) << 8) | (uint64_t)code;
     if (!cmd) return 0;
     struct serverCommand *base = cmd->parent ? cmd->parent : cmd;
-    return procIn(base->proc, pc_barrier_procs);
+    for (int i = 0; pc_barrier_cmds[i]; i++)
+        if (pc_barrier_cmds[i] == base) return 1;
+    return 0;
 }
 
 int (*rustPrecheckCmdFn)(void *, const VioSession *, int, VioCmd *) = rustPrecheckCmd;
