@@ -603,8 +603,13 @@ impl Worker {
             let batch = std::mem::take(&mut self.to_notify);
             let t0 = exec::now_ns();
             let uncontended = (rtc.try_lock)() == 0;
-            if !uncontended {
-                (rtc.lock)();
+            if !uncontended && (rtc.lock)() != 0 {
+                /* The holder is yielding inside a long script/module
+                 * command: give the batch to whoever polls the main
+                 * eventfd (processEventsWhileBlocked() on the holder). */
+                self.to_notify = batch;
+                self.flush_notify();
+                return false;
             }
             let t1 = exec::now_ns();
             let n = batch.len();

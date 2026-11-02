@@ -278,15 +278,38 @@ void rustIoExecCall(client *c, int flags) {
  * exec-rtc
  * ------------------------------------------------------------------------- */
 
+/* The real main thread. While a Rust IO thread holds the engine lock it
+ * is "the main thread" for onServerMainThread() (server.h), which forkless
+ * save, bgiteration and scripting assert on (forkless.c:309 fired on BGSAVE
+ * from an IO thread). inMainThread() (io_threads.c) is already true on Rust
+ * threads: its thread_id defaults to 0. */
+static pthread_t rtc_real_main;
+
 static int rtcTryLock(void) {
-    return moduleTryAcquireGIL();
+    int r = moduleTryAcquireGIL();
+    if (r == 0) server.main_thread_id = pthread_self();
+    return r;
 }
 
-static void rtcLock(void) {
-    moduleAcquireGIL();
+int moduleTimedAcquireGIL(long usec); /* module.c */
+
+/* Blocking acquire, except while the lock holder runs a long script or
+ * module command that yields (processEventsWhileBlocked()): then return 1
+ * and let Rust hand the batch to the yielding thread through the stage 1
+ * ready list and eventfd, which processEventsWhileBlocked() polls, so
+ * those clients get -BUSY and SCRIPT KILL / FUNCTION KILL get through.
+ * isInsideYieldingLongCommand() is read without the lock (a flag and a
+ * pointer the holder sets); a stale read costs one more 1 ms wait. */
+static int rtcLock(void) {
+    while (moduleTimedAcquireGIL(1000) != 0) {
+        if (isInsideYieldingLongCommand()) return 1;
+    }
+    server.main_thread_id = pthread_self();
+    return 0;
 }
 
 static void rtcUnlock(void) {
+    server.main_thread_id = rtc_real_main;
     moduleReleaseGIL();
 }
 
@@ -365,6 +388,7 @@ int rustIoExecInit(void) {
         /* The main thread owns the engine except while it polls. It already
          * holds the GIL: moduleInitModulesSystem() locks it at startup, so IO
          * threads that start before the dataset is loaded wait. */
+        rtc_real_main = server.main_thread_id;
         rust_io_rtc_active = 1;
     }
     return 0;

@@ -87,7 +87,9 @@ pub struct VioExecOps {
 pub struct VioRtcOps {
     /// Non-blocking acquire of the engine lock; 0 on success.
     pub try_lock: extern "C" fn() -> c_int,
-    pub lock: extern "C" fn(),
+    /// Blocking acquire; 0 when acquired, 1 when the holder is inside a
+    /// yielding long command and the batch must go through the ready list.
+    pub lock: extern "C" fn() -> c_int,
     pub unlock: extern "C" fn(),
     /// Run the engine side of one ready connection (adopt, execute, close).
     pub exec_ready: extern "C" fn(*const crate::Conn),

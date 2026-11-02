@@ -148,7 +148,7 @@ typedef struct VioExecOps {
 /* exec-rtc hooks, called on Rust IO threads. */
 typedef struct VioRtcOps {
     int (*try_lock)(void); /* 0 when acquired */
-    void (*lock)(void);
+    int (*lock)(void); /* 0 when acquired, 1: holder is yielding, hand the batch over */
     void (*unlock)(void);
     void (*exec_ready)(const VioConn *h); /* engine side of one ready connection */
     void (*after_batch)(void);            /* lock held: AOF, replies, wake main */
