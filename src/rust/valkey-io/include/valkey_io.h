@@ -86,4 +86,87 @@ void vio_conn_set_auth_required(const VioConn *h, int on);
 void vio_conn_close(const VioConn *h);
 void vio_conn_shutdown(const VioConn *h);
 
+/* ---------------------------------------------------------------------------
+ * Exec mode (cut point 3), src/exec.rs. Engine side: src/rust_io_exec.c.
+ * ------------------------------------------------------------------------- */
+
+/* State call() keeps on its stack; owned by the Rust call(). */
+typedef struct VioCallFrame {
+    void *prev_client;
+    void *real_cmd;
+    int64_t dirty;
+    int64_t old_repl_offset;
+    uint32_t old_flags;
+    int update_command_stats;
+    int reprocessing;
+} VioCallFrame;
+
+/* prop_info() bits */
+#define VIO_PI_PREVENT_PROP (1u << 0)
+#define VIO_PI_IS_EXEC (1u << 1)
+#define VIO_PI_IS_MODULE (1u << 2)
+#define VIO_PI_FORCE_REPL (1u << 3)
+#define VIO_PI_FORCE_AOF (1u << 4)
+#define VIO_PI_PREVENT_REPL (1u << 5)
+#define VIO_PI_PREVENT_AOF (1u << 6)
+
+typedef void (*VioCmdProc)(void *c);
+
+/* Engine helpers the Rust call() uses, one per side effect. */
+typedef struct VioExecOps {
+    int (*bg_block)(void *c);
+    void (*enter)(void *c, VioCallFrame *f);
+    void (*stats_err_reset)(void);
+    void (*enter_execution_unit)(int update_cached_time, long long us);
+    void (*begin_exec)(void *c);
+    VioCmdProc (*proc_of)(void *c);
+    void *(*debug_argv_begin)(void *c);
+    void (*debug_argv_end)(void *c, void *state);
+    void (*exit_execution_unit)(void);
+    int (*after_proc)(void *c);
+    int64_t (*add_duration)(void *c, int64_t us);
+    int64_t (*server_dirty)(void);
+    int (*count_failure)(void *c, void *real_cmd);
+    void (*fire_result_event)(void *c, void *real_cmd, int failed, int64_t duration, int64_t dirty);
+    void (*close_after_command)(void *c);
+    void (*latency)(void *c, void *real_cmd, int64_t duration);
+    void (*commandlog)(void *c, void *real_cmd);
+    void (*feed_monitors)(void *c);
+    void (*cmd_stats)(void *c, void *real_cmd);
+    void (*reset_duration)(void *c);
+    uint32_t (*prop_info)(void *c);
+    void (*also_propagate)(void *c, int propagate_flags);
+    void (*restore_flags)(void *c, uint32_t old_flags);
+    void (*track_keys)(void *c);
+    void (*count_command)(void);
+    void (*peak_memory)(void);
+    void (*after_command)(void *c);
+    void (*set_woff)(void *c, int64_t old_repl_offset);
+    void (*leave)(void *prev_client);
+} VioExecOps;
+
+/* exec-rtc hooks, called on Rust IO threads. */
+typedef struct VioRtcOps {
+    int (*try_lock)(void); /* 0 when acquired */
+    void (*lock)(void);
+    void (*unlock)(void);
+    void (*exec_ready)(const VioConn *h); /* engine side of one ready connection */
+    void (*after_batch)(void);            /* lock held: AOF, replies, wake main */
+} VioRtcOps;
+
+typedef struct VioExecConfig {
+    VioExecOps ops;
+    int rtc;
+    VioRtcOps rtc_ops;
+} VioExecConfig;
+
+/* Before vio_start(). Returns 0. */
+int vio_exec_configure(const VioExecConfig *cfg);
+/* The top-level call() for a client on a Rust connection. */
+void vio_exec_call(void *c, int flags);
+/* Wake the main event loop. */
+void vio_wake_main(void);
+/* exec-rtc lock statistics as INFO lines. Returns length written. */
+size_t vio_rtc_stats(char *buf, size_t len);
+
 #endif /* VALKEY_IO_H */
