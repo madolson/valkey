@@ -23,6 +23,9 @@
 
 #include "rust/valkey-io/include/valkey_io.h"
 
+/* VioCallbacks.precheck_batch, in rust_io_precheck.c. */
+size_t rustPrecheckBatch(void *snap, const VioSession *sess, int barrier_active, VioCmd *cmds, size_t n);
+
 /* VioCmd is engine_io.h's engineCmd. */
 static_assert(sizeof(VioCmd) == sizeof(engineCmd), "VioCmd layout");
 static_assert(offsetof(VioCmd, argv) == offsetof(engineCmd, argv), "VioCmd layout");
@@ -96,10 +99,17 @@ int rustIoListenerUnchanged(void) {
  * Callbacks from Rust IO threads. Allocation only; no engine state.
  * ------------------------------------------------------------------------- */
 
-static void **rustIoCreateArgv(const unsigned char *const *ptrs, const size_t *lens, int argc) {
-    robj **argv = zmalloc(sizeof(robj *) * argc);
-    for (int j = 0; j < argc; j++) argv[j] = createStringObject((const char *)ptrs[j], lens[j]);
-    return (void **)argv;
+/* VioCallbacks.create_argvs: the argv of every command in one parsed batch,
+ * in one call. Runs on a Rust IO thread. */
+static void rustIoCreateArgvs(const unsigned char *const *ptrs, const size_t *lens, VioCmd *cmds, size_t n) {
+    size_t k = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (cmds[i].err) continue;
+        int argc = cmds[i].argc;
+        robj **argv = zmalloc(sizeof(robj *) * argc);
+        for (int j = 0; j < argc; j++, k++) argv[j] = createStringObject((const char *)ptrs[k], lens[k]);
+        cmds[i].argv = (void **)argv;
+    }
 }
 
 /* Also frees argv the engine returned (vio_conn_return_argv): entries the
@@ -586,16 +596,15 @@ int rustIoInitListeners(void) {
         .threads = rust_io_config.threads,
         .proto_max_bulk_len = server.proto_max_bulk_len,
         .client_max_querybuf_len = server.client_max_querybuf_len,
-        .cbs = {.create_argv = rustIoCreateArgv, .free_argv = rustIoFreeArgv, .write_job = rustIoWriteJob},
+        .cbs = {.create_argvs = rustIoCreateArgvs, .free_argv = rustIoFreeArgv, .write_job = rustIoWriteJob},
     };
     rust_io_precheck_active = rust_io_config.mode == RUST_IO_MODE_PRECHECK;
     if (rust_io_precheck_active) {
-        extern int (*rustPrecheckCmdFn)(void *, const VioSession *, int, VioCmd *);
         rustPrecheckInit();
         rustPrecheckPublish();
         cfg.cbs.precheck_begin = rustPrecheckBegin;
         cfg.cbs.precheck_end = rustPrecheckEnd;
-        cfg.cbs.precheck_cmd = rustPrecheckCmdFn;
+        cfg.cbs.precheck_batch = rustPrecheckBatch;
     }
     int efd = vio_start(&cfg);
     if (efd != -1)

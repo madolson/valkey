@@ -277,7 +277,17 @@ static int rustPrecheckCmd(void *snap, const VioSession *sess, int barrier_activ
     return 0;
 }
 
-int (*rustPrecheckCmdFn)(void *, const VioSession *, int, VioCmd *) = rustPrecheckCmd;
+/* VioCallbacks.precheck_batch: one parsed batch of one connection. A command
+ * after a session barrier in the same batch is checked with the barrier
+ * active. Returns the 1-based index of the last barrier, 0 if none. */
+size_t rustPrecheckBatch(void *snap, const VioSession *sess, int barrier_active, VioCmd *cmds, size_t n) {
+    size_t last = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (cmds[i].err) continue;
+        if (rustPrecheckCmd(snap, sess, barrier_active || last, &cmds[i])) last = i + 1;
+    }
+    return last;
+}
 
 /* ---------------------------------------------------------------------------
  * Main thread side

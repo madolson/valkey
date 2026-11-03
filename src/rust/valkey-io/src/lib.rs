@@ -35,8 +35,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct VioCallbacks {
-    /// Build a `robj **` argv of `argc` string objects from byte slices.
-    pub create_argv: extern "C" fn(ptrs: *const *const u8, lens: *const usize, argc: c_int) -> *mut *mut c_void,
+    /// Build the argv of every command in `cmds[0..n]` (entries with
+    /// `err == 0`): `robj **` arrays of `argc` string objects, taking the
+    /// byte slices from `ptrs`/`lens` in order. One call per parsed batch.
+    pub create_argvs: extern "C" fn(ptrs: *const *const u8, lens: *const usize, cmds: *mut VioCmd, n: usize),
     /// Free an argv built by create_argv that the engine never consumed.
     pub free_argv: extern "C" fn(argv: *mut *mut c_void, argc: c_int),
     /// Zero-copy replies: write the sealed reply chunk of `job` (an engine
@@ -48,10 +50,13 @@ pub struct VioCallbacks {
     /// releases it on its own thread (vio_main_next_done). NULL disables.
     pub write_job: Option<extern "C" fn(job: *mut c_void, fd: c_int, can_write: c_int) -> c_int>,
     /// Precheck mode only (cut point 2), NULL otherwise. See precheck.rs.
+    /// begin/end pin the policy snapshot for one IO-thread poll iteration;
+    /// precheck_batch checks one parsed batch and returns the 1-based index
+    /// of its last session barrier, 0 if none.
     pub precheck_begin: Option<extern "C" fn(tid: c_int) -> *mut c_void>,
     pub precheck_end: Option<extern "C" fn(tid: c_int)>,
-    pub precheck_cmd: Option<
-        extern "C" fn(snap: *mut c_void, sess: *const precheck::VioSession, barrier_active: c_int, cmd: *mut VioCmd) -> c_int,
+    pub precheck_batch: Option<
+        extern "C" fn(snap: *mut c_void, sess: *const precheck::VioSession, barrier_active: c_int, cmds: *mut VioCmd, n: usize) -> usize,
     >,
 }
 
@@ -371,11 +376,31 @@ struct Worker {
     /// Write jobs completed in this poll iteration.
     done: Vec<usize>,
     rr: usize,
+    /// Precheck snapshot pinned for this poll iteration (pointer as usize).
+    pinned: Option<usize>,
 }
 
 impl Worker {
     fn me(&self) -> &'static IoThread {
         &global().threads[self.idx]
+    }
+
+    /// Precheck mode: the policy snapshot, pinned on first use in this poll
+    /// iteration and released by unpin() before the thread sleeps.
+    fn pin(&mut self) -> Option<*mut c_void> {
+        let g = global();
+        let begin = g.cbs.precheck_begin?;
+        g.cbs.precheck_batch?;
+        let p = *self.pinned.get_or_insert_with(|| begin(self.idx as c_int) as usize);
+        Some(p as *mut c_void)
+    }
+
+    fn unpin(&mut self) {
+        if self.pinned.take().is_some() {
+            if let Some(end) = global().cbs.precheck_end {
+                end(self.idx as c_int);
+            }
+        }
     }
 
     fn notify(&mut self, conn: &Arc<Conn>, ev: u32) {
@@ -587,6 +612,7 @@ impl Worker {
     /// The engine's next vio_conn_publish() resumes parsing.
     fn parse_buffered(&mut self, idx: usize) {
         let g = global();
+        let snap = self.pin();
         let l = match self.slab[idx].as_mut() {
             Some(l) => l,
             None => return,
@@ -598,17 +624,17 @@ impl Worker {
         let auth_required = conn.auth_required.load(Ordering::Acquire);
         let lim = Limits { max_bulk_len: g.limits.max_bulk_len(), auth_required };
         let mut batch: Vec<VioCmd> = Vec::new();
+        /* Owned (inline) arguments stay alive until create_argvs. */
+        let mut held: Vec<Vec<Arg>> = Vec::new();
         let mut ptrs: Vec<*const u8> = Vec::new();
         let mut lens: Vec<usize> = Vec::new();
-        let pc = precheck::Batch::begin(&g.cbs, self.idx, &conn.session);
+        let mut ncmds = 0usize;
         loop {
             let frame = &l.rbuf[l.rpos..];
             match l.parser.parse(frame, &lim) {
                 Outcome::Command { args, consumed, input_bytes } => {
                     #[cfg(feature = "timing")]
                     let tr = timing::sample_parsed();
-                    ptrs.clear();
-                    lens.clear();
                     let mut sum = 0usize;
                     for a in &args {
                         let (p, len) = match a {
@@ -619,9 +645,9 @@ impl Worker {
                         lens.push(len);
                         sum += len;
                     }
-                    let argv = (g.cbs.create_argv)(ptrs.as_ptr(), lens.as_ptr(), args.len() as c_int);
+                    #[allow(unused_mut)]
                     let mut cmd = VioCmd {
-                        argv,
+                        argv: std::ptr::null_mut(),
                         argc: args.len() as c_int,
                         err: 0,
                         err_byte: 0,
@@ -636,15 +662,11 @@ impl Worker {
                     };
                     #[cfg(feature = "timing")]
                     {
-                        timing::stamp(tr, timing::ST_ARGV);
                         cmd.trace = tr;
                     }
-                    if let Some(pc) = pc.as_ref() {
-                        pc.check(&mut l.precheck, &mut cmd);
-                        #[cfg(feature = "timing")]
-                        timing::stamp(tr, timing::ST_PRECHECK);
-                    }
                     batch.push(cmd);
+                    held.push(args);
+                    ncmds += 1;
                     l.rpos += consumed;
                     if auth_required && l.rpos < l.rbuf.len() {
                         conn.parse_held.store(true, Ordering::Release);
@@ -673,7 +695,21 @@ impl Worker {
                 }
             }
         }
-        drop(pc);
+        if ncmds > 0 {
+            (g.cbs.create_argvs)(ptrs.as_ptr(), lens.as_ptr(), batch.as_mut_ptr(), batch.len());
+            #[cfg(feature = "timing")]
+            for c in batch.iter().filter(|c| c.trace != 0) {
+                timing::stamp(c.trace, timing::ST_ARGV);
+            }
+            if let Some(snap) = snap {
+                precheck::check_batch(&g.cbs, snap, &conn.session, &mut l.precheck, &mut batch, ncmds);
+                #[cfg(feature = "timing")]
+                for c in batch.iter().filter(|c| c.trace != 0) {
+                    timing::stamp(c.trace, timing::ST_PRECHECK);
+                }
+            }
+        }
+        drop(held);
         if l.rpos == l.rbuf.len() {
             l.rbuf.clear();
             l.rpos = 0;
@@ -963,6 +999,7 @@ impl Worker {
                 self.take_inbox();
             }
             timeout = -1;
+            self.unpin();
             self.flush_notify();
         }
     }
@@ -1022,7 +1059,15 @@ fn start(bind: Option<String>, port: c_int, threads: c_int, cbs: VioCallbacks, l
         HANDOFF_DISABLE.store(v, Ordering::Relaxed);
     }
     for idx in 0..nthreads {
-        let w = Worker { idx, slab: Vec::new(), free: Vec::new(), to_notify: Vec::new(), done: Vec::new(), rr: 0 };
+        let w = Worker {
+            idx,
+            slab: Vec::new(),
+            free: Vec::new(),
+            to_notify: Vec::new(),
+            done: Vec::new(),
+            rr: 0,
+            pinned: None,
+        };
         std::thread::Builder::new()
             .name(format!("rust-io-{}", idx))
             .spawn(move || w.run())

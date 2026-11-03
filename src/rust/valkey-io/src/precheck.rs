@@ -15,7 +15,8 @@
 //!   it popped the barrier command. Correctness never depends on this: the
 //!   engine re-validates every token against the live client. Barriers only
 //!   avoid prechecking against a session that is known to be stale.
-//! - pinning the policy snapshot for the duration of one batch.
+//! - one precheck call per parsed batch (`precheck_batch`); the policy
+//!   snapshot is pinned once per IO-thread poll iteration (lib.rs Worker).
 
 use crate::{VioCallbacks, VioCmd};
 use std::ffi::{c_int, c_void};
@@ -119,43 +120,26 @@ pub struct Local {
     barrier_seq: u64,
 }
 
-/// One parsed batch on one connection.
-pub struct Batch<'a> {
-    cbs: &'a VioCallbacks,
-    tid: c_int,
-    snap: *mut c_void,
-    sess: VioSession,
-    consumed: u64,
-}
-
-impl<'a> Batch<'a> {
-    /// None when precheck mode is off (no callbacks).
-    pub fn begin(cbs: &'a VioCallbacks, tid: usize, view: &SessionView) -> Option<Batch<'a>> {
-        let begin = cbs.precheck_begin?;
-        cbs.precheck_cmd?;
-        let snap = begin(tid as c_int);
-        let (sess, consumed) = view.get();
-        Some(Batch { cbs, tid: tid as c_int, snap, sess, consumed })
+/// Precheck one parsed batch on one connection with the pinned snapshot
+/// `snap`: one crossing for the whole batch. Fills cmd/slot/read_flags/token
+/// of every command (entries with `err != 0` are skipped by the engine).
+/// `ncmds` is the number of commands (not errors); an error entry can only
+/// be last.
+pub fn check_batch(cbs: &VioCallbacks, snap: *mut c_void, view: &SessionView, local: &mut Local, cmds: &mut [VioCmd], ncmds: usize) {
+    let check = match cbs.precheck_batch {
+        Some(f) => f,
+        None => return,
+    };
+    if cmds.is_empty() {
+        return;
     }
-
-    /// Precheck one command. Fills cmd/slot/read_flags/token.
-    pub fn check(&self, local: &mut Local, cmd: &mut VioCmd) {
-        local.seq += 1;
-        let barrier_active = local.barrier_seq > self.consumed;
-        let check = self.cbs.precheck_cmd.unwrap();
-        let is_barrier = check(self.snap, &self.sess, barrier_active as c_int, cmd as *mut VioCmd);
-        if is_barrier != 0 {
-            local.barrier_seq = local.seq;
-        }
+    let (sess, consumed) = view.get();
+    let barrier_active = local.barrier_seq > consumed;
+    let last = check(snap, &sess, barrier_active as c_int, cmds.as_mut_ptr(), cmds.len());
+    if last > 0 {
+        local.barrier_seq = local.seq + last as u64;
     }
-}
-
-impl Drop for Batch<'_> {
-    fn drop(&mut self) {
-        if let Some(end) = self.cbs.precheck_end {
-            end(self.tid);
-        }
-    }
+    local.seq += ncmds as u64;
 }
 
 #[cfg(test)]
@@ -171,28 +155,33 @@ mod tests {
     }
     extern "C" fn t_end(_tid: c_int) {}
     /// argc encodes the test command: 1 = barrier, else plain. Token records
-    /// whether the barrier was active.
-    extern "C" fn t_check(_s: *mut c_void, _sess: *const VioSession, active: c_int, cmd: *mut VioCmd) -> c_int {
-        let cmd = unsafe { &mut *cmd };
-        cmd.token = active as u64;
-        if active != 0 {
-            BARRIER_FLAGS.fetch_add(1, Ordering::Relaxed);
+    /// whether the barrier was active. Mirrors rustPrecheckBatch().
+    extern "C" fn t_check(_s: *mut c_void, _sess: *const VioSession, active: c_int, cmds: *mut VioCmd, n: usize) -> usize {
+        let cmds = unsafe { std::slice::from_raw_parts_mut(cmds, n) };
+        let mut last = 0;
+        for (i, cmd) in cmds.iter_mut().enumerate() {
+            let a = active != 0 || last != 0;
+            cmd.token = a as u64;
+            if a {
+                BARRIER_FLAGS.fetch_add(1, Ordering::Relaxed);
+            }
+            if cmd.argc == 1 {
+                last = i + 1;
+            }
         }
-        (cmd.argc == 1) as c_int
+        last
     }
-    extern "C" fn t_create(_p: *const *const u8, _l: *const usize, _a: c_int) -> *mut *mut c_void {
-        std::ptr::null_mut()
-    }
+    extern "C" fn t_create(_p: *const *const u8, _l: *const usize, _c: *mut VioCmd, _n: usize) {}
     extern "C" fn t_free(_a: *mut *mut c_void, _c: c_int) {}
 
     fn cbs() -> VioCallbacks {
         VioCallbacks {
-            create_argv: t_create,
+            create_argvs: t_create,
             free_argv: t_free,
             write_job: None,
             precheck_begin: Some(t_begin),
             precheck_end: Some(t_end),
-            precheck_cmd: Some(t_check),
+            precheck_batch: Some(t_check),
         }
     }
 
@@ -218,32 +207,22 @@ mod tests {
         let cbs = cbs();
         let cell = SessionView::new();
         let mut local = Local::default();
+        let snap = std::ptr::null_mut();
         // Batch 1: plain, barrier (seq 2), plain, plain.
-        {
-            let b = Batch::begin(&cbs, 0, &cell).unwrap();
-            let mut cs = [cmd(2), cmd(1), cmd(2), cmd(2)];
-            for c in cs.iter_mut() {
-                b.check(&mut local, c);
-            }
-            let active: Vec<u64> = cs.iter().map(|c| c.token).collect();
-            assert_eq!(active, vec![0, 0, 1, 1]);
-        }
+        let mut cs = [cmd(2), cmd(1), cmd(2), cmd(2)];
+        check_batch(&cbs, snap, &cell, &mut local, &mut cs, 4);
+        let active: Vec<u64> = cs.iter().map(|c| c.token).collect();
+        assert_eq!(active, vec![0, 0, 1, 1]);
         // Engine consumed only the first command: still behind the barrier.
         cell.set_consumed(1);
-        {
-            let b = Batch::begin(&cbs, 0, &cell).unwrap();
-            let mut c = cmd(2);
-            b.check(&mut local, &mut c);
-            assert_eq!(c.token, 1);
-        }
+        let mut c = [cmd(2)];
+        check_batch(&cbs, snap, &cell, &mut local, &mut c, 1);
+        assert_eq!(c[0].token, 1);
         // Engine popped the barrier: lifted.
         cell.set_consumed(2);
-        {
-            let b = Batch::begin(&cbs, 0, &cell).unwrap();
-            let mut c = cmd(2);
-            b.check(&mut local, &mut c);
-            assert_eq!(c.token, 0);
-        }
+        let mut c = [cmd(2)];
+        check_batch(&cbs, snap, &cell, &mut local, &mut c, 1);
+        assert_eq!(c[0].token, 0);
     }
 
     #[test]
@@ -274,8 +253,10 @@ mod tests {
     #[test]
     fn off_without_callbacks() {
         let mut cbs = cbs();
-        cbs.precheck_begin = None;
+        cbs.precheck_batch = None;
         let cell = SessionView::new();
-        assert!(Batch::begin(&cbs, 0, &cell).is_none());
+        let mut c = [cmd(1)];
+        check_batch(&cbs, std::ptr::null_mut(), &cell, &mut Local::default(), &mut c, 1);
+        assert_eq!(c[0].token, 0);
     }
 }

@@ -95,13 +95,6 @@
 
 typedef struct VioConn VioConn;
 
-typedef struct {
-  void *user;
-  uint32_t gen;
-  uint32_t flags;
-  int dbid;
-} VioSession;
-
 /*
  One parsed command, or a protocol error when `err != 0`.
  */
@@ -135,14 +128,23 @@ typedef struct {
   ;
 } VioCmd;
 
+typedef struct {
+  void *user;
+  uint32_t gen;
+  uint32_t flags;
+  int dbid;
+} VioSession;
+
 /*
  Engine callbacks. Called on Rust IO threads, so they must be thread safe.
  */
 typedef struct {
   /*
-   Build a `robj **` argv of `argc` string objects from byte slices.
+   Build the argv of every command in `cmds[0..n]` (entries with
+   `err == 0`): `robj **` arrays of `argc` string objects, taking the
+   byte slices from `ptrs`/`lens` in order. One call per parsed batch.
    */
-  void **(*create_argv)(const uint8_t *const *ptrs, const size_t *lens, int argc);
+  void (*create_argvs)(const uint8_t *const *ptrs, const size_t *lens, VioCmd *cmds, size_t n);
   /*
    Free an argv built by create_argv that the engine never consumed.
    */
@@ -159,10 +161,17 @@ typedef struct {
   int (*write_job)(void *job, int fd, int can_write);
   /*
    Precheck mode only (cut point 2), NULL otherwise. See precheck.rs.
+   begin/end pin the policy snapshot for one IO-thread poll iteration;
+   precheck_batch checks one parsed batch and returns the 1-based index
+   of its last session barrier, 0 if none.
    */
   void *(*precheck_begin)(int tid);
   void (*precheck_end)(int tid);
-  int (*precheck_cmd)(void *snap, const VioSession *sess, int barrier_active, VioCmd *cmd);
+  size_t (*precheck_batch)(void *snap,
+                           const VioSession *sess,
+                           int barrier_active,
+                           VioCmd *cmds,
+                           size_t n);
 } VioCallbacks;
 
 typedef struct {
