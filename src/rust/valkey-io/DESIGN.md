@@ -14,14 +14,19 @@ deleted in iteration 1 (plan step 2): it re-expressed `call()` through a
 29-entry function table and redefined "main thread" as "GIL holder". The
 code and its measurements stay on the branches `rust-io/exec` and
 `rust-io/integrate`. The "Stage 3" section below is kept as history.
-The boundary is two C files on the engine side (`src/rust_io.c`,
-`src/rust_io_precheck.c`), one header for the Rust exports
-(`include/valkey_io.h`), and the crate. "FFI surface per
-mode" below has the counts.
+The boundary at HEAD is the bridge on the engine side (`src/rust_io.c`,
+`src/rust_io_precheck.c`, `src/engine_io.{h,c}`), the "external"
+connection type (`src/connection_external.{h,c}`), one header for the Rust
+exports (`include/valkey_io.h`), and the crate.
 
-Sections: build and configuration; the stage 1 design (threading,
-handoff, FFI, costs); "Composed modes" and "Handoff v2" (stage 4a); "Stage 2:
-precheck"; "Stage 3: exec".
+How to read this file. The last section, "Iteration 2 (stage 6c): the API
+as it now stands", is the current API: every export, callback and ops-table
+entry at HEAD. The sections before it are in stage order and record why
+each piece exists. Sections that describe deleted code are marked
+"History" in their first line; their symbol tables and counts are not
+current. Unmarked sections still describe the code, except that symbol
+names in them may have been renamed or batched since (the current
+section has the names).
 
 ## Build and configuration
 
@@ -175,6 +180,10 @@ Close:
   progress, so a blocked client does not make the event loop spin.
 
 ## FFI surface
+
+History (stage 1). `vio_conn_set_auth_required` and `rustIoCreateArgv` are
+gone (replaced by `vio_conn_publish` and the batched `create_argvs`); see
+"Iteration 2: the API as it now stands" for the current list.
 
 ### Rust symbols called by C (`include/valkey_io.h`)
 
@@ -448,6 +457,9 @@ All guarded by `USE_RUST_IO`.
 
 ## FFI surface per mode
 
+History (stage 4a counts; `VioRtcOps` and `VioExecOps` were deleted in
+iteration 1). Current counts: ITERATIONS.md, "Iteration 2" metrics.
+
 Rust exports are `#[no_mangle]` functions called by C. C callbacks are
 function pointers Rust calls (`VioCallbacks`, `VioRtcOps`). Engine helpers
 are the `VioExecOps` table the Rust `call()` drives. Counted on the final
@@ -472,6 +484,9 @@ stage 1, 2 and 3 sections below list each symbol's purpose.
 # Stage 5a: hardening
 
 ## beforeSleep() under rtc
+
+History: rtc (exec mode) was deleted in iteration 1, and this fix was not
+merged into iteration 2.
 
 In exec-rtc an IO thread runs a batch under the engine lock and calls
 `rtcAfterBatch()` (`src/rust_io_exec.c`) before it unlocks. The main thread
@@ -567,6 +582,8 @@ Shutting down at once discarded the reply still in the Rust buffer
 (`killself-bgsave.py`).
 
 ## Shutdown and engine-lock fairness (rtc)
+
+History: rtc only; not merged into iteration 2 (exec mode is deleted).
 
 - `rustIoFlushReplicas()` (`src/rust_io.c`) calls `vio_main_flush_kicks()`
   first. Handoff v2 hands main-thread kicks over only at the end of
@@ -872,6 +889,9 @@ module users are not in the snapshot).
 
 ## FFI added in stage 2
 
+History: `precheck_cmd` was replaced by the batched `precheck_batch` in
+iteration 2 (plan step 17); `vio_conn_set_session` is still current.
+
 Rust exports (`include/valkey_io.h`):
 
 | Symbol | Purpose |
@@ -1139,7 +1159,7 @@ shutdown are current (below).
 
 ## Engine callbacks Rust calls on IO threads (`VioCallbacks`)
 
-`create_argvs` (all commands of one parsed batch), `free_argv`,
+Six function pointers (`src/lib.rs`, `pub struct VioCallbacks`): `create_argvs` (all commands of one parsed batch), `free_argv`,
 `write_job` (zero-copy), and in precheck mode `precheck_begin`/`precheck_end`
 (pin the policy snapshot once per IO-thread poll iteration) and
 `precheck_batch` (one parsed batch; returns its last session barrier).
@@ -1149,7 +1169,11 @@ Before iteration 2 every command crossed twice (`create_argv`,
 ## Engine side (C)
 
 - `connection_external.c`: the "external" connection type; `rust_io.c`
-  registers its ops.
+  registers its ops. `externalConnOps` (`src/connection_external.h`) has
+  seven entries: `writev`, `close`, `shutdown`, `want_writable`,
+  `read_resumed`, `has_pending_data`, `process_pending_data`.
+- Zero-copy replies: unchanged since iteration 1 ("Zero-copy replies"
+  above). Off by default (`rust-io-zero-copy-min-bytes -1`).
 - `engine_io.{h,c}`: `engineSubmit()` is the only writer of a client's
   `cmd_queue` for an external connection. `engineCmd` is the layout the IO
   layer's `VioCmd` must have (static_assert in `rust_io.c`).
