@@ -514,6 +514,100 @@ The 22 io-mode exports are stage 1's 16, `vio_set_default_auth_required`
 (stage 4a) = 28 `#[no_mangle]` functions in the crate. The tables in the
 stage 1, 2 and 3 sections below list each symbol's purpose.
 
+# Stage 5a: hardening
+
+## beforeSleep() under rtc
+
+In exec-rtc an IO thread runs a batch under the engine lock and calls
+`rtcAfterBatch()` (`src/rust_io_exec.c`) before it unlocks. The main thread
+keeps running its own `beforeSleep()` whenever it wakes: on its timers
+(`serverCron` every 1000/hz ms), on its own sockets (cluster bus,
+replication, C listeners), and when `rtcAfterBatch()` calls
+`vio_wake_main()`. Each `beforeSleep()` item (`src/server.c`, line numbers
+at stage 5a) is covered one of three ways: **batch** (run in
+`rtcAfterBatch()` under the lock), **wake** (`rtcAfterBatch()` wakes the
+main thread when it is pending), or **main** (left to the next main-thread
+iteration, with the reason).
+
+| server.c | item | rtc coverage |
+|---|---|---|
+| 1958 | `trySendPollJobToIOThreads()` | main. C IO threads only; Rust connections never use them. |
+| 1961 | `stat_peak_memory` | batch, per command (`exPeakMemory`). |
+| 1968-1988 | `ProcessingEventsWhileBlocked` subset | main. A yielding command runs on the main thread (`rustIoRtcShouldDefer`), and an IO thread hands its batch to the yielding holder (`rtcLock` returns 1). |
+| 1992, 2099 | `processIOThreadsResponses()` | main. C IO threads only. |
+| 1996 | `connTypeProcessPendingData()` (Rust stalled clients, TLS) | wake (`connTypeHasPendingData()`). |
+| 2001 | `processPendingReplStreamDecode()` | main. Primary link of a replica, which is a C connection. |
+| 2010 | `clusterBeforeSleep()` | `CLUSTER_TODO_UPDATE_STATE`: batch (`clusterUpdateState()`), so the next command sees the new `cluster_state` (unit/cluster/misc "Cluster state transitions when toggling cluster-require-full-coverage"). Other todo flags (failover, config save, pong broadcast, slot migration): wake. They use the cluster bus and stay on the main thread. |
+| 2013 | `bgIteration_beforeSleep()` | wake while `bgIteration_iterationActive()`. |
+| 2017 | `blockedBeforeSleep()` | wake: `unblocked_clients`, `ready_keys`, `postponed_clients`, `clients_waiting_acks` (WAIT/WAITAOF). Timeouts of blocked clients: main, the same timer-driven latency as the C build. |
+| 2028 | `activeExpireCycle(FAST)` | main. Not needed for correctness; the slow cycle in `serverCron` and lazy expiry still run. |
+| 2032 | module `EVENTLOOP_BEFORE_SLEEP` event | main. Fires once per main-thread iteration, not per IO-thread batch. Known gap for modules that rely on it per batch. |
+| 2045 | `sendGetackToReplicas()` | wake (`get_ack_from_replicas`). |
+| 2052 | `updateFailoverStatus()` | wake while `failover_state == FAILOVER_WAIT_FOR_SYNC`. |
+| 2057-2058 | tracking asserts | batch: invalidations flush per command, as on the main thread. |
+| 2062 | `trackingBroadcastInvalidationMessages()` | batch, before the batch's replies are written. BCAST latency went from 36-100 ms to 0 ms (`bcast-latency.py`). |
+| 2074 | `flushAppendOnlyFile(0)` | batch, before the writes. |
+| 2086 | `fsynced_reploff` update | wake via `clients_waiting_acks`, for WAITAOF. |
+| 2094 | `handleClientsWithPendingWrites()` | batch. |
+| 2111 | `freeClientsInAsyncFreeQueue()` | wake (`clients_to_close`). |
+| 2115 | `incrementalTrimReplicationBacklog()` | main. The backlog trims at the next main-thread iteration (at most one cron tick). |
+| 2118 | `evictClients()` | main. Rust-held buffers are not in client memory anyway (MISSING-FEATURE). |
+| 2127-2147 | event-loop metrics | main. Event-loop metrics in rtc are a known MISSING-FEATURE. |
+| 2153 | `rustIoBeforePoll(1)` | main. It belongs to the main thread's poll. |
+| 2157 | `IOThreadsBeforeSleep()` | main. C IO threads. |
+| 2164 | GIL release | n/a. The IO thread unlocks in `rtcUnlock()`. |
+
+`rtcTakeEngine()` also sets `cmd_time_snapshot` as `afterSleep()` does.
+`processCommand()` checks expiry (`getNodeByQuery()`) before `call()` takes
+its own snapshot, so an IO thread used the previous command's time.
+
+## Admission control
+
+The C listener throttles itself: accept runs on the busy main thread, and
+`acceptCommonHandler()` refuses clients at maxclients. Rust IO threads
+accept and read no matter how far behind the main thread is. Three bounds
+(`src/lib.rs`, constants next to `CMDS_HIGH`):
+
+- **Unadopted connections.** `UNADOPTED` counts accepted connections whose
+  `VIO_EV_NEW` the engine has not taken (`vio_conn_take_events`). At
+  `NEW_HIGH` (128), thread 0 removes the listener from its epoll set
+  (`accept_backoff`). Taking a `VIO_EV_NEW` below `NEW_LOW` (64) sends
+  `Msg::ResumeAccept` to thread 0. The kernel backlog holds the rest, as
+  for the C listener. The pause and resume race is closed by re-checking
+  after setting `ACCEPT_PAUSED` (both SeqCst).
+- **Open connections.** `LIVE` counts Rust connections from accept until
+  the fd closes, including closed connections still draining output. At
+  maxclients (published by `rustIoPublishGlobals()` through
+  `vio_set_maxclients`), the IO thread writes
+  `-ERR max number of clients reached` and closes, as
+  `acceptCommonHandler()` does. `rejected_connections` includes these
+  (`vio_take_rejected`). The engine's own check still runs at adoption.
+  This bound counts real fds, so it is stricter than C's client count by
+  the connections still draining output.
+- **Queued commands, global.** `QUEUED` counts parsed commands in Rust
+  across all connections. Above `QUEUED_HIGH` (4096), a connection stops
+  reading once it holds `FAIR_SHARE` (32) commands (`may_read`). The usual
+  per-connection `CMDS_HIGH` still applies below the budget. A paused
+  connection always holds commands, so it is in the engine's ready path.
+  The engine's pop kicks it below `CMDS_LOW`, and `on_kick` resumes it
+  (`may_resume`), so no global resume broadcast is needed. A connection
+  with nothing queued can always read, so a fresh connection is never
+  starved by pipelines. `vio_conn_close()` frees commands the engine will
+  never pop, so closed connections draining output stop counting.
+
+Not bounded: a single read can parse more than `FAIR_SHARE` commands (one
+`READ_CHUNK`). That is the same per-read granularity as the C read path.
+
+## Shutdown of a closing connection
+
+`freeClient()` calls `connShutdown()` before `connClose()` while a fork
+child holds a copy of the fd (`src/networking.c`, "Only use shutdown when
+the fork is active"). `vio_conn_shutdown()` now only sets
+`shutdown_wanted`. `Drop for Conn` shuts the fd down right before closing
+it, which happens after the output drained or the peer went away.
+Shutting down at once discarded the reply still in the Rust buffer
+(`killself-bgsave.py`).
+
 # Stage 2: precheck (cut point 2)
 
 `rust-io-mode precheck`. The Rust IO thread runs the checks at the top of
