@@ -451,6 +451,28 @@ void vio_conn_set_session(VioConnRef h, const VioSession *s);
 void vio_conn_close(VioConnRef h);
 
 /*
+ Hand the socket to the engine for direct IO (a fork child or a
+ synchronous session will use the fd): the IO thread writes everything
+ accepted so far, then stops reading and writing the fd until
+ vio_conn_attach(). It still reports VIO_EV_CLOSED when the peer goes
+ away. Blocks until done; returns 0, or -1 if the pending output did not
+ drain within 5 s (the engine then treats the connection as broken).
+
+ # Safety
+ `h` must be a live handle. Engine thread only, never in a fork child.
+ */
+int vio_conn_detach(VioConnRef h);
+
+/*
+ End of the direct-IO window: the IO thread polls the fd again (the
+ engine has made it non-blocking).
+
+ # Safety
+ `h` must be a live handle. Engine thread only.
+ */
+void vio_conn_attach(VioConnRef h);
+
+/*
  # Safety
  `h` must be a live handle.
  */

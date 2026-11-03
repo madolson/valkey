@@ -9,6 +9,23 @@
 static ConnectionType CT_External;
 static const externalConnOps *ext_ops;
 
+/* conn->flags: the engine does IO on the fd itself (connExternalBlock()). */
+#define CONN_FLAG_EXT_DETACHED (1 << 15)
+
+/* Direct IO on the fd: a detached connection, or any connection in a fork
+ * child, where the IO layer's threads do not exist. */
+static inline int connExternalDirect(connection *conn) {
+    return (conn->flags & CONN_FLAG_EXT_DETACHED) || server.in_fork_child;
+}
+
+/* As connSocketWrite()/connSocketRead() for errors and EOF. */
+static void connExternalDirectError(connection *conn, ssize_t ret) {
+    if (ret < 0 && errno != EAGAIN) {
+        conn->last_errno = errno;
+        if (errno != EINTR && conn->state == CONN_STATE_CONNECTED) conn->state = CONN_STATE_ERROR;
+    }
+}
+
 static int connExternalGetType(void) {
     return CONN_TYPE_EXTERNAL;
 }
@@ -46,6 +63,11 @@ static int connExternalAccept(connection *conn, ConnectionCallbackFunc accept_ha
 }
 
 static int connExternalWritev(connection *conn, const struct iovec *iov, int iovcnt) {
+    if (connExternalDirect(conn)) {
+        ssize_t ret = writev(conn->fd, iov, iovcnt);
+        connExternalDirectError(conn, ret);
+        return (int)ret;
+    }
     ssize_t n = ext_ops->writev(conn, iov, iovcnt);
     if (n < 0 && errno != EAGAIN) {
         conn->last_errno = errno;
@@ -59,11 +81,18 @@ static int connExternalWrite(connection *conn, const void *data, size_t data_len
     return connExternalWritev(conn, &iov, 1);
 }
 
-/* Input arrives from the IO layer as parsed commands, never through read(). */
+/* Input arrives from the IO layer as parsed commands, never through read(),
+ * except while the engine does direct IO. */
 static int connExternalRead(connection *conn, void *buf, size_t buf_len) {
-    UNUSED(conn);
-    UNUSED(buf);
-    UNUSED(buf_len);
+    if (connExternalDirect(conn)) {
+        ssize_t ret = read(conn->fd, buf, buf_len);
+        if (ret == 0) {
+            conn->state = CONN_STATE_CLOSED;
+        } else {
+            connExternalDirectError(conn, ret);
+        }
+        return (int)ret;
+    }
     errno = EAGAIN;
     return -1;
 }
@@ -88,18 +117,20 @@ static const char *connExternalGetLastError(connection *conn) {
     return strerror(conn->last_errno);
 }
 
+/* Attached, a sync write is handed to the IO layer like any write (it is
+ * written in order with the rest); a sync read has nothing to read. */
 static ssize_t connExternalSyncWrite(connection *conn, char *ptr, ssize_t size, long long timeout) {
-    UNUSED(timeout);
+    if (connExternalDirect(conn)) return syncWrite(conn->fd, ptr, size, timeout);
     return connExternalWrite(conn, ptr, size);
 }
 
 static ssize_t connExternalSyncRead(connection *conn, char *ptr, ssize_t size, long long timeout) {
-    UNUSED(timeout);
+    if (connExternalDirect(conn)) return syncRead(conn->fd, ptr, size, timeout);
     return connExternalRead(conn, ptr, size);
 }
 
 static ssize_t connExternalSyncReadLine(connection *conn, char *ptr, ssize_t size, long long timeout) {
-    UNUSED(timeout);
+    if (connExternalDirect(conn)) return syncReadLine(conn->fd, ptr, size, timeout);
     return connExternalRead(conn, ptr, size);
 }
 
@@ -170,4 +201,30 @@ connection *connCreateExternal(size_t size, int fd) {
 
 int connIsExternal(connection *conn) {
     return conn && conn->type == &CT_External;
+}
+
+void connExternalDetach(connection *conn) {
+    if (conn->flags & CONN_FLAG_EXT_DETACHED) return;
+    conn->flags |= CONN_FLAG_EXT_DETACHED;
+    /* A fork child has no IO layer threads; the parent detached it already
+     * or never used it. */
+    if (server.in_fork_child) return;
+    if (ext_ops->detach(conn) == -1) {
+        conn->last_errno = EIO;
+        if (conn->state == CONN_STATE_CONNECTED) conn->state = CONN_STATE_ERROR;
+    }
+}
+
+int connExternalBlock(connection *conn) {
+    connExternalDetach(conn);
+    return anetBlock(NULL, conn->fd);
+}
+
+int connExternalNonBlock(connection *conn) {
+    int ret = anetNonBlock(NULL, conn->fd);
+    if ((conn->flags & CONN_FLAG_EXT_DETACHED) && !server.in_fork_child) {
+        conn->flags &= ~CONN_FLAG_EXT_DETACHED;
+        ext_ops->attach(conn);
+    }
+    return ret;
 }

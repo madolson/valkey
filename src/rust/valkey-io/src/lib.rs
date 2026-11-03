@@ -24,8 +24,9 @@ use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::ffi::{c_char, c_int, c_void};
 use std::os::unix::io::{IntoRawFd, RawFd};
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 /* ---------------------------------------------------------------------------
  * FFI types (keep in sync with include/valkey_io.h)
@@ -106,6 +107,15 @@ const OUT_HIGH: usize = 1 << 20; /* refuse engine writes past this many pending 
 const OUT_LOW: usize = 256 << 10; /* fire the engine write handler below this */
 const READ_CHUNK: usize = 16 * 1024;
 
+/* Conn.detach states. */
+pub(crate) const DET_NONE: u8 = 0;
+pub(crate) const DET_WANTED: u8 = 1;
+pub(crate) const DET_DONE: u8 = 2;
+pub(crate) const DET_FAILED: u8 = 3;
+/// How long the IO thread waits for the socket to take the output pending
+/// at detach time.
+const DETACH_FLUSH_MS: u64 = 5000;
+
 /* ---------------------------------------------------------------------------
  * Connection shared between one IO thread and the main thread
  * ------------------------------------------------------------------------- */
@@ -114,6 +124,7 @@ struct Shared {
     cmds: VecDeque<VioCmd>,
     out: Vec<u8>,
 }
+
 
 pub struct Conn {
     fd: RawFd,
@@ -136,6 +147,10 @@ pub struct Conn {
     half_close: AtomicBool,
     /// Bytes accepted from the engine and not yet written to the socket.
     out_bytes: AtomicUsize,
+    /// Fork-child IO window (DESIGN.md "Detached connections"): DET_*.
+    /// While DET_DONE the engine does IO on the fd itself and this layer
+    /// neither reads nor writes it.
+    pub(crate) detach: AtomicU8,
     /// Zero-copy write job in flight (engine pointer), 0 if none. Set by
     /// the engine thread, taken by the IO thread. At most one.
     job: AtomicUsize,
@@ -175,6 +190,10 @@ enum Msg {
     /// To thread 0: unadopted connections fell below NEW_LOW, poll the
     /// listener again.
     ResumeAccept,
+    /// Write what is pending, then stop all IO on the fd (vio_conn_detach).
+    Detach(Arc<Conn>),
+    /// Resume IO on a detached fd (vio_conn_attach).
+    Attach(Arc<Conn>),
 }
 
 struct IoThread {
@@ -265,6 +284,39 @@ fn global() -> &'static Global {
 /// Ask the owning IO thread to re-evaluate a connection (flush output,
 /// resume reading, finish a close). Coalesced: one inbox entry per conn
 /// until the IO thread picks it up, one eventfd write per wakeup.
+/// Engine thread: hand the fd to the engine (fork-child IO window). Waits
+/// until the IO thread has written the pending output and stopped all IO
+/// on the fd. False if the output did not drain in time.
+fn detach(conn: &Arc<Conn>) -> bool {
+    match conn.detach.load(Ordering::Acquire) {
+        DET_DONE => return true,
+        DET_NONE | DET_FAILED => {}
+        _ => unreachable!("detach in progress on the engine thread"),
+    }
+    conn.detach.store(DET_WANTED, Ordering::Release);
+    global().threads[conn.thread].post(|q| q.push(Msg::Detach(conn.clone())));
+    let deadline = Instant::now() + Duration::from_millis(DETACH_FLUSH_MS + 1000);
+    loop {
+        match conn.detach.load(Ordering::Acquire) {
+            DET_DONE => return true,
+            DET_FAILED => return false,
+            _ => {}
+        }
+        if Instant::now() > deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_micros(50));
+    }
+}
+
+/// Engine thread: give the fd back to the IO thread.
+fn attach(conn: &Arc<Conn>) {
+    if conn.detach.load(Ordering::Acquire) == DET_NONE {
+        return;
+    }
+    global().threads[conn.thread].post(|q| q.push(Msg::Attach(conn.clone())));
+}
+
 fn kick(conn: &Arc<Conn>) {
     if conn.kicked.swap(true, Ordering::AcqRel) {
         return;
@@ -477,6 +529,7 @@ impl Worker {
             auth_required: AtomicBool::new(DEFAULT_AUTH_REQUIRED.load(Ordering::Relaxed)),
             parse_held: AtomicBool::new(false),
             half_close: AtomicBool::new(false),
+            detach: AtomicU8::new(DET_NONE),
             out_bytes: AtomicUsize::new(0),
             job: AtomicUsize::new(0),
             shared: Mutex::new(Shared { cmds: VecDeque::new(), out: Vec::new() }),
@@ -529,7 +582,10 @@ impl Worker {
         }
         let c = &l.conn;
         let mut want = 0u32;
-        if !c.read_paused.load(Ordering::Acquire) && !c.c_closed.load(Ordering::Acquire) && !l.proto_err {
+        if c.detach.load(Ordering::Acquire) == DET_DONE {
+            /* Only watch for the peer going away. */
+            want = sys::EPOLLRDHUP;
+        } else if !c.read_paused.load(Ordering::Acquire) && !c.c_closed.load(Ordering::Acquire) && !l.proto_err {
             want |= libc::EPOLLIN as u32;
         }
         if l.woff < l.wbuf.len() || l.sock_blocked {
@@ -763,6 +819,9 @@ impl Worker {
             self.run_job(idx);
             return;
         }
+        if conn.detach.load(Ordering::Acquire) == DET_DONE {
+            return;
+        }
         let mut failed = false;
         #[cfg(feature = "timing")]
         let mut tr = 0u32;
@@ -840,6 +899,15 @@ impl Worker {
             self.remove(idx);
             return;
         }
+        if conn.detach.load(Ordering::Acquire) == DET_DONE {
+            /* Nothing pending here (the detach flushed it), so a close or a
+             * shutdown takes effect at once. */
+            self.maybe_half_close(idx);
+            if conn.c_closed.load(Ordering::Acquire) {
+                self.remove(idx);
+            }
+            return;
+        }
         if conn.read_paused.load(Ordering::Acquire) && global().adm.may_resume(conn.shared.lock().unwrap().cmds.len()) {
             conn.read_paused.store(false, Ordering::Release);
         }
@@ -880,6 +948,14 @@ impl Worker {
     }
 
     fn on_event(&mut self, idx: usize, mask: u32) {
+        if let Some(l) = self.slab[idx].as_ref() {
+            if l.conn.detach.load(Ordering::Acquire) == DET_DONE {
+                if mask & (sys::EPOLLRDHUP | sys::EPOLLHUP | sys::EPOLLERR) != 0 {
+                    self.peer_gone(idx);
+                }
+                return;
+            }
+        }
         if mask & (libc::EPOLLOUT as u32) != 0 {
             if let Some(l) = self.slab[idx].as_mut() {
                 l.sock_blocked = false;
@@ -905,6 +981,56 @@ impl Worker {
             } else if mask & ((libc::EPOLLHUP | libc::EPOLLERR) as u32) != 0 {
                 self.peer_gone(idx);
             }
+        }
+    }
+
+    /// Msg::Detach: put everything accepted so far on the socket (the fd
+    /// is still non-blocking), then leave it to the engine. Reading stops
+    /// here too, so input not yet read stays in the socket for the engine.
+    fn on_detach(&mut self, conn: Arc<Conn>) {
+        let idx = conn.token.load(Ordering::Relaxed);
+        let live = matches!(self.slab.get(idx), Some(Some(l)) if Arc::ptr_eq(&l.conn, &conn));
+        if !live {
+            conn.detach.store(DET_DONE, Ordering::Release);
+            return;
+        }
+        let deadline = Instant::now() + Duration::from_millis(DETACH_FLUSH_MS);
+        let mut ok = true;
+        loop {
+            self.flush(idx);
+            let l = match self.slab[idx].as_ref() {
+                Some(l) => l,
+                None => break,
+            };
+            let pending = l.woff < l.wbuf.len() || conn.out_bytes.load(Ordering::Acquire) > 0;
+            if !pending || conn.peer_closed.load(Ordering::Acquire) {
+                break;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                ok = false;
+                break;
+            }
+            sys::poll_writable(conn.fd, (deadline - now).as_millis().max(1) as c_int);
+        }
+        conn.detach.store(if ok { DET_DONE } else { DET_FAILED }, Ordering::Release);
+        if ok {
+            self.update_interest(idx);
+        }
+    }
+
+    /// Msg::Attach: the engine is done with the fd (and made it
+    /// non-blocking again). Resume reading, and parse what was buffered.
+    fn on_attach(&mut self, conn: Arc<Conn>) {
+        conn.detach.store(DET_NONE, Ordering::Release);
+        let idx = conn.token.load(Ordering::Relaxed);
+        if !matches!(self.slab.get(idx), Some(Some(l)) if Arc::ptr_eq(&l.conn, &conn)) {
+            return;
+        }
+        self.update_interest(idx);
+        self.flush(idx);
+        if !conn.parse_held.load(Ordering::Acquire) {
+            self.parse_buffered(idx);
         }
     }
 
@@ -967,6 +1093,8 @@ impl Worker {
                         self.listen_interest(true);
                         self.accept_all();
                     }
+                    Msg::Detach(c) => self.on_detach(c),
+                    Msg::Attach(c) => self.on_attach(c),
                     Msg::FreeArgv(v) => {
                         let free = global().cbs.free_argv;
                         for (argv, argc) in v {

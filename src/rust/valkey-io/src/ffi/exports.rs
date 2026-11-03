@@ -415,6 +415,34 @@ pub unsafe extern "C" fn vio_conn_close(h: ConnRef<'_>) {
     kick(&conn);
 }
 
+/// Hand the socket to the engine for direct IO (a fork child or a
+/// synchronous session will use the fd): the IO thread writes everything
+/// accepted so far, then stops reading and writing the fd until
+/// vio_conn_attach(). It still reports VIO_EV_CLOSED when the peer goes
+/// away. Blocks until done; returns 0, or -1 if the pending output did not
+/// drain within 5 s (the engine then treats the connection as broken).
+///
+/// # Safety
+/// `h` must be a live handle. Engine thread only, never in a fork child.
+#[no_mangle]
+pub unsafe extern "C" fn vio_conn_detach(h: ConnRef<'_>) -> c_int {
+    if detach(&h.arc()) {
+        0
+    } else {
+        -1
+    }
+}
+
+/// End of the direct-IO window: the IO thread polls the fd again (the
+/// engine has made it non-blocking).
+///
+/// # Safety
+/// `h` must be a live handle. Engine thread only.
+#[no_mangle]
+pub unsafe extern "C" fn vio_conn_attach(h: ConnRef<'_>) {
+    attach(&h.arc());
+}
+
 /// # Safety
 /// `h` must be a live handle.
 #[no_mangle]

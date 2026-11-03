@@ -640,7 +640,23 @@ static void rustExtReadResumed(connection *conn) {
     if (c && rc->h && vio_conn_pending_cmds(rc->h)) rustIoStall(rc, c);
 }
 
+static int rustExtDetach(connection *conn) {
+    rustConnection *rc = (rustConnection *)conn;
+    if (!rc->h) return 0;
+    /* A kick may still sit in the main thread's batch; the detach writes
+     * Shared.out regardless, but keep the order simple. */
+    vio_main_flush_kicks();
+    return vio_conn_detach(rc->h);
+}
+
+static void rustExtAttach(connection *conn) {
+    rustConnection *rc = (rustConnection *)conn;
+    if (rc->h) vio_conn_attach(rc->h);
+}
+
 static const externalConnOps rust_ext_ops = {
+    .detach = rustExtDetach,
+    .attach = rustExtAttach,
     .writev = rustExtWritev,
     .close = rustExtClose,
     .shutdown = rustExtShutdown,
