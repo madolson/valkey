@@ -107,6 +107,8 @@ void vio_conn_set_udata(const VioConn *h, void *udata);
 int vio_conn_fd(const VioConn *h);
 size_t vio_conn_pop_cmds(const VioConn *h, VioCmd *out, size_t max);
 size_t vio_conn_pending_cmds(const VioConn *h);
+/* Bytes accepted by vio_conn_writev() not yet written to the socket. */
+size_t vio_conn_pending_out(const VioConn *h);
 ssize_t vio_conn_writev(const VioConn *h, const struct iovec *iov, int iovcnt);
 void vio_conn_want_writable(const VioConn *h, int on);
 void vio_conn_set_auth_required(const VioConn *h, int on);

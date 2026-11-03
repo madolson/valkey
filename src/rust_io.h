@@ -34,6 +34,8 @@ int rustIoTakesOverPort(void);
 /* Start the Rust layer if configured. Returns the number of listeners. */
 int rustIoInitListeners(void);
 void rustIoLogReady(void);
+/* Wait up to timeout_ms for Rust to write what replicas were handed. */
+void rustIoFlushReplicas(long long timeout_ms);
 
 #include "rust_io_precheck.h"
 
