@@ -98,7 +98,10 @@ static void rustIoFreeArgv(void **argv, int argc) {
  * are decremented here. */
 int rustIoTryOffloadFreeArgv(client *c, int argc, robj **argv) {
     rustConnection *rc = (rustConnection *)c->conn;
-    if (!rc->h || argc == 0) return C_ERR;
+    /* With one IO thread that thread is the bottleneck at high pipelining
+     * (the main thread is about 50% idle at -P 16): freeing there cost 9%
+     * GET throughput. Offload only when the IO threads have room. */
+    if (!rc->h || argc == 0 || rust_io_config.threads < 2) return C_ERR;
     int keep = 0;
     for (int j = 0; j < argc; j++) {
         if (argv[j]->refcount > 1) {
