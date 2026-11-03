@@ -296,11 +296,18 @@ static void rustIoDeliver(rustConnection *rc) {
  * client). The per-client tail runs afterwards, by client id, since a
  * client can be freed meanwhile. Returns 1 when the client went into the
  * batch, 0 when it was handled here. */
+#define RUST_IO_BATCH_MAX_QUEUED 2
+
 static int rustIoDeliverBatched(rustConnection *rc, uint64_t *id) {
     client *c = rustIoDeliverPull(rc);
     if (!c) return 0;
     *id = c->id;
-    if (engineCmdQueuePending(c) == 0 || addCommandToBatchAndProcessIfFull(c) == C_ERR) {
+    /* A deep queue (pipelining) is prefetched per client by
+     * processInputBuffer() already; batching it measured -4% to -9% GET
+     * RPS at -P 16. The batch pays off for shallow queues (-P 1: -8% to
+     * -12% main-thread ns/request). */
+    int queued = engineCmdQueuePending(c);
+    if (queued == 0 || queued > RUST_IO_BATCH_MAX_QUEUED || addCommandToBatchAndProcessIfFull(c) == C_ERR) {
         if (processInputBuffer(c) == C_ERR) return 0;
         rustIoAfterCommands(rc, c);
         beforeNextClient(c);
