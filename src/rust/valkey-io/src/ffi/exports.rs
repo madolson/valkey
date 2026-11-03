@@ -489,6 +489,16 @@ pub unsafe extern "C" fn vio_conn_close(h: ConnRef<'_>) {
     kick(&conn);
 }
 
+/// connSetPriority(): a high-priority connection is returned by
+/// vio_main_next_ready() ahead of the others in its batch.
+///
+/// # Safety
+/// `h` must be a live handle. Engine thread only.
+#[no_mangle]
+pub unsafe extern "C" fn vio_conn_set_priority(h: ConnRef<'_>, on: c_int) {
+    set_priority(&h, on != 0);
+}
+
 /// Hand the socket to the engine for direct IO (a fork child or a
 /// synchronous session will use the fd): the IO thread writes everything
 /// accepted so far, then stops reading and writing the fd until

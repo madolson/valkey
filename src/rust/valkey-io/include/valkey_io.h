@@ -509,6 +509,15 @@ void vio_conn_set_session(VioConnRef h, const VioSession *s);
 void vio_conn_close(VioConnRef h);
 
 /*
+ connSetPriority(): a high-priority connection is returned by
+ vio_main_next_ready() ahead of the others in its batch.
+
+ # Safety
+ `h` must be a live handle. Engine thread only.
+ */
+void vio_conn_set_priority(VioConnRef h, int on);
+
+/*
  Hand the socket to the engine for direct IO (a fork child or a
  synchronous session will use the fd): the IO thread writes everything
  accepted so far, then stops reading and writing the fd until

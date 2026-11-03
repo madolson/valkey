@@ -499,8 +499,9 @@ static void rustIoAccept(VioConn *h) {
     }
 }
 
-/* Returns 1 when the client's commands went into the prefetch batch. */
-static int rustIoHandleReady(VioConn *h, uint64_t *id) {
+/* Returns 1 when the client's commands went into the prefetch batch.
+ * A high-priority connection (connSetPriority()) runs at once. */
+static int rustIoHandleReady(VioConn *h, uint64_t *id, int prio) {
     int batched = 0;
     uint32_t ev = vio_conn_take_events(h);
     if (ev & VIO_EV_NEW) rustIoAccept(h);
@@ -511,7 +512,7 @@ static int rustIoHandleReady(VioConn *h, uint64_t *id) {
         if (!callHandler(&rc->c, rc->c.write_handler)) return 0;
     }
 
-    if (ev & (VIO_EV_QBLIMIT | VIO_EV_CLOSED))
+    if (prio || (ev & (VIO_EV_QBLIMIT | VIO_EV_CLOSED)))
         rustIoDeliver(rc);
     else
         batched = rustIoDeliverBatched(rc, id);
@@ -544,6 +545,11 @@ static int rustIoHandleReady(VioConn *h, uint64_t *id) {
     return batched;
 }
 
+static void rustIoQoSCycle(monotime start) {
+    if (server.el->priority_events_stats_callback)
+        server.el->priority_events_stats_callback(server.el, getMonotonicUs() - start);
+}
+
 static int rustIoDrainReady(void) {
     VioConn *h;
     int n = 0;
@@ -553,9 +559,23 @@ static int rustIoDrainReady(void) {
     /* Nested in processEventsWhileBlocked(): run what is left of the outer
      * call's batch first, as processClientIOReadsDone() does. */
     if (ProcessingEventsWhileBlocked) processClientsCommandsBatch();
+    /* vio_main_next_ready() returns high-priority connections first. Like
+     * aeProcessQoSEvents(), time them as one priority cycle for the QoS
+     * stats (the QoS event loop never sees these connections). */
+    int in_prio = 0;
+    monotime prio_start = 0;
     while ((h = vio_main_next_ready()) != NULL) {
         uint64_t id;
-        if (rustIoHandleReady(h, &id)) ids[nids++] = id;
+        rustConnection *prc = vio_conn_udata(h);
+        int prio = prc && prc->c.is_priority;
+        if (prio && !in_prio) {
+            in_prio = 1;
+            prio_start = getMonotonicUs();
+        } else if (!prio && in_prio) {
+            in_prio = 0;
+            rustIoQoSCycle(prio_start);
+        }
+        if (rustIoHandleReady(h, &id, prio)) ids[nids++] = id;
         vio_conn_release(h);
         n++;
         if (nids == RUST_IO_DRAIN_BATCH) {
@@ -563,6 +583,7 @@ static int rustIoDrainReady(void) {
             nids = 0;
         }
     }
+    if (in_prio) rustIoQoSCycle(prio_start);
     if (nids) rustIoFlushBatch(ids, nids);
     return n;
 }
@@ -683,6 +704,11 @@ static int rustExtDetach(connection *conn) {
     return vio_conn_detach(rc->h);
 }
 
+static void rustExtSetPriority(connection *conn, int on) {
+    rustConnection *rc = (rustConnection *)conn;
+    if (rc->h) vio_conn_set_priority(rc->h, on);
+}
+
 static void rustExtAttach(connection *conn) {
     rustConnection *rc = (rustConnection *)conn;
     if (rc->h) vio_conn_attach(rc->h);
@@ -691,6 +717,7 @@ static void rustExtAttach(connection *conn) {
 static const externalConnOps rust_ext_ops = {
     .detach = rustExtDetach,
     .attach = rustExtAttach,
+    .set_priority = rustExtSetPriority,
     .writev = rustExtWritev,
     .close = rustExtClose,
     .shutdown = rustExtShutdown,

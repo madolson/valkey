@@ -162,6 +162,20 @@ fn cmd_argv_bytes(c: &VioCmd) -> usize {
 /// engine adds it to used memory for maxmemory (vio_held_input_total()).
 static RBUF_TOTAL: AtomicUsize = AtomicUsize::new(0);
 
+/// Connections with `priority` set; take_ready() reorders only when > 0.
+static PRIO_CONNS: AtomicUsize = AtomicUsize::new(0);
+
+/// Engine thread: mark a connection high priority (or not).
+fn set_priority(conn: &Conn, on: bool) {
+    if conn.priority.swap(on, Ordering::Relaxed) != on {
+        if on {
+            PRIO_CONNS.fetch_add(1, Ordering::Relaxed);
+        } else {
+            PRIO_CONNS.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
 pub struct Conn {
     fd: RawFd,
     thread: usize,
@@ -188,6 +202,9 @@ pub struct Conn {
     /// the IO thread when they change, read by vio_conn_mem().
     in_len: AtomicUsize,
     in_cap: AtomicUsize,
+    /// High-priority connection (connSetPriority()): the engine drains it
+    /// ahead of the others in a ready batch.
+    priority: AtomicBool,
     /// Fork-child IO window (DESIGN.md "Detached connections"): DET_*.
     /// While DET_DONE the engine does IO on the fd itself and this layer
     /// neither reads nor writes it.
@@ -205,6 +222,7 @@ pub struct Conn {
 
 impl Drop for Conn {
     fn drop(&mut self) {
+        set_priority(self, false);
         let g = global();
         let sh = self.shared.get_mut().unwrap();
         g.adm.queued_sub(sh.cmds.len());
@@ -587,6 +605,7 @@ impl Worker {
             auth_required: AtomicBool::new(DEFAULT_AUTH_REQUIRED.load(Ordering::Relaxed)),
             parse_held: AtomicBool::new(false),
             half_close: AtomicBool::new(false),
+            priority: AtomicBool::new(false),
             detach: AtomicU8::new(DET_NONE),
             in_len: AtomicUsize::new(0),
             in_cap: AtomicUsize::new(0),
@@ -1431,8 +1450,20 @@ fn take_ready(g: &Global) -> c_int {
     let Some(batch) = g.ready.take() else {
         return 0;
     };
-
-    MAIN_READY.with(|r| r.borrow_mut().extend(batch.conns));
+    MAIN_READY.with(|r| {
+        let mut r = r.borrow_mut();
+        if PRIO_CONNS.load(Ordering::Relaxed) == 0 {
+            r.extend(batch.conns);
+            return;
+        }
+        /* High-priority connections first, in arrival order (the QoS event
+         * loop drains its priority set before the normal one). */
+        let (prio, rest): (Vec<_>, Vec<_>) = batch.conns.into_iter().partition(|c| c.priority.load(Ordering::Relaxed));
+        for c in prio.into_iter().rev() {
+            r.push_front(c);
+        }
+        r.extend(rest);
+    });
     MAIN_DONE.with(|d| d.borrow_mut().extend(batch.done));
     1
 }

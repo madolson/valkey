@@ -215,6 +215,11 @@ void connExternalDetach(connection *conn) {
     }
 }
 
+void connExternalSetPriority(connection *conn, int on) {
+    conn->is_priority = on;
+    ext_ops->set_priority(conn, on);
+}
+
 int connExternalBlock(connection *conn) {
     connExternalDetach(conn);
     return anetBlock(NULL, conn->fd);

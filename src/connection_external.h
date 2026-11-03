@@ -37,6 +37,8 @@ typedef struct externalConnOps {
     int (*detach)(struct connection *conn);
     /* End of the window (connNonBlock()): resume IO on the fd. */
     void (*attach)(struct connection *conn);
+    /* connSetPriority(): serve this connection ahead of the others. */
+    void (*set_priority)(struct connection *conn, int on);
     /* beforeSleep() hooks, see ConnectionType. */
     int (*has_pending_data)(void);
     int (*process_pending_data)(void);
@@ -54,6 +56,8 @@ int connIsExternal(struct connection *conn);
  * would: in the parent (synchronous Lua debugger, the dual-channel RDB
  * channel's handoff) and in a fork child, which has no IO layer threads. */
 int connExternalBlock(struct connection *conn);
+/* connSetPriority() of an external connection (it has no ae event). */
+void connExternalSetPriority(struct connection *conn, int on);
 int connExternalNonBlock(struct connection *conn);
 /* Stop the IO layer's IO on the fd without changing its blocking mode: a
  * fork child is about to take the connection over. */
