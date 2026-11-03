@@ -611,6 +611,33 @@ it, which happens after the output drained or the peer went away.
 Shutting down at once discarded the reply still in the Rust buffer
 (`killself-bgsave.py`).
 
+## Shutdown and engine-lock fairness (rtc)
+
+- `rustIoFlushReplicas()` (`src/rust_io.c`) calls `vio_main_flush_kicks()`
+  first. Handoff v2 hands main-thread kicks over only at the end of
+  `beforeSleep()`, which never runs again on the way to exit. Without it
+  the B5 fix waited its full second and the auto failover request was
+  lost again.
+- exec-rtc runs SHUTDOWN on the main thread (`rtcMayYield()`). On an IO
+  thread, `rustIoFlushReplicas()` would wait for output that only this
+  same thread can write.
+- `rtcLock()` counts its waiters, and `afterSleep()` calls
+  `rustIoRtcBeforeAcquire()`, which yields up to 1 ms while any IO thread
+  waits. The engine lock is a plain mutex, and the main thread relocking
+  right after `beforeSleep()` won every race while its own sockets stayed
+  readable (unit/cluster/packet "read backlog does not starve clients").
+
+## Known gap: Rust-held output is not in the COB
+
+Output accepted by `vio_conn_writev` (up to `OUT_HIGH`, 1 MiB) counts as
+written for `getClientOutputBufferMemoryUsage()`. integration/throttle-repl
+never activates in io and rtc, because the whole 1 MB target fits in Rust
+(it passes 7/0 with `OUT_HIGH` = 64 KiB). Adding `vio_conn_pending_out()` to
+the usage fixed throttle-repl but broke unit/obuf-limits (3 tests). The
+engine checks limits only when it appends a reply, so bytes that drain in
+Rust change the usage without a check. It needs a limit check on the
+drain side; not done.
+
 # Stage 2: precheck (cut point 2)
 
 `rust-io-mode precheck`. The Rust IO thread runs the checks at the top of
