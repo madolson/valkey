@@ -47,9 +47,11 @@ pub struct VioCallbacks {
     /// releases it on its own thread (vio_main_next_done). NULL disables.
     pub write_job: Option<extern "C" fn(job: *mut c_void, fd: c_int, can_write: c_int) -> c_int>,
     /// Precheck mode only (cut point 2), NULL otherwise. See precheck.rs.
-    pub precheck_begin: Option<precheck::BeginFn>,
-    pub precheck_end: Option<precheck::EndFn>,
-    pub precheck_cmd: Option<precheck::CheckFn>,
+    pub precheck_begin: Option<extern "C" fn(tid: c_int) -> *mut c_void>,
+    pub precheck_end: Option<extern "C" fn(tid: c_int)>,
+    pub precheck_cmd: Option<
+        extern "C" fn(snap: *mut c_void, sess: *const precheck::VioSession, barrier_active: c_int, cmd: *mut VioCmd) -> c_int,
+    >,
 }
 
 #[repr(C)]
@@ -57,7 +59,7 @@ pub struct VioConfig {
     pub bindaddr: *const c_char,
     pub port: c_int,
     pub threads: c_int,
-    pub proto_max_bulk_len: *const i64,
+    pub proto_max_bulk_len: *const std::ffi::c_longlong,
     pub client_max_querybuf_len: *const usize,
     pub cbs: VioCallbacks,
 }

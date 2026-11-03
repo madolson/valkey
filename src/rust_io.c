@@ -44,7 +44,7 @@ configEnum rust_io_mode_enum[] = {
 
 typedef struct rustConnection {
     connection c;
-    const VioConn *h; /* our reference; NULL once closed */
+    VioConn *h; /* our reference; NULL once closed */
     bool stalled;     /* in rust_stalled: commands wait in Rust */
     int pending_err;  /* VIO_ERR_* seen but not yet replied, -1 once replied */
     int pending_err_byte;
@@ -262,7 +262,7 @@ static bool rustIoCanProgress(rustConnection *rc, client *c) {
 /* Pull and execute what Rust parsed for this connection. Mirrors the tail
  * of readQueryFromClient(). The client may be freed. */
 static void rustIoDeliver(rustConnection *rc) {
-    const VioConn *h = rc->h;
+    VioConn *h = rc->h;
     client *c = connGetPrivateData(&rc->c);
     if (!h || !c) return;
     if (c->flag.close_asap || c->flag.close_after_reply) return;
@@ -393,7 +393,7 @@ sds rustIoCatInfo(sds info) {
  * Accept and readiness
  * ------------------------------------------------------------------------- */
 
-static void rustIoAccept(const VioConn *h) {
+static void rustIoAccept(VioConn *h) {
     rustConnection *rc = (rustConnection *)connCreateExternal(sizeof(rustConnection), vio_conn_fd(h));
     rc->h = vio_conn_retain(h);
     vio_conn_set_udata(h, rc);
@@ -413,7 +413,7 @@ static void rustIoAccept(const VioConn *h) {
     }
 }
 
-static void rustIoHandleReady(const VioConn *h) {
+static void rustIoHandleReady(VioConn *h) {
     uint32_t ev = vio_conn_take_events(h);
     if (ev & VIO_EV_NEW) rustIoAccept(h);
 
@@ -453,7 +453,7 @@ static void rustIoHandleReady(const VioConn *h) {
 }
 
 static int rustIoDrainReady(void) {
-    const VioConn *h;
+    VioConn *h;
     int n = 0;
     rustIoDrainDone();
     while ((h = vio_main_next_ready()) != NULL) {

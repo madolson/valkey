@@ -35,10 +35,12 @@ impl VioSession {
     }
 }
 
-pub type BeginFn = extern "C" fn(tid: c_int) -> *mut c_void;
-pub type EndFn = extern "C" fn(tid: c_int);
-pub type CheckFn =
-    extern "C" fn(snap: *mut c_void, sess: *const VioSession, barrier_active: c_int, cmd: *mut VioCmd) -> c_int;
+/// VioSession.flags bits (published by the engine).
+pub const VIO_SESS_AUTHENTICATED: u32 = 1 << 0;
+pub const VIO_SESS_MULTI: u32 = 1 << 1;
+pub const VIO_SESS_PUBSUB_RESP2: u32 = 1 << 2;
+/// Replica, primary, slot migration, no user.
+pub const VIO_SESS_SPECIAL: u32 = 1 << 3;
 
 /// Per-connection state, shared with the main thread.
 pub struct SessionCell(Mutex<VioSession>);

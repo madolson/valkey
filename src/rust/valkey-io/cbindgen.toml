@@ -15,12 +15,14 @@ usize_is_size_t = true
 
 [export]
 include = ["VioSession", "VioCmd", "VioConfig", "VioCallbacks"]
-exclude = []
+exclude = ["Option_ConnHandle", "PROTO_INLINE_MAX_SIZE", "ST_READ", "ST_PARSED", "ST_ARGV", "ST_PRECHECK", "ST_ENQUEUED", "ST_WRITTEN", "NSTAMPS"]
 
 [export.rename]
 "Conn" = "VioConn"
 "ConnRef" = "VioConnRef"
 "ConnHandle" = "VioConnHandle"
+"Option_ConnHandle" = "VioConnHandle"
+"iovec" = "struct iovec"
 
 [parse]
 parse_deps = false

@@ -790,6 +790,13 @@ rust-io-cargo:
 	cd rust/valkey-io && $(CARGO) clippy --release --quiet $(RUST_IO_CARGO_FEATURES) -- -D warnings
 	cd rust/valkey-io && $(CARGO) build --release --quiet $(RUST_IO_CARGO_FEATURES)
 .PHONY: rust-io-cargo
+# include/valkey_io.h is generated from the crate; check it in.
+rust-header:
+	cd rust/valkey-io && cbindgen --config cbindgen.toml --crate valkey-io -o include/valkey_io.h -q
+check-rust-header:
+	cd rust/valkey-io && cbindgen --config cbindgen.toml --crate valkey-io -o /tmp/valkey_io.h.$$$$ -q && \
+	  diff -u include/valkey_io.h /tmp/valkey_io.h.$$$$ && rm -f /tmp/valkey_io.h.$$$$
+.PHONY: rust-header check-rust-header
 endif
 
 # valkey-server

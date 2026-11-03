@@ -4,6 +4,36 @@
 #![allow(unsafe_code)]
 
 mod exports;
+
+use crate::resp::ProtoError;
+
+/// Protocol error codes in VioCmd.err (resp::ProtoError; mirrors READ_FLAGS_ERROR_*).
+#[allow(dead_code)]
+pub const VIO_ERR_NONE: i32 = 0;
+pub const VIO_ERR_BIG_INLINE: i32 = 1;
+pub const VIO_ERR_BIG_MULTIBULK: i32 = 2;
+pub const VIO_ERR_INVALID_MULTIBULK_LEN: i32 = 3;
+pub const VIO_ERR_UNAUTH_MULTIBULK_LEN: i32 = 4;
+pub const VIO_ERR_UNAUTH_BULK_LEN: i32 = 5;
+pub const VIO_ERR_BIG_BULK_COUNT: i32 = 6;
+pub const VIO_ERR_UNEXPECTED_CHAR: i32 = 7;
+pub const VIO_ERR_INVALID_BULK_LEN: i32 = 8;
+pub const VIO_ERR_UNBALANCED_QUOTES: i32 = 9;
+pub const VIO_ERR_NUL_IN_INLINE: i32 = 10;
+pub const VIO_ERR_INVALID_CRLF: i32 = 11;
+const _: () = {
+    assert!(ProtoError::BigInline as i32 == VIO_ERR_BIG_INLINE);
+    assert!(ProtoError::BigMultibulk as i32 == VIO_ERR_BIG_MULTIBULK);
+    assert!(ProtoError::InvalidMultibulkLen as i32 == VIO_ERR_INVALID_MULTIBULK_LEN);
+    assert!(ProtoError::UnauthMultibulkLen as i32 == VIO_ERR_UNAUTH_MULTIBULK_LEN);
+    assert!(ProtoError::UnauthBulkLen as i32 == VIO_ERR_UNAUTH_BULK_LEN);
+    assert!(ProtoError::BigBulkCount as i32 == VIO_ERR_BIG_BULK_COUNT);
+    assert!(ProtoError::UnexpectedChar as i32 == VIO_ERR_UNEXPECTED_CHAR);
+    assert!(ProtoError::InvalidBulkLen as i32 == VIO_ERR_INVALID_BULK_LEN);
+    assert!(ProtoError::UnbalancedQuotes as i32 == VIO_ERR_UNBALANCED_QUOTES);
+    assert!(ProtoError::NulInInline as i32 == VIO_ERR_NUL_IN_INLINE);
+    assert!(ProtoError::InvalidCrlf as i32 == VIO_ERR_INVALID_CRLF);
+};
 #[allow(unused_imports)]
 pub use exports::*;
 
@@ -29,7 +59,7 @@ unsafe impl Send for Global {}
 /// replaces them with values pushed by the engine).
 #[derive(Clone, Copy)]
 pub(crate) struct LimitPtrs {
-    pub max_bulk_len: *const i64,
+    pub max_bulk_len: *const std::ffi::c_longlong,
     pub max_querybuf_len: *const usize,
 }
 
