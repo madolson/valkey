@@ -6,6 +6,7 @@
 //! model and the full FFI surface; the C declarations live in
 //! include/valkey_io.h.
 
+pub mod precheck;
 pub mod resp;
 
 use resp::{Arg, Limits, Outcome, Parser};
@@ -28,6 +29,10 @@ pub struct VioCallbacks {
     pub create_argv: extern "C" fn(ptrs: *const *const u8, lens: *const usize, argc: c_int) -> *mut *mut c_void,
     /// Free an argv built by create_argv that the engine never consumed.
     pub free_argv: extern "C" fn(argv: *mut *mut c_void, argc: c_int),
+    /// Precheck mode only (cut point 2), NULL otherwise. See precheck.rs.
+    pub precheck_begin: Option<precheck::BeginFn>,
+    pub precheck_end: Option<precheck::EndFn>,
+    pub precheck_cmd: Option<precheck::CheckFn>,
 }
 
 #[repr(C)]
@@ -51,6 +56,12 @@ pub struct VioCmd {
     pub err_byte: c_int,
     pub argv_len_sum: usize,
     pub input_bytes: u64,
+    /// Precheck mode: struct serverCommand *, slot, read flags and token
+    /// filled on the IO thread; token 0 when not prechecked.
+    pub cmd: *mut c_void,
+    pub slot: c_int,
+    pub read_flags: c_int,
+    pub token: u64,
 }
 unsafe impl Send for VioCmd {}
 
@@ -89,9 +100,13 @@ pub struct Conn {
     want_writable: AtomicBool,
     read_paused: AtomicBool,
     auth_required: AtomicBool,
+    /// Unparsed input held until the engine republishes auth_required.
+    parse_held: AtomicBool,
     /// Bytes accepted from the engine and not yet written to the socket.
     out_bytes: AtomicUsize,
     shared: Mutex<Shared>,
+    /// Engine session mirror (precheck mode).
+    session: precheck::SessionCell,
 }
 
 impl Drop for Conn {
@@ -138,6 +153,11 @@ unsafe impl Sync for Global {}
 unsafe impl Send for Global {}
 
 static GLOBAL: OnceLock<Global> = OnceLock::new();
+
+/// authRequired() of a client that has not authenticated yet, published by
+/// the engine. New connections start with it, so their first read is parsed
+/// with the right limits before the engine adopts them.
+static DEFAULT_AUTH_REQUIRED: AtomicBool = AtomicBool::new(false);
 
 fn global() -> &'static Global {
     GLOBAL.get().expect("valkey-io not started")
@@ -188,6 +208,7 @@ struct Local {
     rbuf: Vec<u8>,
     rpos: usize,
     parser: Parser,
+    precheck: precheck::Local,
     proto_err: bool,
     wbuf: Vec<u8>,
     woff: usize,
@@ -243,9 +264,11 @@ impl Worker {
             peer_closed: AtomicBool::new(false),
             want_writable: AtomicBool::new(false),
             read_paused: AtomicBool::new(false),
-            auth_required: AtomicBool::new(false),
+            auth_required: AtomicBool::new(DEFAULT_AUTH_REQUIRED.load(Ordering::Relaxed)),
+            parse_held: AtomicBool::new(false),
             out_bytes: AtomicUsize::new(0),
             shared: Mutex::new(Shared { cmds: VecDeque::new(), out: Vec::new() }),
+            session: precheck::SessionCell::new(),
         });
         let idx = match self.free.pop() {
             Some(i) => i,
@@ -262,6 +285,7 @@ impl Worker {
             rbuf: Vec::new(),
             rpos: 0,
             parser: Parser::new(),
+            precheck: precheck::Local::default(),
             proto_err: false,
             wbuf: Vec::new(),
             woff: 0,
@@ -370,10 +394,33 @@ impl Worker {
             return;
         }
 
+        if !conn.parse_held.load(Ordering::Acquire) {
+            self.parse_buffered(idx);
+        } else {
+            self.update_interest(idx);
+        }
+    }
+
+    /// Parse what is buffered and hand complete commands to the engine.
+    /// While the connection is unauthenticated, stop after one command,
+    /// like the C parser: AUTH/HELLO change the limits for what follows.
+    /// The engine's next vio_conn_set_auth_required() resumes parsing.
+    fn parse_buffered(&mut self, idx: usize) {
+        let g = global();
+        let l = match self.slab[idx].as_mut() {
+            Some(l) => l,
+            None => return,
+        };
+        let conn = l.conn.clone();
+        if conn.c_closed.load(Ordering::Acquire) || l.proto_err {
+            return;
+        }
+        let auth_required = conn.auth_required.load(Ordering::Acquire);
         let lim = Limits { max_bulk_len: unsafe { std::ptr::read_volatile(g.max_bulk_len) }, auth_required };
         let mut batch: Vec<VioCmd> = Vec::new();
         let mut ptrs: Vec<*const u8> = Vec::new();
         let mut lens: Vec<usize> = Vec::new();
+        let pc = precheck::Batch::begin(&g.cbs, self.idx, &conn.session);
         loop {
             let frame = &l.rbuf[l.rpos..];
             match l.parser.parse(frame, &lim) {
@@ -391,15 +438,27 @@ impl Worker {
                         sum += len;
                     }
                     let argv = (g.cbs.create_argv)(ptrs.as_ptr(), lens.as_ptr(), args.len() as c_int);
-                    batch.push(VioCmd {
+                    let mut cmd = VioCmd {
                         argv,
                         argc: args.len() as c_int,
                         err: 0,
                         err_byte: 0,
                         argv_len_sum: sum,
                         input_bytes,
-                    });
+                        cmd: std::ptr::null_mut(),
+                        slot: -1,
+                        read_flags: 0,
+                        token: 0,
+                    };
+                    if let Some(pc) = pc.as_ref() {
+                        pc.check(&mut l.precheck, &mut cmd);
+                    }
+                    batch.push(cmd);
                     l.rpos += consumed;
+                    if auth_required && l.rpos < l.rbuf.len() {
+                        conn.parse_held.store(true, Ordering::Release);
+                        break;
+                    }
                 }
                 Outcome::Empty { consumed } => l.rpos += consumed,
                 Outcome::Incomplete => break,
@@ -411,12 +470,17 @@ impl Worker {
                         err_byte: b as c_int,
                         argv_len_sum: 0,
                         input_bytes: 0,
+                        cmd: std::ptr::null_mut(),
+                        slot: -1,
+                        read_flags: 0,
+                        token: 0,
                     });
                     l.proto_err = true;
                     break;
                 }
             }
         }
+        drop(pc);
         if l.rpos == l.rbuf.len() {
             l.rbuf.clear();
             l.rpos = 0;
@@ -511,6 +575,9 @@ impl Worker {
             conn.read_paused.store(false, Ordering::Release);
         }
         self.flush(idx);
+        if conn.parse_held.swap(false, Ordering::AcqRel) {
+            self.parse_buffered(idx);
+        }
         if conn.c_closed.load(Ordering::Acquire) {
             let drained = match self.slab[idx].as_ref() {
                 Some(l) => l.woff == l.wbuf.len() && conn.out_bytes.load(Ordering::Acquire) == 0,
@@ -836,7 +903,25 @@ pub extern "C" fn vio_conn_want_writable(h: *const Conn, on: c_int) {
 /// tighter multibulk/bulk limits.
 #[no_mangle]
 pub extern "C" fn vio_conn_set_auth_required(h: *const Conn, on: c_int) {
-    conn_ref(h).auth_required.store(on != 0, Ordering::Relaxed);
+    let conn = conn_arc(h);
+    conn.auth_required.store(on != 0, Ordering::Release);
+    /* Store, then check: the IO thread sets parse_held before the engine
+     * can see the command it stopped after, so this cannot miss it. */
+    if conn.parse_held.load(Ordering::Acquire) {
+        kick(&conn);
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn vio_set_default_auth_required(on: c_int) {
+    DEFAULT_AUTH_REQUIRED.store(on != 0, Ordering::Relaxed);
+}
+
+/// Publish the session fields the precheck reads (cut point 2). Read by
+/// the IO thread once per parsed batch.
+#[no_mangle]
+pub extern "C" fn vio_conn_set_session(h: *const Conn, s: *const precheck::VioSession) {
+    conn_ref(h).session.set(unsafe { &*s });
 }
 
 /// The engine is done with the connection. Pending output is flushed, then

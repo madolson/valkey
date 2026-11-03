@@ -15,12 +15,34 @@
 /* Opaque, reference counted connection handle owned by Rust. */
 typedef struct VioConn VioConn;
 
+typedef struct VioCmd VioCmd;
+
+/* Per-connection engine state the precheck reads (cut point 2). Published
+ * by the main thread with vio_conn_set_session(). */
+#define VIO_SESS_AUTHENTICATED (1u << 0)
+#define VIO_SESS_MULTI (1u << 1)
+#define VIO_SESS_PUBSUB_RESP2 (1u << 2)
+#define VIO_SESS_SPECIAL (1u << 3) /* replica, primary, slot migration, no user */
+typedef struct VioSession {
+    void *user;        /* engine user pointer, compared by identity only */
+    uint64_t consumed; /* commands the engine popped from cmd_queue so far */
+    uint32_t gen;      /* bumped by the engine when any other field changes */
+    uint32_t flags;    /* VIO_SESS_* */
+    int dbid;
+} VioSession;
+
 /* Engine callbacks, invoked on Rust IO threads. */
 typedef struct VioCallbacks {
     /* Build a robj** of argc string objects copied from ptrs[i]/lens[i]. */
     void **(*create_argv)(const unsigned char *const *ptrs, const size_t *lens, int argc);
     /* Free an argv from create_argv that never reached the engine. */
     void (*free_argv)(void **argv, int argc);
+    /* Precheck mode only (NULL otherwise). begin/end bracket one parsed
+     * batch and pin the policy snapshot for this IO thread. precheck_cmd
+     * fills cmd/slot/read_flags/token and returns 1 for a session barrier. */
+    void *(*precheck_begin)(int tid);
+    void (*precheck_end)(int tid);
+    int (*precheck_cmd)(void *snap, const VioSession *sess, int barrier_active, VioCmd *cmd);
 } VioCallbacks;
 
 typedef struct VioConfig {
@@ -48,14 +70,19 @@ enum {
     VIO_ERR_INVALID_CRLF = 11,
 };
 
-typedef struct VioCmd {
+struct VioCmd {
     void **argv; /* robj** from create_argv; NULL when err != 0 */
     int argc;
     int err;      /* VIO_ERR_*; the error is always the last item */
     int err_byte; /* offending byte for VIO_ERR_UNEXPECTED_CHAR */
     size_t argv_len_sum;
     uint64_t input_bytes;
-} VioCmd;
+    /* Precheck mode: filled by precheck_cmd on the IO thread. */
+    void *cmd; /* struct serverCommand *, NULL if not found */
+    int slot;
+    int read_flags;
+    uint64_t token; /* 0 when not prechecked */
+};
 
 /* Event bits returned by vio_conn_take_events(). */
 #define VIO_EV_NEW (1u << 0)      /* accepted; engine must adopt or close it */
@@ -83,6 +110,9 @@ size_t vio_conn_pending_cmds(const VioConn *h);
 ssize_t vio_conn_writev(const VioConn *h, const struct iovec *iov, int iovcnt);
 void vio_conn_want_writable(const VioConn *h, int on);
 void vio_conn_set_auth_required(const VioConn *h, int on);
+void vio_conn_set_session(const VioConn *h, const VioSession *s);
+/* authRequired() for a new, unauthenticated connection. */
+void vio_set_default_auth_required(int on);
 void vio_conn_close(const VioConn *h);
 void vio_conn_shutdown(const VioConn *h);
 

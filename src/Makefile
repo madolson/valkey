@@ -778,7 +778,7 @@ ifneq ($(strip $(PREV_FINAL_LDFLAGS)), $(strip $(FINAL_LDFLAGS)))
 endif
 
 ifeq ($(BUILD_RUST_IO),yes)
-ENGINE_SERVER_OBJ += rust_io.o
+ENGINE_SERVER_OBJ += rust_io.o rust_io_precheck.o
 $(SERVER_NAME): $(RUST_IO_LIB)
 # Always ask cargo; it is a no-op when the crate is up to date.
 $(RUST_IO_LIB): rust-io-cargo

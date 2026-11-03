@@ -15,7 +15,7 @@ bridge (everything is behind `USE_RUST_IO`).
 
 | Config | Values | Meaning |
 |---|---|---|
-| `rust-io-mode` | `off` (default), `io`, `precheck`, `exec` | `precheck`/`exec` log a warning and run as `io`. |
+| `rust-io-mode` | `off` (default), `io`, `precheck`, `exec` | `exec` logs a warning and runs as `io`. `precheck`: see "Stage 2" below. |
 | `rust-io-port` | 0..65535, default 0 | Extra port served by Rust. Ignored when takeover is on. |
 | `rust-io-threads` | 1..128, default 1 | Rust IO threads, each with its own epoll loop. |
 | `rust-io-takeover` | yes/no, default no | Rust binds `port`; the C TCP listener is not created. |
@@ -264,21 +264,7 @@ at the end of `beforeSleep()` and let busy IO threads skip the eventfd.
 
 ### Stage 2 ("precheck")
 
-Where: `rustIoPull()` in `src/rust_io.c`, marked `STAGE 2 HOOK`. Today the
-main thread runs `prepareCommandGeneric()` there and the rest of the checks
-inside `processCommand()`. In precheck mode the IO thread would run them
-right after parsing, before step 1 of the handoff, and set `p->cmd`,
-`p->slot` and a "rejected with this reply" outcome per command.
-
-Engine state the IO thread would need published (read-mostly, versioned or
-RCU-style): the command table (`server.commands`, renames), per-client
-`authenticated` flag and ACL user (selectors and key/channel patterns),
-`server.cluster_enabled` and the slot-to-node map with migration state
-(`ASKING`, importing/migrating), `server.loading`, OOM state
-(`maxmemory`/`used_memory` and the deny-oom decision), replica read-only and
-`replica-serve-stale-data` state, `CLIENT PAUSE` state, `MULTI` state of the
-client (queueing changes which checks apply), and `protected-mode`. Today
-only `authRequired(c)` is published (`vio_conn_set_auth_required`).
+Implemented; see "Stage 2: precheck" below.
 
 ### Stage 3 ("exec")
 
@@ -290,3 +276,348 @@ thread already releases around `aeApiPoll()` in `beforeSleep()`/`afterSleep()`
 (`src/server.c`), so engine state is only touched by one thread at a time.
 `server.current_client`, `server.in_exec`, propagation and keyspace
 notification paths assume the main thread and would need auditing.
+
+# Stage 2: precheck (cut point 2)
+
+`rust-io-mode precheck`. The Rust IO thread runs the checks at the top of
+`processCommand()` right after parsing and tags each command with a token.
+The main thread validates the token with a few loads; if it holds,
+`processCommand()` skips the checks that were done off-thread and runs the
+rest unchanged. Any doubt falls back to the full, unchanged path. A wrong
+fast path is a bug; a fallback is always allowed.
+
+Code: `src/rust_io_precheck.c` (policy, snapshot, validation),
+`src/rust_io_precheck.h`, `src/rust/valkey-io/src/precheck.rs` (batch
+pinning, session mirror, barriers). Edits to shared files are listed at the
+end.
+
+## Pipeline per command
+
+1. IO thread, `parse_buffered()` (`src/lib.rs:408`): pin the snapshot for the
+   batch (`precheck::Batch::begin`, `lib.rs:423`), copy the connection's
+   published session, and for each parsed command call `precheck_cmd`
+   (`rustPrecheckCmd`, `rust_io_precheck.c:236`):
+   - lookup, arity and cluster slot (what `prepareCommandGeneric()` does),
+     except module commands, which are left for the main thread
+     (`READ_FLAGS_RUST_PREPARE_ON_MAIN`): their getkeys callback is module
+     code, the valkey#5054 race;
+   - the decision in `pcDecide()` (`rust_io_precheck.c:209`, table below);
+   - token = `epoch32 << 32 | session_gen24 << 8 | code`.
+2. Main thread, `rustIoPull()` (`src/rust_io.c:89`): copies cmd/slot/flags/
+   token into the `parsedCommand` and sets `READ_FLAGS_RUST_PRECHECKED`; no
+   `prepareCommandGeneric()` on the main thread in precheck mode.
+3. `consumeCommandQueue()` copies the token into `c->rust_precheck`.
+4. `processCommand()` (`src/server.c:4674`) calls `rustPrecheckValidate()`
+   (`rust_io_precheck.c:289`) when not reprocessing. It returns 1 only if:
+   code is `PC_FAST`; the token's epoch equals `acl_mutation_epoch`; the
+   token's session generation equals the last one published for this
+   connection *and* the client's current `user`, `db->id` and session flags
+   equal the published ones; no module command filter is registered and no
+   module disabled cluster redirection; in cluster mode, for a keyed command,
+   `getNodeBySlot(slot) == myself`, the slot is neither migrating nor
+   importing, and `isClusterHealthy()`. Every outcome is counted.
+5. When it returns 1, `processCommand()` skips module filters (none exist),
+   the security/existence/auth/arity/protected block (`server.c:4695`), the
+   NO_MULTI check, `ACLCheckAllPerm()` and `getNodeByQuery()`
+   (`goto prechecked_resume`, `server.c:4773` to `:4825`). Everything else
+   runs unchanged.
+
+Session correctness never depends on Rust: the main thread compares the
+current client fields with the published copy the token was computed
+against. Barriers (below) only avoid prechecking against a session that is
+known to be stale.
+
+## Snapshot contents and publication
+
+`pcSnapshot` (`rust_io_precheck.c`):
+
+| Field | Source | Why |
+|---|---|---|
+| `epoch` | `acl_mutation_epoch` at build | validation key |
+| `default_auth_required` | `DefaultUser` nopass/disabled | `authRequired()` off-thread |
+| `modules` | `moduleCommandFilterCount() > 0` | filters can rewrite argv: fall back |
+| `live[i]`, `copy[i]` (max 64) | every user in `Users` without roles | ACL check off-thread |
+
+ACL users are mutated in place (`ACL SETUSER` builds a temp user and
+`ACLCopyUser()`s it back), so the IO thread never reads a live `user`. The
+snapshot holds private deep copies (`ACLCreateUnlinkedUser()` +
+`ACLCopyUser()`), and the IO thread runs the unchanged
+`ACLCheckAllUserCommandPerm()` on the copy. Live pointers are kept only as
+identity keys. Users that hold roles are not copied (the copy would read the
+roles' live selectors) and fall back with `acl_user`.
+
+Publication (RCU with hazard pointers):
+
+- Build and swap on the main thread in `rustPrecheckPublish()`
+  (`rust_io_precheck.c:146`), called from `beforeSleep()` through the
+  connection type's `process_pending_data` (`rust_io.c:325`) and at startup.
+  Rebuild only when `acl_mutation_epoch` or the filter count changed. Build
+  and free of the copies restore `acl_mutation_epoch` so they do not
+  invalidate themselves.
+- IO thread pins per batch: store the pointer in its hazard slot, re-load
+  the global pointer, retry if it moved (`rustPrecheckBegin`,
+  `rust_io_precheck.c:188`); clear the slot after the batch. One seq_cst
+  store and two loads per batch, not per command.
+- Old snapshots go on a retired list and are freed on the main thread once no
+  hazard slot holds them (`pcReclaim`). `ACLFreeUser()` therefore never runs
+  off the main thread.
+
+Deviation from the recommended design: the slot-ownership bitmap and the
+class C flags are **not** in the snapshot. Slot ownership is re-read live in
+`rustPrecheckValidate()` (3 loads and `isClusterHealthy()`), which is as
+cheap as an epoch compare and needs no hook in the cluster bus code, where
+ownership changes without any command. The class C checks (disk error,
+min-replicas, read-only replica, stale replica, loading, busy script/module,
+pause, replica keyspace access, redirects) are not skipped at all: they stay
+in `processCommand()` after `prechecked_resume:` and read live state. They
+cost a few loads each in the boring state and removing them would need an
+epoch hook at every site listed below; the measured gain of the fast path
+comes from lookup, ACL and slot work, not from these flags.
+
+## Epoch mutation sites
+
+Hooked (`acl_mutation_epoch++`, `src/acl.c`):
+
+| Site | Line | Covers |
+|---|---|---|
+| `ACLFreeUser()` | `acl.c:559` | `ACL DELUSER`, `ACL LOAD` replacing users, pointer reuse |
+| `ACLCopyUser()` | `acl.c:609` | `ACL SETUSER` commit, `ACL LOAD` of the default user |
+| `ACLRecomputeCommandBitsFromCommandRulesAllUsers()` | `acl.c:1014` | module command registration |
+| `ACLSetUser()` | `acl.c:1770` | `requirepass`, module ACL APIs, every op on a user |
+| `ACLRemapSurvivingRoleMembers()` | `acl.c:3035` | role membership changes in `ACL LOAD` |
+
+Not hooked, because the PoC does not skip the check they feed (it stays live
+in `processCommand()`). A production version that moves these into the
+snapshot must hook every one:
+
+| State | Mutation sites |
+|---|---|
+| client pause | `pauseActions()`/`unpauseActions()` (`networking.c`), pause expiry in `checkClientPauseTimeoutAndReturnIfPaused()`, `FAILOVER` state machine (`replication.c` `updateFailoverStatus`, `abortFailover`) |
+| loading / async loading | `startLoading()`/`stopLoading()` (`rdb.c`), `DEBUG RELOAD`, diskless replica load |
+| disk write errors | `server.lastbgsave_status` (`backgroundSaveDoneHandler`), `server.aof_last_write_status` (`aof.c` `flushAppendOnlyFile`), `stop-writes-on-bgsave-error` config |
+| min-replicas | `refreshGoodReplicasCount()` (`replication.c`, from `replicationCron` and replica ack), the two `min-replicas-*` configs |
+| role, read-only, stale replica | `replicationSetPrimary()`/`replicationUnsetPrimary()`, `server.repl_state` transitions, `replica-read-only`, `replica-serve-stale-data` |
+| busy script / module | `scriptTimedOut` paths (`script.c`), `server.busy_module_yield_flags` (`module.c` `RM_Yield`) |
+| cluster slots | `clusterUpdateSlotsConfigWith()`, `clusterAddSlot()`/`clusterDelSlot()`, `CLUSTER SETSLOT` (`cluster_legacy.c`), migrating/importing arrays, atomic slot migration jobs, `clusterUpdateState()`, `cluster_module_flags` |
+| command table | `MODULE LOAD/UNLOAD` (`moduleRegisterCommand`, unregister), which also races any off-thread lookup (C IO threads share this) |
+| protected configs | `enable-debug-command`, `enable-module-command` (DEBUG/MODULE are `CMD_PROTECTED`, always fall back) |
+
+## Barrier commands
+
+Resolved by name at init (`pc_barrier_names`, `rust_io_precheck.c:65`) and
+compared by command pointer, parent for subcommands: `AUTH HELLO SELECT MULTI
+EXEC DISCARD RESET SUBSCRIBE UNSUBSCRIBE PSUBSCRIBE PUNSUBSCRIBE SSUBSCRIBE
+SUNSUBSCRIBE READONLY READWRITE CLIENT ACL SYNC PSYNC REPLCONF QUIT`.
+
+After a barrier with sequence number B, later commands on the connection get
+`PC_FB_BARRIER` until the engine publishes `consumed >= B`
+(`precheck.rs`). The engine publishes `{user, db, flags, gen, consumed}` after
+every delivery (`rustIoPublishSession`, `rust_io.c:161`); `gen` changes only
+when a field changes.
+
+The first version compared the parent's `proc`; container commands have no
+proc of their own, so `ACL SETUSER` and every `CLIENT` subcommand were never
+barriers. The epoch check still caught it (fallback `epoch` instead of
+`barrier`), which is the point of validating on the main thread. Found with
+the negative-control build in the stage report.
+
+Unauthenticated connections never hit the barrier path in practice: the
+parser now stops after one command while `auth_required` is set (see "Stage
+1 fixes"), so the command after `AUTH` is parsed after the engine published
+the post-AUTH session.
+
+## Decision table
+
+IO thread (`pcDecide`), first match wins:
+
+| Condition | Code | Main thread then |
+|---|---|---|
+| no snapshot published yet | `no_snapshot` | full path |
+| session never published (first read before adoption) | `no_session` | full path |
+| barrier pending | `barrier` | full path |
+| command filters registered | `modules` | full path |
+| replica, primary, slot-migration client, no user, must-obey | `special_client` | full path |
+| `MULTI` open | `multi` | full path (queues) |
+| RESP2 pub/sub mode | `pubsub_resp2` | full path |
+| unknown command, wrong arity | `PC_REJECT` | validate, then full path emits the error |
+| auth required and command not `CMD_NO_AUTH` | `PC_REJECT` | same |
+| `CMD_MODULE`, `CMD_PROTECTED`, `CMD_PUBSUB`, EXEC, EVAL*, FCALL* | `ineligible` | full path |
+| `CROSSSLOT` | `PC_REJECT` | same |
+| user not in snapshot (roles, >64 users, module user) | `acl_user` | full path |
+| ACL denies (cmd, key, channel, db) | `PC_REJECT` | same |
+| otherwise | `PC_FAST` | validate |
+
+Main thread (`rustPrecheckValidate`), for `PC_FAST` and `PC_REJECT`:
+
+| Check | Fails as |
+|---|---|
+| token epoch != `acl_mutation_epoch` | `epoch` |
+| token gen != published gen, or user/db/flags differ from published | `session` |
+| filters registered, or module disabled cluster redirection | `modules_live` |
+| (`PC_REJECT` stops here) | `rejected` |
+| cluster, keyed: slot not mine, migrating, importing, or cluster unhealthy | `cluster` |
+| all hold | `fast` |
+
+Rejection protocol: a predicted rejection is validated like a fast path and
+then runs the full path, which emits the error. Its position in the reply
+stream is therefore the command's own, and `rejected_calls`, error stats,
+`ACL LOG` (with client info) and module ACL-rejected events are produced by
+the unchanged code on the main thread. Rejected alternative: Rust building
+the error text and a "rejected" record doing the accounting. It would
+duplicate `rejectCommand*()`, `addACLLogEntry()` and the module events for a
+path that is rare in steady state; the only saving would be the check itself.
+
+Counters: `INFO rust_io` (explicit section only), plus one log line at exit.
+
+## What the main thread still does per command in precheck mode
+
+Per command on the fast path (`src/server.c`):
+
+- `rustPrecheckValidate()` (`:4674`): one load of the epoch, the published
+  session (5 compares), `moduleCommandFilterCount()`, and in cluster mode
+  `getNodeBySlot`/`getMigratingSlotDest`/`getImportingSlotSource`/
+  `isClusterHealthy`.
+- `reqresAppendRequest()` (`:4680`, no-op unless built with req-res logging).
+- busy-module-yield postpone check (`:4685`).
+- `getCommandFlags()` and flag derivation (`:4754`), `mustObeyClient()`.
+- cluster replica keyless redirect and standalone `-REDIRECT` checks
+  (`:4825`-`:4890`).
+- class D, unchanged: `evictClients()` (`:4892`), maxmemory with
+  `performEvictions()` and `trackingHandlePendingKeyInvalidations()`
+  (`:4904`), `trackingLimitUsedSlots()` (`:4937`), deny-oom.
+- class C, unchanged, live: disk error (`:4942`), min-replicas (`:4967`),
+  read-only replica (`:4974`), RESP2 pub/sub (`:4981`), stale replica
+  (`:4997`), loading (`:5005`, `:5011`), busy script/module (`:5023`),
+  replica keyspace (`:5041`), pause with `blockPostponeClient()` (`:5050`).
+- throttling (`:5055`), `queueMultiCommand()` (`:5061`, never on the fast
+  path since MULTI falls back), `call()` (`:5065`),
+  `handleClientsBlockedOnKeys()`.
+- everything around `processCommand()` from stage 1: `commandProcessed()`,
+  `resetClient()` (argv free), reply construction, the writev copy, the
+  handoff.
+
+Removed from the main thread compared with io mode: `prepareCommandGeneric()`
+(lookup, arity, slot hashing) for every command, including fallbacks; the
+auth, existence, arity, protected, NO_MULTI checks; `ACLCheckAllPerm()`
+(key-pattern matching for restricted users); `getNodeByQuery()`.
+
+Added on the main thread: `rustIoPublishSession()` per delivery (field
+compare plus one mutex store), the validation loads per command, and a
+snapshot rebuild after each ACL mutation (copies every user; O(users)).
+
+## Compatibility with in-flight upstream work
+
+AOF durability (valkey#3381). It fences replies at per-client byte offsets
+inside the C write path (`clientHasPendingReplies`, `writevToClient`,
+`_writeToClient`) and brackets `call()` with
+`beginCommandReplyBlocking()`/`finalizeCommandReplyBlocking()` in
+`processCommand()`. Precheck mode keeps both: the fast path still reaches the
+same `call()` site, so the bracket wraps it unchanged, and replies still
+leave through `writeToClient()` before the Rust `writev` copy, so the fence
+caps what is handed to Rust exactly as it caps what is written to a socket.
+If `processCommand()` is later split into "checks" and "execute", the bracket
+belongs in the execute half, immediately around `call()`, after
+`throttle_throttleClientIfNeeded()` and after any gate that may block the
+client (below), so a blocked-then-re-executed command opens its bracket only
+when it really runs. One interaction to watch: #3381 also touches
+`trySendWriteToIOThreads`; Rust connections never go there (stage 1), so the
+Rust copy path must apply the same cap, which it does today only because it
+sits behind `writevToClient()`.
+
+Data tiering (valkey#3326). Its gate goes at the end of `processCommand()`
+after throttling: `dbFind()` on the command's keys, and for cold keys block
+with `BLOCKED_INUSE`, fetch, then re-execute. It needs the keyspace, so it is
+class D and stays on the main thread. In precheck mode it goes at the same
+place, after `prechecked_resume:` and after
+`throttle_throttleClientIfNeeded()` (`server.c:5055`), before the MULTI
+queue/`call()` branch. Re-execution goes through the reprocessing path
+(`c->cmd` set, `client_reprocessing_command`), which never consults the
+token, so a command that blocked on a cold key re-runs ACL and cluster checks
+against live state when it resumes, which is correct after an arbitrary wait.
+
+Throttling and module getkeys (valkey#5054). Throttling stays on the main
+thread unchanged. Module commands are never prepared off-thread (step 1), so
+no module getkeys callback runs on a Rust thread. Module command filters
+force full fallback. Other module callbacks reachable from the precheck: none
+(`ACLCheckAllUserCommandPerm()` on a copied user does not call into modules;
+module users are not in the snapshot).
+
+## Stage 1 fixes made in this stage
+
+- New connections start with `auth_required` from the default user
+  (`vio_set_default_auth_required`, `lib.rs:916`), so the first read is
+  parsed with unauthenticated limits when a password is set. Before, a client
+  could send a 100 MB bulk header as its first command and hang the
+  connection (unit/auth "multibulk and bulk length are limited").
+- While `auth_required`, the parser stops after one command and resumes when
+  the engine republishes (`parse_held`, `lib.rs:459`), matching the C parser.
+  Before, commands pipelined behind AUTH were parsed with pre-AUTH limits
+  (unit/auth "Unauthenticated multibulk limit works in pipeline after AUTH").
+
+## FFI added in stage 2
+
+Rust exports (`include/valkey_io.h`):
+
+| Symbol | Purpose |
+|---|---|
+| `vio_conn_set_session(h, s)` | Publish the session fields the precheck reads. |
+| `vio_set_default_auth_required(on)` | Initial `auth_required` for new connections (fix above). |
+
+C callbacks (`VioCallbacks`, NULL outside precheck mode):
+
+| Symbol | Purpose |
+|---|---|
+| `precheck_begin(tid)` = `rustPrecheckBegin` | Pin the snapshot for one batch (hazard slot). |
+| `precheck_end(tid)` = `rustPrecheckEnd` | Unpin. |
+| `precheck_cmd(snap, sess, barrier_active, cmd)` = `rustPrecheckCmd` | Lookup/arity/slot, decision, token; returns 1 for a barrier. |
+
+Structs: `VioSession` (new), `VioCmd` gained `cmd`, `slot`, `read_flags`,
+`token`.
+
+## Edits to shared files in stage 2
+
+| File | Change |
+|---|---|
+| `src/server.c` | `processCommand()`: call `rustPrecheckValidate()`, skip filters/top checks/NO_MULTI/ACL/getNodeByQuery when it returns 1 (`goto prechecked_resume`); `is_keyless` moved above the jump. `INFO rust_io` section. |
+| `src/server.h` | `rust_precheck` field in `parsedCommand` and `client`. |
+| `src/networking.c` | `consumeCommandQueue()` copies `rust_precheck`. |
+| `src/acl.c` | `acl_mutation_epoch` and its 5 bumps; `ACLCopyUser()` no longer static. |
+| `src/module.c` | `moduleCommandFilterCount()`. |
+| `src/rust_io.c` | token handoff in `rustIoPull()`, session publication, snapshot publish in `process_pending_data`, callbacks at start. |
+| `src/rust_io.h` | include `rust_io_precheck.h`. |
+| `src/Makefile` | `rust_io_precheck.o`. |
+| `src/rust/valkey-io/src/lib.rs` | `VioCmd`/`VioCallbacks` fields, session cell, precheck calls in the parse loop (split into `parse_buffered()`), `parse_held`, two exports. |
+
+## Thread-safety notes for the off-thread checks
+
+- Command lookup: `server.commands` and subcommand tables are hashtables
+  with `instant_rehashing = 1` (`src/server.c:735`), so a lookup never takes
+  a rehash step; the tables change only at startup and on `MODULE LOAD`
+  (the latter is a race shared with the C IO threads, see the table above).
+- ACL: only snapshot copies are read. `ACLCheckAllUserCommandPerm()` uses
+  stack-local key caches; `get_dbid_args` and native getkeys procs are pure
+  functions of argv and allocate with `zmalloc` (thread safe).
+- Cluster slot: `clusterSlotByCommand()` is what the C IO threads already
+  run; ownership is not read off-thread.
+
+## Known gaps
+
+- At most 64 users are copied; more, users with roles, and module users fall
+  back (`acl_user`). Every ACL mutation rebuilds the whole snapshot.
+- The token carries the low 32 bits of the epoch and 24 bits of the session
+  generation. A false match needs exactly 2^32 ACL mutations (or 2^24 session
+  changes on one connection) while one command waits in the queue.
+- `INFO rust_io` counters are not reset by `CONFIG RESETSTAT`.
+- Replication over the Rust port still does not work (stage 1 gap; the
+  dual-channel replica test in unit/auth fails in io mode too).
+
+## What I would change in the shared handoff (not done: sibling stage)
+
+- Publish the session from `beforeNextClient()` only when it changed, and
+  carry `consumed` in an atomic instead of the session mutex.
+- Let the IO thread hold unparsed input for any connection with a pending
+  barrier, the way `parse_held` does for AUTH, instead of prechecking and
+  discarding. That turns `barrier` fallbacks into fast paths one handoff
+  later, at the cost of a round trip per barrier.
+- Batch IO-thread kicks at the end of `beforeSleep()` (stage 1 note); that is
+  still where the main thread's time goes at `-P 1` (see the stage report).

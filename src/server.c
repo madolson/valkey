@@ -4666,9 +4666,17 @@ int processCommand(client *c) {
      * this is a reprocessing of this command, so we do not want to perform some of the actions again. */
     int client_reprocessing_command = c->cmd ? 1 : 0;
 
+    /* rust-io precheck mode: the IO thread already ran the auth, lookup,
+     * arity, protected, NO_MULTI, ACL and cluster routing checks and the
+     * result is still valid. No module command filter is registered. */
+    int prechecked = 0;
+#ifdef USE_RUST_IO
+    if (!client_reprocessing_command) prechecked = rustPrecheckValidate(c);
+#endif
+
     /* only run command filter if not reprocessing command */
     if (!client_reprocessing_command) {
-        moduleCallCommandFilters(c);
+        if (!prechecked) moduleCallCommandFilters(c);
         reqresAppendRequest(c);
     }
 
@@ -4684,7 +4692,10 @@ int processCommand(client *c) {
      * such as wrong arity, bad command name and so forth.
      * In case we are reprocessing a command after it was blocked,
      * we do not have to repeat the same checks */
-    if (!client_reprocessing_command) {
+    if (prechecked) {
+        c->cmd = c->lastcmd = c->realcmd = c->parsed_cmd;
+        c->flag.buffered_reply = 0;
+    } else if (!client_reprocessing_command) {
         struct serverCommand *cmd = c->parsed_cmd;
         if (!cmd) {
             /* Handle possible security attacks. */
@@ -4757,6 +4768,9 @@ int processCommand(client *c) {
     int is_deny_async_loading_command = (combined_flags & CMD_NO_ASYNC_LOADING);
 
     const int obey_client = mustObeyClient(c);
+    int is_keyless = (c->read_flags & READ_FLAGS_NO_KEYS) && c->cmd->proc != execCommand;
+
+    if (prechecked) goto prechecked_resume;
 
     if (c->flag.multi && c->cmd->flags & CMD_NO_MULTI) {
         sds nomulti_err =
@@ -4791,7 +4805,6 @@ int processCommand(client *c) {
      * However we don't perform the redirection if:
      * 1) The sender of this command is our primary.
      * 2) The command has no key arguments. */
-    int is_keyless = (c->read_flags & READ_FLAGS_NO_KEYS) && c->cmd->proc != execCommand;
     if (server.cluster_enabled && !obey_client && !is_keyless) {
         int error_code;
         clusterNode *n = getNodeByQuery(c, &error_code);
@@ -4809,6 +4822,7 @@ int processCommand(client *c) {
         }
     }
 
+prechecked_resume:;
     /* If the client has the redirect capability, redirect keyless
      * commands to the primary when this is a replica and the client
      * has not opted into replica reads with READONLY. EXEC with all-keyless
@@ -7222,6 +7236,14 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
         info = throttle_sdscatInfoMetrics(info);
         info = throttleRepl_sdscatInfoMetrics(info);
     }
+
+#ifdef USE_RUST_IO
+    /* rust-io precheck counters, only when asked for by name. */
+    if (dictFind(section_dict, "rust_io") != NULL) {
+        if (sections++) info = sdscat(info, "\r\n");
+        info = rustPrecheckCatInfo(info);
+    }
+#endif
 
     /* Get info from modules.
      * Returned when the user asked for "everything", "modules", or a specific module section.

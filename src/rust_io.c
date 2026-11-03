@@ -44,6 +44,8 @@ typedef struct rustConnection {
     bool stalled;     /* in rust_stalled: commands wait in Rust */
     int pending_err;  /* VIO_ERR_* seen but not yet replied, -1 once replied */
     int pending_err_byte;
+    unsigned long long pulled; /* commands moved into cmd_queue so far */
+    VioSession sess;           /* last session published to Rust (precheck) */
 } rustConnection;
 
 static ConnectionType CT_Rust;
@@ -122,11 +124,21 @@ static int rustIoPull(rustConnection *rc, client *c) {
             p->input_bytes = cmds[i].input_bytes;
             p->slot = -1;
             p->cmd = NULL;
-            prepareCommandGeneric(p->argv, p->argc, &p->read_flags, &p->cmd, &p->slot);
+            p->rust_precheck = cmds[i].token;
+            if (cmds[i].token && !(cmds[i].read_flags & READ_FLAGS_RUST_PREPARE_ON_MAIN)) {
+                /* Precheck mode: lookup, arity and slot ran on the IO thread. */
+                p->cmd = cmds[i].cmd;
+                p->slot = cmds[i].slot;
+                p->read_flags = cmds[i].read_flags | READ_FLAGS_RUST_PRECHECKED;
+            } else {
+                if (cmds[i].token) p->read_flags |= READ_FLAGS_RUST_PRECHECKED;
+                prepareCommandGeneric(p->argv, p->argc, &p->read_flags, &p->cmd, &p->slot);
+            }
             bytes += cmds[i].input_bytes;
             pulled++;
         }
     }
+    rc->pulled += pulled;
 
     if (pulled) {
         /* What handleReadResult() accounts for a socket read. */
@@ -136,6 +148,29 @@ static int rustIoPull(rustConnection *rc, client *c) {
         c->last_interaction = server.unixtime;
     }
     return pulled;
+}
+
+const VioSession *rustIoConnSession(connection *conn) {
+    if (!connIsRust(conn)) return NULL;
+    return &((rustConnection *)conn)->sess;
+}
+
+/* Publish the session fields the precheck reads. The generation changes only
+ * when a field does; 'consumed' lets Rust lift a barrier once the engine has
+ * run the barrier command. */
+static void rustIoPublishSession(rustConnection *rc, client *c) {
+    if (rust_io_config.mode != RUST_IO_MODE_PRECHECK || !rc->h) return;
+    VioSession *s = &rc->sess;
+    unsigned int flags = rustPrecheckSessionFlags(c);
+    int dbid = c->db ? c->db->id : -1;
+    if (s->user != (void *)c->user || s->flags != flags || s->dbid != dbid) {
+        s->user = c->user;
+        s->flags = flags;
+        s->dbid = dbid;
+        s->gen++;
+    }
+    s->consumed = rc->pulled - cmdQueuePending(c);
+    vio_conn_set_session(rc->h, s);
 }
 
 static void rustIoProtocolError(client *c, int err, int byte) {
@@ -197,6 +232,7 @@ static void rustIoDeliver(rustConnection *rc) {
     }
     trimCommandQueue(c);
     vio_conn_set_auth_required(h, authRequired(c));
+    rustIoPublishSession(rc, c);
     /* May free the client (close_asap). */
     beforeNextClient(c);
 }
@@ -224,7 +260,10 @@ static void rustIoAccept(const VioConn *h) {
     acceptCommonHandler(&rc->c, flags, cip);
 
     rc = vio_conn_udata(h);
-    if (rc && connGetPrivateData(&rc->c)) vio_conn_set_auth_required(h, authRequired(connGetPrivateData(&rc->c)));
+    if (rc && connGetPrivateData(&rc->c)) {
+        vio_conn_set_auth_required(h, authRequired(connGetPrivateData(&rc->c)));
+        rustIoPublishSession(rc, connGetPrivateData(&rc->c));
+    }
 }
 
 static void rustIoHandleReady(const VioConn *h) {
@@ -282,6 +321,8 @@ static void rustIoEventHandler(aeEventLoop *el, int fd, void *privdata, int mask
 /* Clients whose input waits in Rust (cmd_queue full, blocked, protected).
  * Called from beforeSleep() through connTypeProcessPendingData(). */
 static int connRustProcessPendingData(void) {
+    vio_set_default_auth_required(!(DefaultUser->flags & USER_FLAG_NOPASS) || (DefaultUser->flags & USER_FLAG_DISABLED));
+    rustPrecheckPublish();
     if (!rust_stalled || listLength(rust_stalled) == 0) return 0;
     int processed = 0;
     unsigned long n = listLength(rust_stalled);
@@ -498,9 +539,8 @@ int rustIoTakesOverPort(void) {
 
 int rustIoInitListeners(void) {
     if (rust_io_config.mode == RUST_IO_MODE_OFF) return 0;
-    if (rust_io_config.mode != RUST_IO_MODE_IO) {
-        serverLog(LL_WARNING, "rust-io-mode %s is not implemented yet, running as 'io'",
-                  rust_io_config.mode == RUST_IO_MODE_PRECHECK ? "precheck" : "exec");
+    if (rust_io_config.mode == RUST_IO_MODE_EXEC) {
+        serverLog(LL_WARNING, "rust-io-mode exec is not implemented yet, running as 'io'");
     }
     int port = rust_io_config.takeover ? server.port : rust_io_config.port;
     if (port == 0) return 0;
@@ -513,7 +553,17 @@ int rustIoInitListeners(void) {
         .client_max_querybuf_len = &server.client_max_querybuf_len,
         .cbs = {.create_argv = rustIoCreateArgv, .free_argv = rustIoFreeArgv},
     };
+    if (rust_io_config.mode == RUST_IO_MODE_PRECHECK) {
+        extern int (*rustPrecheckCmdFn)(void *, const VioSession *, int, VioCmd *);
+        rustPrecheckInit();
+        rustPrecheckPublish();
+        cfg.cbs.precheck_begin = rustPrecheckBegin;
+        cfg.cbs.precheck_end = rustPrecheckEnd;
+        cfg.cbs.precheck_cmd = rustPrecheckCmdFn;
+    }
     int efd = vio_start(&cfg);
+    if (efd != -1)
+        vio_set_default_auth_required(!(DefaultUser->flags & USER_FLAG_NOPASS) || (DefaultUser->flags & USER_FLAG_DISABLED));
     if (efd == -1) {
         serverLog(LL_WARNING, "Failed listening on rust-io port %d: %s, aborting.", port, strerror(errno));
         exit(1);
