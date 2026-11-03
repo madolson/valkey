@@ -5118,16 +5118,6 @@ sds catClientInfoShortString(sds s, client *client, int hide_user_data) {
     if (!server.crashed) waitForClientIO(client);
     char conninfo[CONN_INFO_LEN];
 
-    size_t qbuf = client->querybuf ? sdslen(client->querybuf) : 0;
-    size_t qbuf_free = client->querybuf ? sdsavail(client->querybuf) : 0;
-#ifdef USE_RUST_IO
-    if (client->conn && connIsExternal(client->conn)) {
-        size_t rq, rf;
-        rustIoClientQbuf(client, &rq, &rf);
-        qbuf += rq;
-        qbuf_free += rf;
-    }
-#endif
     sds ret = sdscatfmt(
         s,
         FMTARGS(
