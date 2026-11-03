@@ -285,9 +285,18 @@ void rustIoExecCall(client *c, int flags) {
  * threads: its thread_id defaults to 0. */
 static pthread_t rtc_real_main;
 
+/* Taking the engine: become "the main thread" and refresh the cached
+ * clock, which only the main loop (afterSleep, serverCron) updates.
+ * Without it, clients accepted on an IO thread got a stale ctime after
+ * the main thread ran DEBUG SLEEP ("CLIENT KILL maxAGE" killed both). */
+static void rtcTakeEngine(void) {
+    server.main_thread_id = pthread_self();
+    updateCachedTime(0);
+}
+
 static int rtcTryLock(void) {
     int r = moduleTryAcquireGIL();
-    if (r == 0) server.main_thread_id = pthread_self();
+    if (r == 0) rtcTakeEngine();
     return r;
 }
 
@@ -304,7 +313,7 @@ static int rtcLock(void) {
     while (moduleTimedAcquireGIL(1000) != 0) {
         if (isInsideYieldingLongCommand()) return 1;
     }
-    server.main_thread_id = pthread_self();
+    rtcTakeEngine();
     return 0;
 }
 
@@ -317,6 +326,9 @@ static void rtcUnlock(void) {
  * NULL == c->querybuf of a Rust client, so trimClientQueryBuffer() would take
  * the shared-buffer branch and crash in resetSharedQueryBuf(). */
 extern _Thread_local sds thread_shared_qb;
+
+/* server.c, not in server.h. */
+void updateCachedTime(int update_daylight_info);
 
 static void rtcExecReady(const VioConn *h) {
     /* Not initSharedQueryBuf(): it registers the buffer under getCurTid(),
