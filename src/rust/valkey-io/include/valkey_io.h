@@ -97,7 +97,6 @@ typedef struct VioConn VioConn;
 
 typedef struct {
   void *user;
-  uint64_t consumed;
   uint32_t gen;
   uint32_t flags;
   int dbid;
@@ -408,13 +407,15 @@ void vio_conn_return_argv(VioConnRef h, void **argv, int argc);
 void vio_conn_want_writable(VioConnRef h, int on);
 
 /*
- Published engine state the parser needs: unauthenticated clients get
- tighter multibulk/bulk limits.
+ After each delivery: the commands the engine has popped so far (the
+ precheck lifts a session barrier once it is consumed) and whether the
+ client must still authenticate (unauthenticated clients get tighter
+ multibulk/bulk limits).
 
  # Safety
  `h` must be a live handle.
  */
-void vio_conn_set_auth_required(VioConnRef h, int on);
+void vio_conn_publish(VioConnRef h, uint64_t consumed, int auth_required);
 
 /*
  # Safety
@@ -423,8 +424,8 @@ void vio_conn_set_auth_required(VioConnRef h, int on);
 void vio_set_default_auth_required(int on);
 
 /*
- Publish the session fields the precheck reads (cut point 2). Read by
- the IO thread once per parsed batch.
+ Publish the session fields the precheck reads (cut point 2), when one
+ of them changed. Read by the IO thread once per parsed batch.
 
  # Safety
  `h` must be a live handle and `s` a valid VioSession for the call.

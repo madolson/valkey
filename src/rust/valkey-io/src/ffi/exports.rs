@@ -359,15 +359,18 @@ pub unsafe extern "C" fn vio_conn_want_writable(h: ConnRef<'_>, on: c_int) {
     }
 }
 
-/// Published engine state the parser needs: unauthenticated clients get
-/// tighter multibulk/bulk limits.
+/// After each delivery: the commands the engine has popped so far (the
+/// precheck lifts a session barrier once it is consumed) and whether the
+/// client must still authenticate (unauthenticated clients get tighter
+/// multibulk/bulk limits).
 ///
 /// # Safety
 /// `h` must be a live handle.
 #[no_mangle]
-pub unsafe extern "C" fn vio_conn_set_auth_required(h: ConnRef<'_>, on: c_int) {
+pub unsafe extern "C" fn vio_conn_publish(h: ConnRef<'_>, consumed: u64, auth_required: c_int) {
     let conn = h.arc();
-    conn.auth_required.store(on != 0, Ordering::Release);
+    conn.session.set_consumed(consumed);
+    conn.auth_required.store(auth_required != 0, Ordering::Release);
     /* Store, then check: the IO thread sets parse_held before the engine
      * can see the command it stopped after, so this cannot miss it. */
     if conn.parse_held.load(Ordering::Acquire) {
@@ -382,14 +385,14 @@ pub unsafe extern "C" fn vio_set_default_auth_required(on: c_int) {
     DEFAULT_AUTH_REQUIRED.store(on != 0, Ordering::Relaxed);
 }
 
-/// Publish the session fields the precheck reads (cut point 2). Read by
-/// the IO thread once per parsed batch.
+/// Publish the session fields the precheck reads (cut point 2), when one
+/// of them changed. Read by the IO thread once per parsed batch.
 ///
 /// # Safety
 /// `h` must be a live handle and `s` a valid VioSession for the call.
 #[no_mangle]
 pub unsafe extern "C" fn vio_conn_set_session(h: ConnRef<'_>, s: *const precheck::VioSession) {
-    // SAFETY: caller contract; the session is copied.
+    // SAFETY: caller contract; the session is copied into the view.
     h.session.set(unsafe { &*s });
 }
 

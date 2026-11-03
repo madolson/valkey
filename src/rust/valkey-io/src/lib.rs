@@ -134,8 +134,8 @@ pub struct Conn {
     /// the engine thread, taken by the IO thread. At most one.
     job: AtomicUsize,
     shared: Mutex<Shared>,
-    /// Engine session mirror (precheck mode).
-    session: precheck::SessionCell,
+    /// The engine's session view (precheck mode).
+    session: precheck::SessionView,
     /// Stage-timing id riding on the bytes in `shared.out`.
     #[cfg(feature = "timing")]
     trace: AtomicU32,
@@ -485,7 +485,7 @@ impl Worker {
             out_bytes: AtomicUsize::new(0),
             job: AtomicUsize::new(0),
             shared: Mutex::new(Shared { cmds: VecDeque::new(), out: Vec::new() }),
-            session: precheck::SessionCell::new(),
+            session: precheck::SessionView::new(),
             #[cfg(feature = "timing")]
             trace: AtomicU32::new(0),
         });
@@ -621,7 +621,7 @@ impl Worker {
     /// Parse what is buffered and hand complete commands to the engine.
     /// While the connection is unauthenticated, stop after one command,
     /// like the C parser: AUTH/HELLO change the limits for what follows.
-    /// The engine's next vio_conn_set_auth_required() resumes parsing.
+    /// The engine's next vio_conn_publish() resumes parsing.
     fn parse_buffered(&mut self, idx: usize) {
         let g = global();
         let l = match self.slab[idx].as_mut() {

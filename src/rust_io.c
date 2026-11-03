@@ -49,7 +49,9 @@ typedef struct rustConnection {
     int pending_err;  /* VIO_ERR_* seen but not yet replied, -1 once replied */
     int pending_err_byte;
     unsigned long long pulled; /* commands moved into cmd_queue so far */
-    VioSession sess;           /* last session published to Rust (precheck) */
+    VioSession sess;           /* session last written to Rust's view (precheck) */
+    unsigned long long consumed_pub; /* consumed count last published */
+    int auth_pub;                    /* auth_required last published, -1 none */
 } rustConnection;
 
 static list *rust_stalled; /* client ids */
@@ -209,22 +211,35 @@ const VioSession *rustIoConnSession(connection *conn) {
     return &((rustConnection *)conn)->sess;
 }
 
-/* Publish the session fields the precheck reads. The generation changes only
- * when a field does; 'consumed' lets Rust lift a barrier once the engine has
- * run the barrier command. */
-static void rustIoPublishSession(rustConnection *rc, client *c) {
-    if (!rust_io_precheck_active || !rc->h) return;
-    VioSession *s = &rc->sess;
-    unsigned int flags = rustPrecheckSessionFlags(c);
-    int dbid = c->db ? c->db->id : -1;
-    if (s->user != (void *)c->user || s->flags != flags || s->dbid != dbid) {
-        s->user = c->user;
-        s->flags = flags;
-        s->dbid = dbid;
-        s->gen++;
+/* Publish what Rust reads about this client after a delivery: the parser's
+ * auth limits, and in precheck mode the session view. The session fields go
+ * into Rust's seqlock only when one changed (the generation moves with
+ * them); 'consumed' lets Rust lift a barrier once the engine has run the
+ * barrier command. Nothing crosses when nothing changed. */
+static void rustIoPublish(rustConnection *rc, client *c) {
+    if (!rc->h) return;
+    /* Counted in io mode too: a delivery that popped commands is what
+     * resumes a connection whose parse Rust held after one unauthenticated
+     * command (vio_conn_publish() kicks it). */
+    unsigned long long consumed = rc->pulled - cmdQueuePending(c);
+    if (rust_io_precheck_active) {
+        VioSession *s = &rc->sess;
+        unsigned int flags = rustPrecheckSessionFlags(c);
+        int dbid = c->db ? c->db->id : -1;
+        if (s->gen == 0 || s->user != (void *)c->user || s->flags != flags || s->dbid != dbid) {
+            s->user = c->user;
+            s->flags = flags;
+            s->dbid = dbid;
+            s->gen++;
+            vio_conn_set_session(rc->h, s);
+        }
     }
-    s->consumed = rc->pulled - cmdQueuePending(c);
-    vio_conn_set_session(rc->h, s);
+    int auth = authRequired(c);
+    if (consumed != rc->consumed_pub || auth != rc->auth_pub) {
+        rc->consumed_pub = consumed;
+        rc->auth_pub = auth;
+        vio_conn_publish(rc->h, consumed, auth);
+    }
 }
 
 static void rustIoProtocolError(client *c, int err, int byte) {
@@ -285,8 +300,7 @@ static void rustIoDeliver(rustConnection *rc) {
         rc->pending_err = -1;
     }
     trimCommandQueue(c);
-    vio_conn_set_auth_required(h, authRequired(c));
-    rustIoPublishSession(rc, c);
+    rustIoPublish(rc, c);
     /* May free the client (close_asap). */
     beforeNextClient(c);
 }
@@ -411,6 +425,7 @@ static void rustIoAccept(VioConn *h) {
     rustConnection *rc = (rustConnection *)connCreateExternal(sizeof(rustConnection), vio_conn_fd(h));
     rc->h = vio_conn_retain(h);
     vio_conn_set_udata(h, rc);
+    rc->auth_pub = -1;
 
     struct ClientFlags flags = {0};
     char cip[NET_IP_STR_LEN] = {0};
@@ -422,8 +437,7 @@ static void rustIoAccept(VioConn *h) {
 
     rc = vio_conn_udata(h);
     if (rc && connGetPrivateData(&rc->c)) {
-        vio_conn_set_auth_required(h, authRequired(connGetPrivateData(&rc->c)));
-        rustIoPublishSession(rc, connGetPrivateData(&rc->c));
+        rustIoPublish(rc, connGetPrivateData(&rc->c));
     }
 }
 
