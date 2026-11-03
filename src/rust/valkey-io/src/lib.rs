@@ -99,6 +99,9 @@ pub const VIO_EV_NEW: u32 = 1 << 0;
 pub const VIO_EV_CLOSED: u32 = 1 << 1;
 pub const VIO_EV_WRITABLE: u32 = 1 << 2;
 pub const VIO_EV_QBLIMIT: u32 = 1 << 3;
+/// The input this layer holds for the connection grew (client memory
+/// accounting: the engine re-reads vio_conn_mem() on delivery).
+pub const VIO_EV_MEM: u32 = 1 << 4;
 
 /* Backpressure thresholds. */
 pub(crate) const CMDS_HIGH: usize = 1024; /* stop reading when this many commands are queued */
@@ -112,6 +115,9 @@ pub(crate) const DET_NONE: u8 = 0;
 pub(crate) const DET_WANTED: u8 = 1;
 pub(crate) const DET_DONE: u8 = 2;
 pub(crate) const DET_FAILED: u8 = 3;
+/// Read-buffer sweep period (clientsCron visits a client about this often
+/// at the default hz with few clients).
+const SWEEP_EVERY: Duration = Duration::from_millis(100);
 /// How long the IO thread waits for the socket to take the output pending
 /// at detach time.
 const DETACH_FLUSH_MS: u64 = 5000;
@@ -122,9 +128,22 @@ const DETACH_FLUSH_MS: u64 = 5000;
 
 struct Shared {
     cmds: VecDeque<VioCmd>,
+    /// For vio_conn_mem(): input bytes and argv bytes (argv_len_sum plus
+    /// the pointer array) of `cmds`.
+    cmds_input: usize,
+    cmds_argv: usize,
     out: Vec<u8>,
 }
 
+
+/// argv bytes of a parsed command, as getClientMemoryUsage() counts argv.
+fn cmd_argv_bytes(c: &VioCmd) -> usize {
+    c.argv_len_sum + c.argc.max(0) as usize * std::mem::size_of::<*mut c_void>()
+}
+
+/// Capacity of every connection's private read buffer, all threads: the
+/// engine adds it to used memory for maxmemory (vio_held_input_total()).
+static RBUF_TOTAL: AtomicUsize = AtomicUsize::new(0);
 
 pub struct Conn {
     fd: RawFd,
@@ -147,6 +166,11 @@ pub struct Conn {
     half_close: AtomicBool,
     /// Bytes accepted from the engine and not yet written to the socket.
     out_bytes: AtomicUsize,
+    /// Input bytes the parser has not consumed (CLIENT LIST qbuf) and
+    /// private read-buffer capacity, written by
+    /// the IO thread when they change, read by vio_conn_mem().
+    in_len: AtomicUsize,
+    in_cap: AtomicUsize,
     /// Fork-child IO window (DESIGN.md "Detached connections"): DET_*.
     /// While DET_DONE the engine does IO on the fd itself and this layer
     /// neither reads nor writes it.
@@ -418,6 +442,14 @@ struct Local {
     sock_blocked: bool,
     registered: bool,
     interest: u32,
+    /// `rbuf` is the worker's shared read buffer, lent for one read.
+    rbuf_shared: bool,
+    /// in_len/in_cap last published, and peak use since the last sweep
+    /// (querybuf_peak).
+    len_pub: usize,
+    cap_pub: usize,
+    peak: usize,
+    last_read: Instant,
 }
 
 struct Worker {
@@ -437,6 +469,15 @@ struct Worker {
     ptrs: Vec<usize>,
     lens: Vec<usize>,
     held: Vec<Vec<Arg>>,
+    /// Shared read buffer (thread_shared_qb): a connection reads into it
+    /// unless it holds a partial command, and keeps it only if input is
+    /// left unparsed. Idle connections then hold no read buffer.
+    shared_rbuf: Vec<u8>,
+    /// Connections holding a private read buffer (cap_pub != 0).
+    private_bufs: usize,
+    /// Time after the last epoll_wait, and of the last buffer sweep.
+    now: Instant,
+    last_sweep: Instant,
 }
 
 impl Worker {
@@ -530,9 +571,11 @@ impl Worker {
             parse_held: AtomicBool::new(false),
             half_close: AtomicBool::new(false),
             detach: AtomicU8::new(DET_NONE),
+            in_len: AtomicUsize::new(0),
+            in_cap: AtomicUsize::new(0),
             out_bytes: AtomicUsize::new(0),
             job: AtomicUsize::new(0),
-            shared: Mutex::new(Shared { cmds: VecDeque::new(), out: Vec::new() }),
+            shared: Mutex::new(Shared { cmds: VecDeque::new(), cmds_input: 0, cmds_argv: 0, out: Vec::new() }),
             session: precheck::SessionView::new(),
             #[cfg(feature = "timing")]
             trace: AtomicU32::new(0),
@@ -558,12 +601,21 @@ impl Worker {
             sock_blocked: false,
             registered: true,
             interest: libc::EPOLLIN as u32,
+            rbuf_shared: false,
+            len_pub: 0,
+            cap_pub: 0,
+            peak: 0,
+            last_read: self.now,
         });
         self.notify(&conn, VIO_EV_NEW);
     }
 
     fn remove(&mut self, idx: usize) {
         if let Some(l) = self.slab[idx].take() {
+            RBUF_TOTAL.fetch_sub(l.cap_pub, Ordering::Relaxed);
+            if l.cap_pub != 0 {
+                self.private_bufs -= 1;
+            }
             if l.registered {
                 sys::epoll_del(self.me().epfd, l.conn.fd);
             }
@@ -620,6 +672,107 @@ impl Worker {
     }
 
     fn on_readable(&mut self, idx: usize) {
+        let now = self.now;
+        if let Some(l) = self.slab[idx].as_mut() {
+            l.last_read = now;
+            if l.rbuf.capacity() == 0 {
+                std::mem::swap(&mut l.rbuf, &mut self.shared_rbuf);
+                l.rbuf_shared = true;
+            }
+        }
+        self.read_and_parse(idx);
+        self.settle_rbuf(idx);
+    }
+
+    /// After a read or a parse: return a lent shared buffer that holds no
+    /// unparsed input (otherwise the connection keeps it, as C hands a
+    /// client the shared query buffer), and publish what is held.
+    fn settle_rbuf(&mut self, idx: usize) {
+        let l = match self.slab[idx].as_mut() {
+            Some(l) => l,
+            None => return,
+        };
+        if l.rbuf_shared {
+            l.rbuf_shared = false;
+            if l.rpos == l.rbuf.len() {
+                l.rbuf.clear();
+                l.rpos = 0;
+                if l.rbuf.capacity() <= 4 * READ_CHUNK {
+                    std::mem::swap(&mut l.rbuf, &mut self.shared_rbuf);
+                } else {
+                    l.rbuf = Vec::new();
+                }
+            }
+        }
+        let len = (l.rbuf.len() - l.rpos).saturating_sub(l.parser.frame_consumed());
+        if len != l.len_pub {
+            l.len_pub = len;
+            l.conn.in_len.store(len, Ordering::Relaxed);
+        }
+        let cap = l.rbuf.capacity();
+        if cap != l.cap_pub {
+            let grew = cap > l.cap_pub;
+            if l.cap_pub == 0 {
+                self.private_bufs += 1;
+            } else if cap == 0 {
+                self.private_bufs -= 1;
+            }
+            if grew {
+                RBUF_TOTAL.fetch_add(cap - l.cap_pub, Ordering::Relaxed);
+            } else {
+                RBUF_TOTAL.fetch_sub(l.cap_pub - cap, Ordering::Relaxed);
+            }
+            l.cap_pub = cap;
+            l.conn.in_cap.store(cap, Ordering::Relaxed);
+            if grew {
+                let c = l.conn.clone();
+                self.notify(&c, VIO_EV_MEM);
+            }
+        }
+    }
+
+    /// Every SWEEP_EVERY: clientsCronResizeQueryBuffer() for the private read
+    /// buffers. Free an idle connection's empty buffer, shrink an idle one
+    /// holding a partial command to fit, and trim a buffer that is twice
+    /// its recent peak.
+    fn sweep(&mut self) {
+        let now = self.now;
+        self.last_sweep = now;
+        for idx in 0..self.slab.len() {
+            let l = match self.slab[idx].as_mut() {
+                Some(l) => l,
+                None => continue,
+            };
+            let cap = l.rbuf.capacity();
+            if cap == 0 {
+                l.peak = 0;
+                continue;
+            }
+            let unparsed = l.rbuf.len() - l.rpos;
+            let needed = l.parser.needed();
+            if cap - l.rbuf.len() > 4096 {
+                if now.duration_since(l.last_read) > Duration::from_secs(2) {
+                    if unparsed == 0 {
+                        l.rbuf = Vec::new();
+                        l.rpos = 0;
+                    } else {
+                        l.rbuf.drain(..l.rpos);
+                        l.rpos = 0;
+                        l.rbuf.shrink_to_fit();
+                    }
+                } else if cap > 32 * 1024 && cap / 2 > l.peak {
+                    l.rbuf.drain(..l.rpos);
+                    l.rpos = 0;
+                    let keep = l.rbuf.len().max(l.peak).max(needed);
+                    l.rbuf.shrink_to(keep);
+                }
+            }
+            l.peak = (l.rbuf.len() - l.rpos).max(needed);
+            self.settle_rbuf(idx);
+        }
+    }
+
+    fn read_and_parse(&mut self, idx: usize) {
         let g = global();
         let l = match self.slab[idx].as_mut() {
             Some(l) => l,
@@ -632,7 +785,9 @@ impl Worker {
 
         /* Size the read for a large pending bulk so it lands in one buffer. */
         let have = l.rbuf.len() - l.rpos;
-        let want = l.parser.needed().saturating_sub(have).max(READ_CHUNK);
+        let rem = l.parser.needed().saturating_sub(have);
+        let want = if l.parser.big_bulk() && rem > 0 { rem } else { rem.max(READ_CHUNK) };
+        l.peak = l.peak.max(have + want);
         let n = sys::read_append(conn.fd, &mut l.rbuf, want);
         if n == 0 {
             self.peer_gone(idx);
@@ -783,14 +938,13 @@ impl Worker {
             l.rbuf.drain(..l.rpos);
             l.rpos = 0;
         }
-        if l.rbuf.is_empty() && l.rbuf.capacity() > 4 * READ_CHUNK {
-            l.rbuf = Vec::new();
-        }
-
         if !batch.is_empty() {
             let n = batch.len();
+            let (input, argv) = batch.iter().fold((0, 0), |(i, a), c| (i + c.input_bytes as usize, a + cmd_argv_bytes(c)));
             let queued = {
                 let mut sh = conn.shared.lock().unwrap();
+                sh.cmds_input += input;
+                sh.cmds_argv += argv;
                 #[cfg(feature = "timing")]
                 for c in batch.iter().filter(|c| c.trace != 0) {
                     timing::stamp(c.trace, timing::ST_ENQUEUED);
@@ -915,6 +1069,7 @@ impl Worker {
         self.maybe_half_close(idx);
         if conn.parse_held.swap(false, Ordering::AcqRel) {
             self.parse_buffered(idx);
+            self.settle_rbuf(idx);
         }
         if conn.c_closed.load(Ordering::Acquire) {
             let drained = match self.slab[idx].as_ref() {
@@ -1031,6 +1186,7 @@ impl Worker {
         self.flush(idx);
         if !conn.parse_held.load(Ordering::Acquire) {
             self.parse_buffered(idx);
+            self.settle_rbuf(idx);
         }
     }
 
@@ -1116,6 +1272,7 @@ impl Worker {
             }
             let n = sys::epoll_wait(me.epfd, &mut events, timeout);
             me.inbox.waker.awake();
+            self.now = Instant::now();
             for ev in events.iter().take(n) {
                 let tok = ev.u64;
                 let mask = ev.events;
@@ -1136,7 +1293,11 @@ impl Worker {
             if !me.inbox.waker.signaled() {
                 self.take_inbox();
             }
-            timeout = -1;
+            if self.now.duration_since(self.last_sweep) >= SWEEP_EVERY {
+                self.sweep();
+            }
+            /* Wake up for the sweep while private read buffers exist. */
+            timeout = if self.private_bufs > 0 { SWEEP_EVERY.as_millis() as c_int } else { -1 };
             self.unpin();
             self.flush_notify();
         }
@@ -1208,6 +1369,10 @@ fn start(bind: Option<String>, port: c_int, threads: c_int, cbs: VioCallbacks, l
             ptrs: Vec::new(),
             lens: Vec::new(),
             held: Vec::new(),
+            shared_rbuf: Vec::new(),
+            private_bufs: 0,
+            now: Instant::now(),
+            last_sweep: Instant::now(),
         };
         std::thread::Builder::new()
             .name(format!("rust-io-{}", idx))

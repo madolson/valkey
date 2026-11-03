@@ -18,6 +18,12 @@
 #define VIO_EV_QBLIMIT (1 << 3)
 
 /*
+ The input this layer holds for the connection grew (client memory
+ accounting: the engine re-reads vio_conn_mem() on delivery).
+ */
+#define VIO_EV_MEM (1 << 4)
+
+/*
  Protocol error codes in VioCmd.err (resp::ProtoError; mirrors READ_FLAGS_ERROR_*).
  */
 #define VIO_ERR_NONE 0
@@ -364,6 +370,46 @@ size_t vio_conn_pop_cmds(VioConnRef h, VioCmd *out, size_t max);
  `h` must be a live handle.
  */
 size_t vio_conn_pending_cmds(VioConnRef h);
+
+/*
+ Memory this layer holds for one connection (client memory accounting).
+ */
+typedef struct VioConnMem {
+  /*
+   Input read and not parsed yet.
+   */
+  size_t in_unparsed;
+  /*
+   Capacity of the connection's private read buffer (0 when it reads
+   into the thread's shared buffer).
+   */
+  size_t in_alloc;
+  /*
+   Parsed commands not yet taken by the engine: their input bytes and
+   their argv bytes (argv_len_sum plus the pointer array).
+   */
+  size_t queued_input;
+  size_t queued_argv;
+  /*
+   Output accepted and not yet written (copy path).
+   */
+  size_t out_pending;
+} VioConnMem;
+
+/*
+ # Safety
+ `h` must be a live handle, `out` writable.
+ */
+void vio_conn_mem(VioConnRef h, struct VioConnMem *out);
+
+/*
+ Sum of in_alloc over every connection: read buffers live in the system
+ allocator, so the engine adds this to used memory for maxmemory.
+
+ # Safety
+ None beyond the FFI ABI.
+ */
+size_t vio_held_input_total(void);
 
 /*
  Bytes accepted from the engine and not yet written to the socket.

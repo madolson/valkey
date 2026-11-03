@@ -760,6 +760,42 @@ void rustIoFlushReplicas(long long timeout_ms) {
     }
 }
 
+/* ---------------------------------------------------------------------------
+ * Client memory held in Rust (DESIGN.md "Client memory")
+ * ------------------------------------------------------------------------- */
+
+/* getClientMemoryUsage(): Rust's private read buffer (sdsAllocSize(querybuf)
+ * for a C client), the argv of commands parsed but not yet pulled, and the
+ * output accepted but not yet written. */
+size_t rustIoClientMem(client *c) {
+    rustConnection *rc = (rustConnection *)c->conn;
+    if (!rc->h) return 0;
+    VioConnMem m;
+    vio_conn_mem(rc->h, &m);
+    return m.in_alloc + m.queued_argv + m.out_pending;
+}
+
+/* CLIENT LIST qbuf/qbuf-free: input bytes not yet executed (unparsed,
+ * parsed in Rust, and pulled into cmd_queue: a C client still has those
+ * in its querybuf), and the read buffer's free space. */
+void rustIoClientQbuf(client *c, size_t *qbuf, size_t *qbuf_free) {
+    rustConnection *rc = (rustConnection *)c->conn;
+    *qbuf = *qbuf_free = 0;
+    if (!rc->h) return;
+    VioConnMem m;
+    vio_conn_mem(rc->h, &m);
+    size_t queued = 0;
+    for (int i = c->cmd_queue.off; i < c->cmd_queue.len; i++) queued += c->cmd_queue.cmds[i].input_bytes;
+    *qbuf = m.in_unparsed + m.queued_input + queued;
+    *qbuf_free = m.in_alloc > m.in_unparsed ? m.in_alloc - m.in_unparsed : 0;
+}
+
+/* getMaxmemoryState(): read buffers are in the system allocator, so they
+ * are not in zmalloc_used_memory(). */
+size_t rustIoHeldMemory(void) {
+    return rust_started ? vio_held_input_total() : 0;
+}
+
 void rustIoLogReady(void) {
     if (rust_started) serverLog(LL_NOTICE, "Ready to accept connections rust");
 }

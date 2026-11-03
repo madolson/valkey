@@ -217,6 +217,24 @@ impl Parser {
         }
     }
 
+    /// Bytes of the current frame already consumed into parsed parts (the
+    /// header and complete arguments of a partial multibulk). C keeps only
+    /// what follows in its query buffer (qb_pos is past them).
+    pub fn frame_consumed(&self) -> usize {
+        if self.in_mb {
+            self.pos
+        } else {
+            0
+        }
+    }
+
+    /// Reading a bulk argument of at least 32 KiB (PROTO_MBULK_BIG_ARG):
+    /// read exactly what it still needs, as readToQueryBuf() does, so the
+    /// buffer is sized to the argument instead of doubling past it.
+    pub fn big_bulk(&self) -> bool {
+        self.in_mb && self.bulklen >= 32 * 1024
+    }
+
     fn reset(&mut self) {
         self.in_mb = false;
         self.mb_left = 0;

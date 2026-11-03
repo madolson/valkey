@@ -225,8 +225,11 @@ pub unsafe extern "C" fn vio_conn_pop_cmds(h: ConnRef<'_>, out: *mut VioCmd, max
         let mut sh = conn.shared.lock().unwrap();
         let n = max.min(sh.cmds.len());
         for i in 0..n {
+            let c = sh.cmds.pop_front().unwrap();
+            sh.cmds_input -= c.input_bytes as usize;
+            sh.cmds_argv -= cmd_argv_bytes(&c);
             // SAFETY: i < n <= max, and the caller provides max slots.
-            unsafe { out.add(i).write(sh.cmds.pop_front().unwrap()) };
+            unsafe { out.add(i).write(c) };
         }
         (n, sh.cmds.len())
     };
@@ -246,6 +249,51 @@ pub unsafe extern "C" fn vio_conn_pending_cmds(h: ConnRef<'_>) -> usize {
 
 /// Bytes accepted from the engine and not yet written to the socket.
 ///
+/// Memory this layer holds for one connection (client memory accounting).
+#[repr(C)]
+pub struct VioConnMem {
+    /// Input read and not parsed yet.
+    pub in_unparsed: usize,
+    /// Capacity of the connection's private read buffer (0 when it reads
+    /// into the thread's shared buffer).
+    pub in_alloc: usize,
+    /// Parsed commands not yet taken by the engine: their input bytes and
+    /// their argv bytes (argv_len_sum plus the pointer array).
+    pub queued_input: usize,
+    pub queued_argv: usize,
+    /// Output accepted and not yet written (copy path).
+    pub out_pending: usize,
+}
+
+/// # Safety
+/// `h` must be a live handle, `out` writable.
+#[no_mangle]
+pub unsafe extern "C" fn vio_conn_mem(h: ConnRef<'_>, out: *mut VioConnMem) {
+    let (queued_input, queued_argv) = {
+        let sh = h.shared.lock().unwrap();
+        (sh.cmds_input, sh.cmds_argv)
+    };
+    let m = VioConnMem {
+        in_unparsed: h.in_len.load(Ordering::Relaxed),
+        in_alloc: h.in_cap.load(Ordering::Relaxed),
+        queued_input,
+        queued_argv,
+        out_pending: h.out_bytes.load(Ordering::Acquire),
+    };
+    // SAFETY: the caller provides a writable VioConnMem.
+    unsafe { out.write(m) };
+}
+
+/// Sum of in_alloc over every connection: read buffers live in the system
+/// allocator, so the engine adds this to used memory for maxmemory.
+///
+/// # Safety
+/// None beyond the FFI ABI.
+#[no_mangle]
+pub unsafe extern "C" fn vio_held_input_total() -> usize {
+    RBUF_TOTAL.load(Ordering::Relaxed)
+}
+
 /// # Safety
 /// `h` must be a live handle.
 #[no_mangle]
@@ -402,7 +450,12 @@ pub unsafe extern "C" fn vio_conn_close(h: ConnRef<'_>) {
     let conn = h.arc();
     /* Commands the engine will never pop: free them now instead of when
      * the output drains, so they stop counting against the queued budget. */
-    let dropped: Vec<VioCmd> = conn.shared.lock().unwrap().cmds.drain(..).collect();
+    let dropped: Vec<VioCmd> = {
+        let mut sh = conn.shared.lock().unwrap();
+        sh.cmds_input = 0;
+        sh.cmds_argv = 0;
+        sh.cmds.drain(..).collect()
+    };
     global().adm.popped(dropped.len());
     for cmd in dropped {
         if !cmd.argv.is_null() {

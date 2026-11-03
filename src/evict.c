@@ -268,6 +268,10 @@ int getMaxmemoryState(size_t *total, size_t *logical, size_t *tofree, float *lev
     /* Check if we are over the memory usage limit. If we are not, no need
      * to subtract the replicas output buffers. We can just return ASAP. */
     mem_reported = zmalloc_used_memory();
+#ifdef USE_RUST_IO
+    /* Client read buffers of the Rust IO layer (system allocator). */
+    mem_reported += rustIoHeldMemory();
+#endif
     if (total) *total = mem_reported;
 
     /* We may return ASAP if there is no need to compute the level. */

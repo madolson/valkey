@@ -5058,6 +5058,16 @@ sds catClientInfoString(sds s, client *client, int hide_user_data) {
         replBufBlock *cur = listNodeValue(client->repl_data->ref_repl_buf_node);
         used_blocks_of_repl_buf = last->id - cur->id + 1;
     }
+    size_t qbuf = client->querybuf ? sdslen(client->querybuf) : 0;
+    size_t qbuf_free = client->querybuf ? sdsavail(client->querybuf) : 0;
+#ifdef USE_RUST_IO
+    if (client->conn && connIsExternal(client->conn)) {
+        size_t rq, rf;
+        rustIoClientQbuf(client, &rq, &rf);
+        qbuf += rq;
+        qbuf_free += rf;
+    }
+#endif
     sds ret = sdscatfmt(
         s,
         FMTARGS(
@@ -5076,8 +5086,8 @@ sds catClientInfoString(sds s, client *client, int hide_user_data) {
             " ssub=%i", client->pubsub_data ? (int)hashtableSize(client->pubsub_data->pubsubshard_channels) : 0,
             " multi=%i", client->mstate ? client->mstate->count : -1,
             " watch=%i", client->mstate ? (int)listLength(&client->mstate->watched_keys) : 0,
-            " qbuf=%U", client->querybuf ? (unsigned long long)sdslen(client->querybuf) : 0,
-            " qbuf-free=%U", client->querybuf ? (unsigned long long)sdsavail(client->querybuf) : 0,
+            " qbuf=%U", (unsigned long long)qbuf,
+            " qbuf-free=%U", (unsigned long long)qbuf_free,
             " argv-mem=%U", (unsigned long long)client->argv_len_sum,
             " multi-mem=%U", client->mstate ? (unsigned long long)client->mstate->argv_len_sums : 0,
             " rbs=%U", (unsigned long long)client->buf_usable_size,
@@ -5108,6 +5118,16 @@ sds catClientInfoShortString(sds s, client *client, int hide_user_data) {
     if (!server.crashed) waitForClientIO(client);
     char conninfo[CONN_INFO_LEN];
 
+    size_t qbuf = client->querybuf ? sdslen(client->querybuf) : 0;
+    size_t qbuf_free = client->querybuf ? sdsavail(client->querybuf) : 0;
+#ifdef USE_RUST_IO
+    if (client->conn && connIsExternal(client->conn)) {
+        size_t rq, rf;
+        rustIoClientQbuf(client, &rq, &rf);
+        qbuf += rq;
+        qbuf_free += rf;
+    }
+#endif
     sds ret = sdscatfmt(
         s,
         FMTARGS(
@@ -6715,6 +6735,9 @@ size_t getClientMemoryUsage(client *c, size_t *output_buffer_mem_usage) {
 
     if (output_buffer_mem_usage != NULL) *output_buffer_mem_usage = mem;
     mem += c->querybuf ? sdsAllocSize(c->querybuf) : 0;
+#ifdef USE_RUST_IO
+    if (c->conn && connIsExternal(c->conn)) mem += rustIoClientMem(c);
+#endif
     mem += zmalloc_size(c);
     mem += c->buf_usable_size;
     /* Compression staging capacity is retained for reuse, so account it as
