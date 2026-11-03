@@ -1,0 +1,45 @@
+/* Engine side of an external IO layer: what the engine offers a transport
+ * that reads and parses outside the engine (src/rust_io.c today). Only this
+ * file's implementation writes a client's cmd_queue for such a transport. */
+#ifndef ENGINE_IO_H
+#define ENGINE_IO_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+struct client;
+
+/* One command parsed by the IO layer, or a protocol error when err != 0.
+ * The IO layer's own type (valkey_io.h VioCmd) has this layout; rust_io.c
+ * checks it at compile time. */
+typedef struct engineCmd {
+    void **argv; /* robj **, owned by the engine once submitted */
+    int argc;
+    int err; /* protocol error code (VIO_ERR_*), 0 for a command */
+    int err_byte;
+    size_t argv_len_sum;
+    uint64_t input_bytes;
+    void *cmd; /* precheck: struct serverCommand *, filled off the engine thread */
+    int slot;
+    int read_flags;
+    uint64_t token; /* precheck token, 0 when not prechecked */
+#ifdef RUST_IO_TIMING
+    uint32_t trace;
+#endif
+} engineCmd;
+
+/* Commands in c->cmd_queue not yet executed. */
+int engineCmdQueuePending(struct client *c);
+
+/* Append cmds[0..n] to c->cmd_queue and prepare them (lookup, arity, slot)
+ * unless the IO layer prechecked them. Stops at the first protocol error and
+ * stores its code in *err and *err_byte (the error is always the last
+ * entry). Adds the commands' input bytes to *bytes. Returns the number of
+ * commands appended. */
+size_t engineSubmit(struct client *c, const engineCmd *cmds, size_t n, int *err, int *err_byte, unsigned long long *bytes);
+
+/* After a submit that appended commands: the read accounting
+ * handleReadResult() does for a socket read. */
+void engineAccountRead(struct client *c, unsigned long long bytes);
+
+#endif /* ENGINE_IO_H */

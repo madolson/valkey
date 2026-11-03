@@ -16,11 +16,28 @@
 #include "rust_io.h"
 #include "rust_io_timing.h"
 #include "connection_external.h"
+#include "engine_io.h"
 #include "io_threads.h"
 
 #ifdef USE_RUST_IO
 
 #include "rust/valkey-io/include/valkey_io.h"
+
+/* VioCmd is engine_io.h's engineCmd. */
+static_assert(sizeof(VioCmd) == sizeof(engineCmd), "VioCmd layout");
+static_assert(offsetof(VioCmd, argv) == offsetof(engineCmd, argv), "VioCmd layout");
+static_assert(offsetof(VioCmd, argc) == offsetof(engineCmd, argc), "VioCmd layout");
+static_assert(offsetof(VioCmd, err) == offsetof(engineCmd, err), "VioCmd layout");
+static_assert(offsetof(VioCmd, err_byte) == offsetof(engineCmd, err_byte), "VioCmd layout");
+static_assert(offsetof(VioCmd, argv_len_sum) == offsetof(engineCmd, argv_len_sum), "VioCmd layout");
+static_assert(offsetof(VioCmd, input_bytes) == offsetof(engineCmd, input_bytes), "VioCmd layout");
+static_assert(offsetof(VioCmd, cmd) == offsetof(engineCmd, cmd), "VioCmd layout");
+static_assert(offsetof(VioCmd, slot) == offsetof(engineCmd, slot), "VioCmd layout");
+static_assert(offsetof(VioCmd, read_flags) == offsetof(engineCmd, read_flags), "VioCmd layout");
+static_assert(offsetof(VioCmd, token) == offsetof(engineCmd, token), "VioCmd layout");
+#ifdef RUST_IO_TIMING
+static_assert(offsetof(VioCmd, trace) == offsetof(engineCmd, trace), "VioCmd layout");
+#endif
 
 /* Not exported through server.h. */
 void trimCommandQueue(client *c);
@@ -40,7 +57,6 @@ configEnum rust_io_mode_enum[] = {
  * stops reading the socket once its own queue is full. */
 #define RUST_IO_CMD_QUEUE_MAX 1024
 #define RUST_IO_POP_BATCH 128
-#define COMMAND_QUEUE_MIN_CAPACITY 16
 
 typedef struct rustConnection {
     connection c;
@@ -124,85 +140,27 @@ int rustIoTryOffloadFreeArgv(client *c, int argc, robj **argv) {
  * Command handoff
  * ------------------------------------------------------------------------- */
 
-static int cmdQueuePending(client *c) {
-    return c->cmd_queue.len - c->cmd_queue.off;
-}
-
 static void rustIoStall(rustConnection *rc, client *c) {
     if (rc->stalled) return;
     rc->stalled = true;
     listAddNodeTail(rust_stalled, (void *)(uintptr_t)c->id);
 }
 
-/* Move parsed commands from Rust into c->cmd_queue and prepare them
- * (lookup, arity, slot) on the main thread.
- *
- * STAGE 2 HOOK: in precheck mode prepareCommandGeneric() and the checks at
- * the top of processCommand() move to the Rust thread, before this handoff. */
+/* Move parsed commands from Rust into c->cmd_queue (engineSubmit()). */
 static int rustIoPull(rustConnection *rc, client *c) {
-    cmdQueue *q = &c->cmd_queue;
     VioCmd cmds[RUST_IO_POP_BATCH];
     unsigned long long bytes = 0;
     int pulled = 0;
 
-    while (rc->pending_err == 0 && cmdQueuePending(c) < RUST_IO_CMD_QUEUE_MAX) {
-        size_t want = RUST_IO_CMD_QUEUE_MAX - cmdQueuePending(c);
+    while (rc->pending_err == 0 && engineCmdQueuePending(c) < RUST_IO_CMD_QUEUE_MAX) {
+        size_t want = RUST_IO_CMD_QUEUE_MAX - engineCmdQueuePending(c);
         if (want > RUST_IO_POP_BATCH) want = RUST_IO_POP_BATCH;
         size_t n = vio_conn_pop_cmds(rc->h, cmds, want);
         if (n == 0) break;
-
-        if (q->off > 0) {
-            memmove(q->cmds, q->cmds + q->off, (q->len - q->off) * sizeof(parsedCommand));
-            q->len -= q->off;
-            q->off = 0;
-        }
-        if (q->len + n > q->cap) {
-            size_t cap = q->cap ? q->cap : COMMAND_QUEUE_MIN_CAPACITY;
-            while (cap < q->len + n) cap *= 2;
-            q->cap = cap;
-            q->cmds = zrealloc(q->cmds, q->cap * sizeof(parsedCommand));
-        }
-        for (size_t i = 0; i < n; i++) {
-            if (cmds[i].err) {
-                rc->pending_err = cmds[i].err;
-                rc->pending_err_byte = cmds[i].err_byte;
-                break;
-            }
-            parsedCommand *p = &q->cmds[q->len++];
-            p->read_flags = READ_FLAGS_PARSING_COMPLETED;
-            p->argc = cmds[i].argc;
-            p->argv = (robj **)cmds[i].argv;
-            p->argv_len = cmds[i].argc;
-            p->argv_len_sum = cmds[i].argv_len_sum;
-            p->input_bytes = cmds[i].input_bytes;
-            p->slot = -1;
-            p->cmd = NULL;
-            p->rust_precheck = cmds[i].token;
-#ifdef RUST_IO_TIMING
-            if (cmds[i].trace) ritDequeued(cmds[i].trace, cmds[i].argv);
-#endif
-            if (cmds[i].token && !(cmds[i].read_flags & READ_FLAGS_RUST_PREPARE_ON_MAIN)) {
-                /* Precheck mode: lookup, arity and slot ran on the IO thread. */
-                p->cmd = cmds[i].cmd;
-                p->slot = cmds[i].slot;
-                p->read_flags = cmds[i].read_flags | READ_FLAGS_RUST_PRECHECKED;
-            } else {
-                if (cmds[i].token) p->read_flags |= READ_FLAGS_RUST_PRECHECKED;
-                prepareCommandGeneric(p->argv, p->argc, &p->read_flags, &p->cmd, &p->slot);
-            }
-            bytes += cmds[i].input_bytes;
-            pulled++;
-        }
+        pulled += engineSubmit(c, (const engineCmd *)cmds, n, &rc->pending_err, &rc->pending_err_byte, &bytes);
     }
     rc->pulled += pulled;
-
-    if (pulled) {
-        /* What handleReadResult() accounts for a socket read. */
-        server.stat_total_reads_processed++;
-        server.stat_net_input_bytes += bytes;
-        c->net_input_bytes += bytes;
-        c->last_interaction = server.unixtime;
-    }
+    if (pulled) engineAccountRead(c, bytes);
     return pulled;
 }
 
@@ -221,7 +179,7 @@ static void rustIoPublish(rustConnection *rc, client *c) {
     /* Counted in io mode too: a delivery that popped commands is what
      * resumes a connection whose parse Rust held after one unauthenticated
      * command (vio_conn_publish() kicks it). */
-    unsigned long long consumed = rc->pulled - cmdQueuePending(c);
+    unsigned long long consumed = rc->pulled - engineCmdQueuePending(c);
     if (rust_io_precheck_active) {
         VioSession *s = &rc->sess;
         unsigned int flags = rustPrecheckSessionFlags(c);
@@ -271,9 +229,9 @@ static void rustIoProtocolError(client *c, int err, int byte) {
 static bool rustIoCanProgress(rustConnection *rc, client *c) {
     if (!rc->h || !rc->c.read_handler) return false;
     if (c->flag.close_asap || c->flag.close_after_reply) return false;
-    if (rc->pending_err == 0 && cmdQueuePending(c) < RUST_IO_CMD_QUEUE_MAX && vio_conn_pending_cmds(rc->h) > 0)
+    if (rc->pending_err == 0 && engineCmdQueuePending(c) < RUST_IO_CMD_QUEUE_MAX && vio_conn_pending_cmds(rc->h) > 0)
         return true;
-    if (!c->flag.blocked && canParseCommand(c) && (cmdQueuePending(c) > 0 || rc->pending_err > 0)) return true;
+    if (!c->flag.blocked && canParseCommand(c) && (engineCmdQueuePending(c) > 0 || rc->pending_err > 0)) return true;
     return false;
 }
 
@@ -295,7 +253,7 @@ static void rustIoDeliver(rustConnection *rc) {
 
     if (c->flag.blocked) return; /* resumed by processUnblockedClients() */
     if (processInputBuffer(c) == C_ERR) return;
-    if (rc->pending_err > 0 && cmdQueuePending(c) == 0 && canParseCommand(c)) {
+    if (rc->pending_err > 0 && engineCmdQueuePending(c) == 0 && canParseCommand(c)) {
         rustIoProtocolError(c, rc->pending_err, rc->pending_err_byte);
         rc->pending_err = -1;
     }
