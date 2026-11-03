@@ -113,7 +113,8 @@ int vio_main_has_ready(void);
 const VioConn *vio_main_next_ready(void);
 
 /* Per connection, main thread only. */
-void vio_conn_retain(const VioConn *h);
+/* Returns a new reference to h. */
+const VioConn *vio_conn_retain(const VioConn *h);
 void vio_conn_release(const VioConn *h);
 uint32_t vio_conn_take_events(const VioConn *h);
 void *vio_conn_udata(const VioConn *h);

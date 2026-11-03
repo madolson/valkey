@@ -270,8 +270,7 @@ static void rustIoAccept(const VioConn *h) {
     rc->c.fd = vio_conn_fd(h);
     rc->c.iovcnt = IOV_MAX;
     rc->c.state = CONN_STATE_ACCEPTING;
-    rc->h = h;
-    vio_conn_retain(h);
+    rc->h = vio_conn_retain(h);
     vio_conn_set_udata(h, rc);
 
     struct ClientFlags flags = {0};

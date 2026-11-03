@@ -3,7 +3,7 @@ use crate::precheck;
 use crate::*;
 use std::ffi::{c_int, c_void, CStr};
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use super::{ConnHandle, ConnRef};
 
 /// Bind the listener and start the IO threads. Returns the eventfd the
 /// engine must poll for readability (then call vio_main_begin_drain), or
@@ -102,14 +102,11 @@ pub unsafe extern "C" fn vio_main_after_poll() -> c_int {
 /// # Safety
 /// Engine thread only (the thread that called vio_start()).
 #[no_mangle]
-pub unsafe extern "C" fn vio_main_next_ready() -> *const Conn {
-    match MAIN_READY.with(|r| r.borrow_mut().pop_front()) {
-        Some(c) => {
-            c.in_ready.store(false, Ordering::Release);
-            Arc::into_raw(c)
-        }
-        None => std::ptr::null(),
-    }
+pub unsafe extern "C" fn vio_main_next_ready() -> Option<ConnHandle> {
+    MAIN_READY.with(|r| r.borrow_mut().pop_front()).map(|c| {
+        c.in_ready.store(false, Ordering::Release);
+        ConnHandle::new(c)
+    })
 }
 
 /// Whether the current batch still holds connections. True inside a long
@@ -124,48 +121,48 @@ pub unsafe extern "C" fn vio_main_has_ready() -> c_int {
     MAIN_READY.with(|r| !r.borrow().is_empty()) as c_int
 }
 
+/// A new strong reference to `h`.
+///
 /// # Safety
 /// `h` must be a live handle.
 #[no_mangle]
-pub unsafe extern "C" fn vio_conn_retain(h: *const Conn) {
-    // SAFETY: `h` came from Arc::into_raw and is alive.
-    unsafe { Arc::increment_strong_count(h) };
+pub unsafe extern "C" fn vio_conn_retain(h: ConnRef<'_>) -> ConnHandle {
+    h.retain()
 }
 
 /// # Safety
-/// `h` must be a live handle; the caller gives up one reference.
+/// `h` must be a live handle; the caller gives up this reference.
 #[no_mangle]
-pub unsafe extern "C" fn vio_conn_release(h: *const Conn) {
-    // SAFETY: the caller owns the reference it releases.
-    unsafe { Arc::decrement_strong_count(h) };
-}
-
-/// # Safety
-/// `h` must be a live handle.
-#[no_mangle]
-pub unsafe extern "C" fn vio_conn_take_events(h: *const Conn) -> u32 {
-    unsafe { conn_ref(h) }.events.swap(0, Ordering::AcqRel)
+pub unsafe extern "C" fn vio_conn_release(h: ConnHandle) {
+    drop(h);
 }
 
 /// # Safety
 /// `h` must be a live handle.
 #[no_mangle]
-pub unsafe extern "C" fn vio_conn_udata(h: *const Conn) -> *mut c_void {
-    unsafe { conn_ref(h) }.udata.load(Ordering::Relaxed)
+pub unsafe extern "C" fn vio_conn_take_events(h: ConnRef<'_>) -> u32 {
+    h.events.swap(0, Ordering::AcqRel)
+}
+
+/// # Safety
+/// `h` must be a live handle.
+#[no_mangle]
+pub unsafe extern "C" fn vio_conn_udata(h: ConnRef<'_>) -> *mut c_void {
+    h.udata.load(Ordering::Relaxed)
 }
 
 /// # Safety
 /// `h` must be a live handle. Rust stores `p` and never dereferences it.
 #[no_mangle]
-pub unsafe extern "C" fn vio_conn_set_udata(h: *const Conn, p: *mut c_void) {
-    unsafe { conn_ref(h) }.udata.store(p, Ordering::Relaxed)
+pub unsafe extern "C" fn vio_conn_set_udata(h: ConnRef<'_>, p: *mut c_void) {
+    h.udata.store(p, Ordering::Relaxed)
 }
 
 /// # Safety
 /// `h` must be a live handle.
 #[no_mangle]
-pub unsafe extern "C" fn vio_conn_fd(h: *const Conn) -> c_int {
-    unsafe { conn_ref(h) }.fd
+pub unsafe extern "C" fn vio_conn_fd(h: ConnRef<'_>) -> c_int {
+    h.fd
 }
 
 /// Move up to `max` parsed commands into `out`, in order. argv ownership
@@ -174,8 +171,8 @@ pub unsafe extern "C" fn vio_conn_fd(h: *const Conn) -> c_int {
 /// # Safety
 /// `h` must be a live handle and `out` valid for `max` writes.
 #[no_mangle]
-pub unsafe extern "C" fn vio_conn_pop_cmds(h: *const Conn, out: *mut VioCmd, max: usize) -> usize {
-    let conn = unsafe { conn_arc(h) };
+pub unsafe extern "C" fn vio_conn_pop_cmds(h: ConnRef<'_>, out: *mut VioCmd, max: usize) -> usize {
+    let conn = h.arc();
     let (n, left) = {
         let mut sh = conn.shared.lock().unwrap();
         let n = max.min(sh.cmds.len());
@@ -194,8 +191,8 @@ pub unsafe extern "C" fn vio_conn_pop_cmds(h: *const Conn, out: *mut VioCmd, max
 /// # Safety
 /// `h` must be a live handle.
 #[no_mangle]
-pub unsafe extern "C" fn vio_conn_pending_cmds(h: *const Conn) -> usize {
-    unsafe { conn_ref(h) }.shared.lock().unwrap().cmds.len()
+pub unsafe extern "C" fn vio_conn_pending_cmds(h: ConnRef<'_>) -> usize {
+    h.shared.lock().unwrap().cmds.len()
 }
 
 /// Bytes accepted from the engine and not yet written to the socket.
@@ -203,8 +200,8 @@ pub unsafe extern "C" fn vio_conn_pending_cmds(h: *const Conn) -> usize {
 /// # Safety
 /// `h` must be a live handle.
 #[no_mangle]
-pub unsafe extern "C" fn vio_conn_pending_out(h: *const Conn) -> usize {
-    unsafe { conn_ref(h) }.out_bytes.load(Ordering::Acquire)
+pub unsafe extern "C" fn vio_conn_pending_out(h: ConnRef<'_>) -> usize {
+    h.out_bytes.load(Ordering::Acquire)
 }
 
 /// Copy engine output into the connection's outbound buffer and wake its
@@ -215,8 +212,8 @@ pub unsafe extern "C" fn vio_conn_pending_out(h: *const Conn) -> usize {
 /// `h` must be a live handle and `iov[0..iovcnt]` valid iovecs, each
 /// pointing at `iov_len` readable bytes, for the duration of the call.
 #[no_mangle]
-pub unsafe extern "C" fn vio_conn_writev(h: *const Conn, iov: *const libc::iovec, iovcnt: c_int) -> isize {
-    let conn = unsafe { conn_arc(h) };
+pub unsafe extern "C" fn vio_conn_writev(h: ConnRef<'_>, iov: *const libc::iovec, iovcnt: c_int) -> isize {
+    let conn = h.arc();
     if conn.peer_closed.load(Ordering::Acquire) {
         sys::set_errno(libc::EPIPE);
         return -1;
@@ -267,8 +264,8 @@ pub unsafe extern "C" fn vio_conn_writev(h: *const Conn, iov: *const libc::iovec
 /// # Safety
 /// `h` must be a live handle.
 #[no_mangle]
-pub unsafe extern "C" fn vio_conn_want_writable(h: *const Conn, on: c_int) {
-    let conn = unsafe { conn_arc(h) };
+pub unsafe extern "C" fn vio_conn_want_writable(h: ConnRef<'_>, on: c_int) {
+    let conn = h.arc();
     conn.want_writable.store(on != 0, Ordering::Release);
     if on != 0 {
         kick(&conn);
@@ -281,8 +278,8 @@ pub unsafe extern "C" fn vio_conn_want_writable(h: *const Conn, on: c_int) {
 /// # Safety
 /// `h` must be a live handle.
 #[no_mangle]
-pub unsafe extern "C" fn vio_conn_set_auth_required(h: *const Conn, on: c_int) {
-    let conn = unsafe { conn_arc(h) };
+pub unsafe extern "C" fn vio_conn_set_auth_required(h: ConnRef<'_>, on: c_int) {
+    let conn = h.arc();
     conn.auth_required.store(on != 0, Ordering::Release);
     /* Store, then check: the IO thread sets parse_held before the engine
      * can see the command it stopped after, so this cannot miss it. */
@@ -304,9 +301,9 @@ pub unsafe extern "C" fn vio_set_default_auth_required(on: c_int) {
 /// # Safety
 /// `h` must be a live handle and `s` a valid VioSession for the call.
 #[no_mangle]
-pub unsafe extern "C" fn vio_conn_set_session(h: *const Conn, s: *const precheck::VioSession) {
+pub unsafe extern "C" fn vio_conn_set_session(h: ConnRef<'_>, s: *const precheck::VioSession) {
     // SAFETY: caller contract; the session is copied.
-    unsafe { conn_ref(h).session.set(&*s) };
+    h.session.set(unsafe { &*s });
 }
 
 /// The engine is done with the connection. Pending output is flushed, then
@@ -315,8 +312,8 @@ pub unsafe extern "C" fn vio_conn_set_session(h: *const Conn, s: *const precheck
 /// # Safety
 /// `h` must be a live handle.
 #[no_mangle]
-pub unsafe extern "C" fn vio_conn_close(h: *const Conn) {
-    let conn = unsafe { conn_arc(h) };
+pub unsafe extern "C" fn vio_conn_close(h: ConnRef<'_>) {
+    let conn = h.arc();
     conn.udata.store(std::ptr::null_mut(), Ordering::Relaxed);
     conn.want_writable.store(false, Ordering::Release);
     conn.c_closed.store(true, Ordering::Release);
@@ -326,35 +323,14 @@ pub unsafe extern "C" fn vio_conn_close(h: *const Conn) {
 /// # Safety
 /// `h` must be a live handle.
 #[no_mangle]
-pub unsafe extern "C" fn vio_conn_shutdown(h: *const Conn) {
-    sys::shutdown(unsafe { conn_ref(h) }.fd);
+pub unsafe extern "C" fn vio_conn_shutdown(h: ConnRef<'_>) {
+    sys::shutdown(h.fd);
 }
 
 /* ---------------------------------------------------------------------------
- * Exported API: per connection (main thread)
- *
- * Common contract for every `h: *const Conn` below: `h` is a handle the
- * engine got from vio_main_next_ready() and still holds a reference to
- * (vio_conn_retain, not yet released), and the call is made on the thread
- * that called vio_start().
+ * Per connection. `h` is a ConnRef: the engine holds a ConnHandle for it.
+ * Calls are made on the thread that called vio_start().
  * ------------------------------------------------------------------------- */
-
-/// # Safety
-/// `h` must be a live handle (see the module contract above).
-unsafe fn conn_ref<'a>(h: *const Conn) -> &'a Conn {
-    // SAFETY: the caller holds a strong reference, so the Conn is alive.
-    unsafe { &*h }
-}
-
-/// Borrow the handle as an Arc without changing the refcount.
-///
-/// # Safety
-/// `h` must be a live handle (see the module contract above).
-unsafe fn conn_arc(h: *const Conn) -> std::mem::ManuallyDrop<Arc<Conn>> {
-    // SAFETY: `h` came from Arc::into_raw and the caller holds a reference;
-    // ManuallyDrop keeps this borrow from releasing it.
-    std::mem::ManuallyDrop::new(unsafe { Arc::from_raw(h) })
-}
 
 #[cfg(feature = "timing")]
 mod timing_exports {
