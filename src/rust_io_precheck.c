@@ -102,13 +102,15 @@ static pcSnapshot *pcBuild(void) {
          * so they fall back (PC_FB_ACL_USER). */
         if ((u->flags & USER_FLAG_ROLE) || (u->roles && listLength(u->roles))) continue;
         if (s->nusers == PC_MAX_USERS) break;
-        user *cp = ACLCreateUnlinkedUser();
-        ACLCopyUser(cp, u);
-        s->live[s->nusers] = u;
-        s->copy[s->nusers] = cp;
-        s->nusers++;
+        s->live[s->nusers++] = u;
     }
     raxStop(&ri);
+    /* Copy after the walk: ACLCreateUnlinkedUser() inserts into and removes
+     * from Users, which would invalidate the iterator. */
+    for (int i = 0; i < s->nusers; i++) {
+        s->copy[i] = ACLCreateUnlinkedUser();
+        ACLCopyUser(s->copy[i], s->live[i]);
+    }
     acl_mutation_epoch = saved;
     s->epoch = saved;
     pc_stats.snapshots_built++;
