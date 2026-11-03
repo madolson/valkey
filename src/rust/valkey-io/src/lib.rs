@@ -378,6 +378,13 @@ struct Worker {
     rr: usize,
     /// Precheck snapshot pinned for this poll iteration (pointer as usize).
     pinned: Option<usize>,
+    /// Reused across batches (growing them per batch cost the IO thread
+    /// several glibc allocations per batch): argument pointers (as usize, so
+    /// the Worker stays Send), lengths, and the parsed arguments kept alive
+    /// until create_argvs.
+    ptrs: Vec<usize>,
+    lens: Vec<usize>,
+    held: Vec<Vec<Arg>>,
 }
 
 impl Worker {
@@ -625,9 +632,12 @@ impl Worker {
         let lim = Limits { max_bulk_len: g.limits.max_bulk_len(), auth_required };
         let mut batch: Vec<VioCmd> = Vec::new();
         /* Owned (inline) arguments stay alive until create_argvs. */
-        let mut held: Vec<Vec<Arg>> = Vec::new();
-        let mut ptrs: Vec<*const u8> = Vec::new();
-        let mut lens: Vec<usize> = Vec::new();
+        let held = &mut self.held;
+        let ptrs = &mut self.ptrs;
+        let lens = &mut self.lens;
+        held.clear();
+        ptrs.clear();
+        lens.clear();
         let mut ncmds = 0usize;
         loop {
             let frame = &l.rbuf[l.rpos..];
@@ -641,7 +651,7 @@ impl Worker {
                             Arg::Range(o, len) => (frame[*o..].as_ptr(), *len),
                             Arg::Owned(v) => (v.as_ptr(), v.len()),
                         };
-                        ptrs.push(p);
+                        ptrs.push(p as usize);
                         lens.push(len);
                         sum += len;
                     }
@@ -696,7 +706,7 @@ impl Worker {
             }
         }
         if ncmds > 0 {
-            (g.cbs.create_argvs)(ptrs.as_ptr(), lens.as_ptr(), batch.as_mut_ptr(), batch.len());
+            (g.cbs.create_argvs)(ptrs.as_ptr() as *const *const u8, lens.as_ptr(), batch.as_mut_ptr(), batch.len());
             #[cfg(feature = "timing")]
             for c in batch.iter().filter(|c| c.trace != 0) {
                 timing::stamp(c.trace, timing::ST_ARGV);
@@ -709,7 +719,7 @@ impl Worker {
                 }
             }
         }
-        drop(held);
+        held.clear();
         if l.rpos == l.rbuf.len() {
             l.rbuf.clear();
             l.rpos = 0;
@@ -1067,6 +1077,9 @@ fn start(bind: Option<String>, port: c_int, threads: c_int, cbs: VioCallbacks, l
             done: Vec::new(),
             rr: 0,
             pinned: None,
+            ptrs: Vec::new(),
+            lens: Vec::new(),
+            held: Vec::new(),
         };
         std::thread::Builder::new()
             .name(format!("rust-io-{}", idx))

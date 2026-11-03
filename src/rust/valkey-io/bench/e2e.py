@@ -35,7 +35,11 @@ import argparse, csv, io, os, statistics, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SRC = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
-SERVER_CPUS, CLIENT_CPUS, CLIENT_THREADS = "0-3", "4-7", "4"
+# E2E_SERVER_CPUS / E2E_CLIENT_CPUS / E2E_CLIENT_THREADS override the layout
+# (e.g. for configs with more threads than the server's four cores).
+SERVER_CPUS = os.environ.get("E2E_SERVER_CPUS", "0-3")
+CLIENT_CPUS = os.environ.get("E2E_CLIENT_CPUS", "4-7")
+CLIENT_THREADS = os.environ.get("E2E_CLIENT_THREADS", "4")
 
 PROFILES = {
     "quick": ["c-io2", "c-io4", "io-t1", "io-t3", "precheck-t1", "precheck-t3"],
