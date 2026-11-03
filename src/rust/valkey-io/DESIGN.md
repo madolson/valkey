@@ -913,7 +913,7 @@ Rules, each inherited from the C IO threads rather than re-invented:
 Threshold. `rust-io-zero-copy-min-bytes` (modifiable): a write is offloaded
 when the reply list is non-empty, `c->buf` holds bulk-string references, or
 `c->bufpos` is at least the threshold. -1 always copies (step 22's
-behaviour). Default 2048, chosen from the sweep (ITERATIONS.md "Reply-size
+behaviour) and is the default; 2048 is the recommended value, chosen from the sweep (ITERATIONS.md "Reply-size
 sweep"): the job costs a fixed round trip per write (about +5% to +18%
 main-thread ns per request for 64-1024 B replies at -P 1, where the main
 thread is about 50% idle), and breaks even at about 1.2 KB per write (64 B
@@ -922,6 +922,20 @@ main ns, +6.6% RPS at 3 IO threads; 16 KB x 16: -79% main ns, +50% RPS).
 The threshold applies to the bytes of one write, so one 64 B reply is
 copied and 16 pipelined 128 B replies are not. Strings of 16 KiB and more
 are referenced, never copied, so they always take the job.
+
+Why the default stays -1. With zero-copy on, unit/maxmemory loses two tests
+that copy mode passes ("eviction due to output buffers of many MGET
+clients, client eviction: true" and "client tracking don't cause eviction
+feedback loop"), while unit/client-eviction gains one ("BLPOP +
+maxmemory-clients: successor eviction during ready-key reexec"). In copy
+mode output handed to Rust sits in the Rust heap, invisible to
+`used_memory`; with jobs it stays in `c->reply` (as in C) but is released
+later, and `freeClient()` of a client with a job in flight is deferred
+(`clientHasPendingIO()`), so `evictClients()` cannot free it at once and
+`performEvictions()` evicts keys instead. Fixing that (count clients
+pending an async free, which the C test "a client pending an async free
+doesn't cause over-eviction" also covers and which fails in both modes)
+is left for the next stage; until then zero-copy is opt-in.
 
 Scope. Replica, primary and slot-migration connections stay on the copy
 path (`getClientType()` check in `rustIoTrySendWrite()`): their output is
