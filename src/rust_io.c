@@ -17,6 +17,7 @@
 #include "rust_io_timing.h"
 #include "connection_external.h"
 #include "engine_io.h"
+#include "memory_prefetch.h"
 #include "io_threads.h"
 
 #ifdef USE_RUST_IO
@@ -245,32 +246,80 @@ static bool rustIoCanProgress(rustConnection *rc, client *c) {
     return false;
 }
 
-/* Pull and execute what Rust parsed for this connection. Mirrors the tail
- * of readQueryFromClient(). The client may be freed. */
-static void rustIoDeliver(rustConnection *rc) {
-    VioConn *h = rc->h;
-    client *c = connGetPrivateData(&rc->c);
-    if (!h || !c) return;
-    if (c->flag.close_asap || c->flag.close_after_reply) return;
-    /* protectClient() removes the read handler: hold input in Rust. */
-    if (!rc->c.read_handler) {
-        if (vio_conn_pending_cmds(h)) rustIoStall(rc, c);
-        return;
-    }
-
-    rustIoPull(rc, c);
-    if (rc->pending_err > 0 || vio_conn_pending_cmds(h)) rustIoStall(rc, c);
-
-    if (c->flag.blocked) return; /* resumed by processUnblockedClients() */
-    if (processInputBuffer(c) == C_ERR) return;
+/* After a client's commands ran: the protocol error that ended its input,
+ * the queue trim, and what Rust reads about the client. */
+static void rustIoAfterCommands(rustConnection *rc, client *c) {
     if (rc->pending_err > 0 && engineCmdQueuePending(c) == 0 && canParseCommand(c)) {
         rustIoProtocolError(c, rc->pending_err, rc->pending_err_byte);
         rc->pending_err = -1;
     }
     trimCommandQueue(c);
     rustIoPublish(rc, c);
+}
+
+/* Pull what Rust parsed for this connection into its command queue. Returns
+ * the client when it has commands to run now, NULL otherwise. */
+static client *rustIoDeliverPull(rustConnection *rc) {
+    VioConn *h = rc->h;
+    client *c = connGetPrivateData(&rc->c);
+    if (!h || !c) return NULL;
+    if (c->flag.close_asap || c->flag.close_after_reply) return NULL;
+    /* protectClient() removes the read handler: hold input in Rust. */
+    if (!rc->c.read_handler) {
+        if (vio_conn_pending_cmds(h)) rustIoStall(rc, c);
+        return NULL;
+    }
+
+    rustIoPull(rc, c);
+    if (rc->pending_err > 0 || vio_conn_pending_cmds(h)) rustIoStall(rc, c);
+
+    if (c->flag.blocked) return NULL; /* resumed by processUnblockedClients() */
+    return c;
+}
+
+/* Pull and execute what Rust parsed for this connection. Mirrors the tail
+ * of readQueryFromClient(). The client may be freed. */
+static void rustIoDeliver(rustConnection *rc) {
+    client *c = rustIoDeliverPull(rc);
+    if (!c) return;
+    if (processInputBuffer(c) == C_ERR) return;
+    rustIoAfterCommands(rc, c);
     /* May free the client (close_asap). */
     beforeNextClient(c);
+}
+
+/* Cross-connection batch (plan step 21), the C IO threads' scheme
+ * (handleReadJobs(), processClientIOReadsDone()): the commands of every
+ * ready connection go into the key-prefetch batch first, which prefetches
+ * the keys of all of them and then runs them (processClientsCommandsBatch()
+ * runs processPendingCommandAndInputBuffer() and beforeNextClient() per
+ * client). The per-client tail runs afterwards, by client id, since a
+ * client can be freed meanwhile. Returns 1 when the client went into the
+ * batch, 0 when it was handled here. */
+static int rustIoDeliverBatched(rustConnection *rc, uint64_t *id) {
+    client *c = rustIoDeliverPull(rc);
+    if (!c) return 0;
+    *id = c->id;
+    if (engineCmdQueuePending(c) == 0 || addCommandToBatchAndProcessIfFull(c) == C_ERR) {
+        if (processInputBuffer(c) == C_ERR) return 0;
+        rustIoAfterCommands(rc, c);
+        beforeNextClient(c);
+        return 0;
+    }
+    return 1;
+}
+
+#define RUST_IO_DRAIN_BATCH 128
+extern int ProcessingEventsWhileBlocked; /* networking.c */
+
+/* Run the batch and each batched client's tail. */
+static void rustIoFlushBatch(uint64_t *ids, int n) {
+    processClientsCommandsBatch();
+    for (int i = 0; i < n; i++) {
+        client *c = lookupClientByID(ids[i]);
+        if (!c || !c->conn || !connIsExternal(c->conn)) continue;
+        rustIoAfterCommands((rustConnection *)c->conn, c);
+    }
 }
 
 /* ---------------------------------------------------------------------------
@@ -409,21 +458,26 @@ static void rustIoAccept(VioConn *h) {
     }
 }
 
-static void rustIoHandleReady(VioConn *h) {
+/* Returns 1 when the client's commands went into the prefetch batch. */
+static int rustIoHandleReady(VioConn *h, uint64_t *id) {
+    int batched = 0;
     uint32_t ev = vio_conn_take_events(h);
     if (ev & VIO_EV_NEW) rustIoAccept(h);
 
     rustConnection *rc = vio_conn_udata(h);
-    if (!rc) return;
+    if (!rc) return 0;
     if ((ev & VIO_EV_WRITABLE) && rc->c.write_handler) {
-        if (!callHandler(&rc->c, rc->c.write_handler)) return;
+        if (!callHandler(&rc->c, rc->c.write_handler)) return 0;
     }
 
-    rustIoDeliver(rc);
+    if (ev & (VIO_EV_QBLIMIT | VIO_EV_CLOSED))
+        rustIoDeliver(rc);
+    else
+        batched = rustIoDeliverBatched(rc, id);
 
     if (ev & VIO_EV_QBLIMIT) {
         rc = vio_conn_udata(h);
-        if (!rc) return;
+        if (!rc) return batched;
         client *c = connGetPrivateData(&rc->c);
         if (c) {
             /* handleQbLimitReached() dumps c->querybuf, which is NULL here. */
@@ -433,12 +487,12 @@ static void rustIoHandleReady(VioConn *h) {
             freeClientAsync(c);
             server.stat_client_qbuf_limit_disconnections++;
         }
-        return;
+        return batched;
     }
 
     if (ev & VIO_EV_CLOSED) {
         rc = vio_conn_udata(h);
-        if (!rc) return;
+        if (!rc) return batched;
         rc->c.state = CONN_STATE_CLOSED;
         client *c = connGetPrivateData(&rc->c);
         if (c) {
@@ -446,17 +500,29 @@ static void rustIoHandleReady(VioConn *h) {
             freeClientAsync(c);
         }
     }
+    return batched;
 }
 
 static int rustIoDrainReady(void) {
     VioConn *h;
     int n = 0;
+    uint64_t ids[RUST_IO_DRAIN_BATCH];
+    int nids = 0;
     rustIoDrainDone();
+    /* Nested in processEventsWhileBlocked(): run what is left of the outer
+     * call's batch first, as processClientIOReadsDone() does. */
+    if (ProcessingEventsWhileBlocked) processClientsCommandsBatch();
     while ((h = vio_main_next_ready()) != NULL) {
-        rustIoHandleReady(h);
+        uint64_t id;
+        if (rustIoHandleReady(h, &id)) ids[nids++] = id;
         vio_conn_release(h);
         n++;
+        if (nids == RUST_IO_DRAIN_BATCH) {
+            rustIoFlushBatch(ids, nids);
+            nids = 0;
+        }
     }
+    if (nids) rustIoFlushBatch(ids, nids);
     return n;
 }
 
@@ -614,6 +680,9 @@ int rustIoInitListeners(void) {
         exit(1);
     }
     serverAssert(connExternalAttach(&rust_ext_ops) == C_OK);
+    /* The key-prefetch batch rustIoDrainReady() fills (only the C IO threads
+     * create it otherwise). */
+    prefetchCommandsBatchInit();
     if (aeCreateFileEvent(server.el, efd, AE_READABLE, rustIoEventHandler, NULL) == AE_ERR)
         serverPanic("Unrecoverable error creating rust-io event handler.");
     rust_stalled = listCreate();
