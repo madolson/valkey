@@ -215,3 +215,66 @@ citations: `~/rust-io/iter2/report.md`; data `~/rust-io/iter2fin/`.
   20 -> 39 ns).
 - Zero-copy (T=4, -P 16, GET): main ns/req 2200 -> 371 (16 KB) and
   20284 -> 511 (200 KB); RPS +2% / +10%, IO-thread bound.
+
+# Iteration 3a (stage 7a, branch rust-io/iter3a)
+
+Base: `rust-io/iter2` 300a1c03a. Same host class (32 cores). Method: stage
+5b's matched-thread bench (`~/rust-io/iter2fin/tools/bench.py`, copied to
+`~/rust-io/iter3a/tools/`): server on cores 0..T-1, valkey-benchmark
+`--threads 16` on 16-31, `-c 400 -d 64 -r 1000000`, 8 s, 3 reps, median.
+C = `--io-threads T`, precheck = `--rust-io-threads T-1 --rust-io-takeover yes`.
+Main ns/request = main-thread CPU / RPS. Baseline: the iter2 HEAD binary
+(`~/rust-io/iter3a/bin/valkey-server.iter2`, `sha=300a1c03:0`), rerun in the
+same session as each step. Raw data `~/rust-io/iter3a/m/bench.csv`,
+profiles `~/rust-io/iter3a/perf/`. Predictions are written here before the
+step is measured.
+
+## Step 1a: no allocation in the handoff (swap-the-Vec mailboxes)
+
+Finding (6d profile `head-precheck4-get-main.data`, call graph under
+`vio_conn_return_argv`, 5.84% inclusive of main-thread samples): 2.68% is
+`Vec::push` -> `RawVec::grow_one` -> glibc `realloc`, and 1.01% of that is
+`__lll_unlock_wake_private`. The "mailbox mutex" futex in the 6d table is
+mostly glibc's malloc arena lock, not the mailbox: Rust uses the system
+allocator, `return_argv` handed its per-thread Vec to the IO thread
+(`mem::take`) every flush and regrew a new one from capacity 0 on the next
+command, and the IO thread freed it into the engine thread's arena. The two
+mailboxes had the same pattern: `Mailbox::take()` left the producer an
+empty Vec, so every inbox and ready batch was allocated on one thread and
+freed on the other.
+
+Change: `Mailbox::swap()` replaces `take()`: the consumer swaps its emptied
+buffer with the queue, so both keep capacity. `Msg::FreeArgv` carries one
+(argv, argc) and the engine thread's per-IO-thread Vec is drained into the
+inbox, never moved. Steady state: no allocation on either side.
+
+Prediction (T=4 GET -P 16, main thread): realloc + its futex (~3.7% of
+390 ns = 14 ns) and the remaining futex (~0.7%, 3 ns) go away, minus the
+cost of the 16 B/entry copy into the inbox: -10 to -15 ns/request on main,
++2.5% to +4% RPS at T=4 GET -P 16 (main-bound). T=8 GET -P 16 similar
+in ns. SET -P 16: same ns saving, smaller relative (~580 ns/req): +1% to
++2%. -P 1 cells: main ns -1% to -2%, RPS client-bound (unchanged).
+
+Result (`s1a` vs `base`, same session, `m/bench.csv`):
+
+| T | test | P | RPS base -> s1a | main ns/req base -> s1a |
+|---|---|---|---|---|
+| 4 | GET | 16 | 2,602,074 -> 2,711,186 (+4.2%) | 380 -> 365 (-3.8%) |
+| 4 | SET | 16 | 1,772,948 -> 1,775,630 (+0.2%) | 563 -> 563 (-0.1%) |
+| 4 | GET | 1 | 222,087 -> 221,287 (-0.4%) | 847 -> 823 (-2.7%) |
+| 4 | SET | 1 | 220,056 -> 220,738 (+0.3%) | 991 -> 933 (-5.8%) |
+| 8 | GET | 16 | 2,476,618 -> 2,724,327 (+10.0%) | 403 -> 367 (-8.9%) |
+| 8 | SET | 16 | 1,711,088 -> 1,747,125 (+2.1%) | 584 -> 572 (-2.1%) |
+| 8 | GET | 1 | 518,034 -> 517,048 (-0.2%) | 1009 -> 940 (-6.8%) |
+| 8 | SET | 1 | 513,240 -> 515,318 (+0.4%) | 1160 -> 1096 (-5.5%) |
+
+Spreads 0.1-2.9%. GET -P 16 met the prediction at T=4 (-15 ns) and beat
+it at T=8 (-36 ns, where more IO threads meant more cross-arena frees).
+SET -P 16 at T=4 did not move (predicted +1% to +2%): its main thread is
+`setCommand`-bound and the saved ns are inside the spread. -P 1 main ns
+fell 3% to 7% (more than predicted; one return_argv per command there).
+Gates (`gates/s1a/summary.txt`): line-for-line the iter2 failures;
+miri 18 passed. unit/client-eviction aborted on its first input-side test
+in both modes; later gates skip the three input-side tests as iteration 1
+did. Verdict: KEEP.
+

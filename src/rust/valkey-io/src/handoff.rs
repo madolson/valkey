@@ -114,11 +114,26 @@ impl<B: Default> Mailbox<B> {
     }
 
     /// Consumer: take everything if work was published. None otherwise.
+    #[cfg(test)]
     pub(crate) fn take(&self) -> Option<B> {
         if !self.waker.take_pending() {
             return None;
         }
         Some(std::mem::take(&mut *self.q.lock().unwrap()))
+    }
+
+    /// Consumer: swap the queue with `mine`, which the caller has emptied,
+    /// if work was published. Both buffers keep their capacity, so neither
+    /// side allocates in steady state; `take()` left the producer an empty
+    /// Vec, and every batch was a glibc allocation on one thread freed on
+    /// the other (arena lock traffic on the engine thread). False when
+    /// nothing was published.
+    pub(crate) fn swap(&self, mine: &mut B) -> bool {
+        if !self.waker.take_pending() {
+            return false;
+        }
+        std::mem::swap(mine, &mut *self.q.lock().unwrap());
+        true
     }
 }
 
@@ -165,6 +180,28 @@ mod tests {
         }
         t.join().unwrap();
         assert_eq!(got, n);
+    }
+
+    /// swap() hands over the queue and keeps both buffers' capacity.
+    #[test]
+    fn swap_keeps_capacity() {
+        let mb: Mailbox<Vec<u32>> = Mailbox::new(-1, false);
+        let mut mine: Vec<u32> = Vec::new();
+        assert!(!mb.swap(&mut mine));
+        for i in 0..64 {
+            mb.post(false, |q| q.push(i));
+        }
+        assert!(mb.swap(&mut mine));
+        assert_eq!(mine.len(), 64);
+        let cap = mine.capacity();
+        mine.clear();
+        mb.post(false, |q| q.push(7));
+        assert!(mb.swap(&mut mine));
+        assert_eq!(mine, vec![7]);
+        mine.clear();
+        mb.post(false, |q| q.push(8));
+        assert!(mb.swap(&mut mine));
+        assert_eq!(mine.capacity(), cap);
     }
 
     /// An awake consumer is not signaled; a sleeping one is, once.

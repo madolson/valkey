@@ -169,9 +169,10 @@ impl Drop for Conn {
 enum Msg {
     NewFd(RawFd),
     Kick(Arc<Conn>),
-    /// Executed argv the engine returned, to free on the thread that built
-    /// them: (argv, argc) pairs.
-    FreeArgv(Vec<(usize, c_int)>),
+    /// An executed argv the engine returned, to free on the thread that
+    /// built it: (argv, argc). One entry per argv, so the engine's batch
+    /// Vec keeps its capacity instead of being moved to the IO thread.
+    FreeArgv(usize, c_int),
     /// To thread 0: unadopted connections fell below NEW_LOW, poll the
     /// listener again.
     ResumeAccept,
@@ -314,8 +315,8 @@ fn return_argv(thread: usize, argv: usize, argc: c_int) {
         }
         a[thread].push((argv, argc));
         if a[thread].len() >= ARGV_BATCH {
-            let v = std::mem::take(&mut a[thread]);
-            global().threads[thread].post(|q| q.push(Msg::FreeArgv(v)));
+            let v = &mut a[thread];
+            global().threads[thread].post(|q| q.extend(v.drain(..).map(|(p, n)| Msg::FreeArgv(p, n))));
         }
     });
 }
@@ -323,14 +324,14 @@ fn return_argv(thread: usize, argv: usize, argc: c_int) {
 /// Main thread: hand IO thread `idx` its kicks and returned argv with one
 /// inbox lock and at most one wakeup.
 fn flush_thread(idx: usize, kicks: &mut Vec<Arc<Conn>>, argv: Option<&mut Vec<(usize, c_int)>>) {
-    let argv = argv.filter(|a| !a.is_empty()).map(std::mem::take);
+    let argv = argv.filter(|a| !a.is_empty());
     if kicks.is_empty() && argv.is_none() {
         return;
     }
     global().threads[idx].post(|q| {
         q.extend(kicks.drain(..).map(Msg::Kick));
         if let Some(v) = argv {
-            q.push(Msg::FreeArgv(v));
+            q.extend(v.drain(..).map(|(p, n)| Msg::FreeArgv(p, n)));
         }
     });
 }
@@ -385,6 +386,8 @@ struct Worker {
     ptrs: Vec<usize>,
     lens: Vec<usize>,
     held: Vec<Vec<Arg>>,
+    /// Swapped with the inbox (handoff::Mailbox::swap).
+    inbox_buf: Vec<Msg>,
 }
 
 impl Worker {
@@ -958,8 +961,9 @@ impl Worker {
 
     fn take_inbox(&mut self) {
         let me = self.me();
-        if let Some(msgs) = me.inbox.take() {
-            for m in msgs {
+        let mut msgs = std::mem::take(&mut self.inbox_buf);
+        if me.inbox.swap(&mut msgs) {
+            for m in msgs.drain(..) {
                 match m {
                     Msg::NewFd(fd) => self.add_conn(fd),
                     Msg::Kick(c) => self.on_kick(c),
@@ -967,15 +971,11 @@ impl Worker {
                         self.listen_interest(true);
                         self.accept_all();
                     }
-                    Msg::FreeArgv(v) => {
-                        let free = global().cbs.free_argv;
-                        for (argv, argc) in v {
-                            free(argv as *mut *mut c_void, argc);
-                        }
-                    }
+                    Msg::FreeArgv(argv, argc) => (global().cbs.free_argv)(argv as *mut *mut c_void, argc),
                 }
             }
         }
+        self.inbox_buf = msgs;
     }
 
     fn run(mut self) {
@@ -1080,6 +1080,7 @@ fn start(bind: Option<String>, port: c_int, threads: c_int, cbs: VioCallbacks, l
             ptrs: Vec::new(),
             lens: Vec::new(),
             held: Vec::new(),
+            inbox_buf: Vec::new(),
         };
         std::thread::Builder::new()
             .name(format!("rust-io-{}", idx))
@@ -1097,18 +1098,23 @@ thread_local! {
     static MAIN_READY: RefCell<VecDeque<Arc<Conn>>> = const { RefCell::new(VecDeque::new()) };
     /// Completed write jobs taken with the current batch.
     static MAIN_DONE: RefCell<VecDeque<usize>> = const { RefCell::new(VecDeque::new()) };
+    /// Swapped with the ready mailbox (handoff::Mailbox::swap).
+    static MAIN_SWAP: RefCell<Ready> = RefCell::new(Ready::default());
 }
 
 
 /// Take connections that became ready while the main thread was awake (no
 /// eventfd was written for them). Returns 1 when there was pending work.
 fn take_ready(g: &Global) -> c_int {
-    let Some(batch) = g.ready.take() else {
-        return 0;
-    };
-    MAIN_READY.with(|r| r.borrow_mut().extend(batch.conns));
-    MAIN_DONE.with(|d| d.borrow_mut().extend(batch.done));
-    1
+    MAIN_SWAP.with(|b| {
+        let mut b = b.borrow_mut();
+        if !g.ready.swap(&mut b) {
+            return 0;
+        }
+        MAIN_READY.with(|r| r.borrow_mut().extend(b.conns.drain(..)));
+        MAIN_DONE.with(|d| d.borrow_mut().extend(b.done.drain(..)));
+        1
+    })
 }
 
 
