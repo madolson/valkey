@@ -350,7 +350,11 @@ static int connRustProcessPendingData(void) {
      * its batch in Rust's main-thread list, behind an eventfd that was
      * already drained. processEventsWhileBlocked() reaches it only here
      * (SCRIPT KILL from a connection in the same batch never ran). */
-    int processed = rustIoDrainReady();
+    int processed = 0;
+    if (rust_started) {
+        vio_main_take_ready();
+        processed = rustIoDrainReady();
+    }
     if (!rust_stalled || listLength(rust_stalled) == 0) return processed;
     unsigned long n = listLength(rust_stalled);
     uint64_t *ids = zmalloc(sizeof(uint64_t) * n);
@@ -611,9 +615,19 @@ int rustIoInitListeners(void) {
     return 1;
 }
 
-/* End of beforeSleep(), also inside processEventsWhileBlocked(). */
-void rustIoBeforePoll(void) {
-    if (rust_started) vio_main_flush_kicks();
+/* End of beforeSleep(), also inside processEventsWhileBlocked() (sleeping
+ * 0: the main thread does not block there). Returns 1 when the main thread
+ * must poll without blocking: Rust handed it work while it was awake, and
+ * skipped the eventfd for it. */
+int rustIoBeforePoll(int sleeping) {
+    if (!rust_started) return 0;
+    vio_main_flush_kicks();
+    return sleeping ? vio_main_before_poll() : 0;
+}
+
+/* afterSleep(). */
+void rustIoAfterPoll(void) {
+    if (rust_started) vio_main_after_poll();
 }
 
 void rustIoLogReady(void) {

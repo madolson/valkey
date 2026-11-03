@@ -1982,7 +1982,7 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
         } while (last_processed != 0);
         processed += freeClientsInAsyncFreeQueue();
 #ifdef USE_RUST_IO
-        rustIoBeforePoll();
+        rustIoBeforePoll(0);
 #endif
         server.events_processed_while_blocked += processed;
         return;
@@ -2150,7 +2150,7 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
     /* Don't sleep at all before the next beforeSleep() if needed (e.g. a
      * connection has pending data) */
 #ifdef USE_RUST_IO
-    rustIoBeforePoll();
+    if (rustIoBeforePoll(1)) dont_sleep = 1;
 #endif
     aeSetDontWait(server.el, dont_sleep);
 
@@ -2197,6 +2197,10 @@ void afterSleep(struct aeEventLoop *eventLoop, int numevents) {
         /* Set the eventloop command count at start. */
         server.el_cmd_cnt_start = server.stat_numcommands;
     }
+
+#ifdef USE_RUST_IO
+    rustIoAfterPoll();
+#endif
 
     /* Update the time cache. Skip the (relatively expensive) daylight-saving
      * refresh here since afterSleep() runs on every event-loop wakeup. */

@@ -99,6 +99,12 @@ void vio_main_begin_drain(void);
 /* Connections left in the current batch (processEventsWhileBlocked()). */
 /* Hand the kicks collected during this iteration to the IO threads. */
 void vio_main_flush_kicks(void);
+/* Take connections that became ready while the main thread was awake;
+ * 1 when there was pending work. */
+int vio_main_take_ready(void);
+/* Last call before the main thread polls; 1 = do not block. */
+int vio_main_before_poll(void);
+void vio_main_after_poll(void);
 int vio_main_has_ready(void);
 const VioConn *vio_main_next_ready(void);
 

@@ -136,6 +136,11 @@ struct IoThread {
     epfd: RawFd,
     wakefd: RawFd,
     signaled: AtomicBool,
+    /// Set just before epoll_wait, cleared after: producers skip the eventfd
+    /// write while the thread is awake.
+    sleeping: AtomicBool,
+    /// Inbox has entries the thread has not taken yet.
+    pending: AtomicBool,
     inbox: Mutex<Vec<Msg>>,
 }
 
@@ -146,6 +151,13 @@ struct Global {
     threads: Vec<IoThread>,
     main_efd: RawFd,
     main_signaled: AtomicBool,
+    /// Main thread is (about to be) blocked in poll; set by
+    /// vio_main_before_poll, cleared by vio_main_after_poll. While it is
+    /// clear, producers skip the eventfd write.
+    main_sleeping: AtomicBool,
+    /// `ready` has entries, or the main loop has beforeSleep() work
+    /// (vio_wake_main), that the main thread has not taken yet.
+    main_pending: AtomicBool,
     ready: Mutex<Vec<Arc<Conn>>>,
     listen_fd: RawFd,
 }
@@ -159,6 +171,18 @@ static GLOBAL: OnceLock<Global> = OnceLock::new();
 /// the engine. New connections start with it, so their first read is parsed
 /// with the right limits before the engine adopts them.
 static DEFAULT_AUTH_REQUIRED: AtomicBool = AtomicBool::new(false);
+
+/// Measurement switch, read once from VIO_HANDOFF_DISABLE at vio_start():
+/// bit 1 = no main-thread kick batching, bit 2 = always write the IO-thread
+/// eventfd, bit 4 = always write the main eventfd (the stage 1 handoff is 7).
+static HANDOFF_DISABLE: AtomicU32 = AtomicU32::new(0);
+const HD_KICK_BATCH: u32 = 1;
+const HD_IO_AWAKE: u32 = 2;
+const HD_MAIN_AWAKE: u32 = 4;
+
+fn hd(bit: u32) -> bool {
+    HANDOFF_DISABLE.load(Ordering::Relaxed) & bit != 0
+}
 
 fn global() -> &'static Global {
     GLOBAL.get().expect("valkey-io not started")
@@ -198,13 +222,19 @@ fn kick(conn: &Arc<Conn>) {
     /* Main thread: collect, and hand each IO thread its kicks in one inbox
      * append and at most one eventfd write at the end of beforeSleep()
      * (vio_main_flush_kicks). */
-    if IS_MAIN.with(|m| m.get()) {
+    if IS_MAIN.with(|m| m.get()) && !hd(HD_KICK_BATCH) {
         MAIN_KICKS.with(|k| {
             let mut k = k.borrow_mut();
             if k.len() <= conn.thread {
                 k.resize_with(conn.thread + 1, Vec::new);
             }
-            k[conn.thread].push(conn.clone());
+            let list = &mut k[conn.thread];
+            list.push(conn.clone());
+            /* Large batches: hand over early so the IO thread writes while
+             * the main thread is still producing replies. */
+            if list.len() >= KICK_BATCH {
+                flush_kicks(conn.thread, list);
+            }
         });
         return;
     }
@@ -213,8 +243,23 @@ fn kick(conn: &Arc<Conn>) {
     wake_thread(t);
 }
 
+/// Call after pushing to `t.inbox`. Pairs with the sleep check in
+/// Worker::run (Dekker, all SeqCst): either this sees `sleeping` set and
+/// writes the eventfd, or the thread sees `pending` set and does not block.
+/// Call after pushing to `g.ready` (or creating beforeSleep() work). Pairs
+/// with vio_main_before_poll (Dekker, all SeqCst): either this sees the main
+/// thread sleeping and writes the eventfd, or the main thread sees
+/// `main_pending` and polls without blocking.
+fn wake_main(g: &Global) {
+    g.main_pending.store(true, Ordering::SeqCst);
+    if (hd(HD_MAIN_AWAKE) || g.main_sleeping.load(Ordering::SeqCst)) && !g.main_signaled.swap(true, Ordering::SeqCst) {
+        eventfd_signal(g.main_efd);
+    }
+}
+
 fn wake_thread(t: &IoThread) {
-    if !t.signaled.swap(true, Ordering::AcqRel) {
+    t.pending.store(true, Ordering::SeqCst);
+    if (hd(HD_IO_AWAKE) || t.sleeping.load(Ordering::SeqCst)) && !t.signaled.swap(true, Ordering::SeqCst) {
         eventfd_signal(t.wakefd);
     }
 }
@@ -224,20 +269,26 @@ fn wake_thread(t: &IoThread) {
 /// processEventsWhileBlocked().
 #[no_mangle]
 pub extern "C" fn vio_main_flush_kicks() {
-    let g = match GLOBAL.get() {
-        Some(g) => g,
-        None => return,
-    };
+    if GLOBAL.get().is_none() {
+        return;
+    }
     MAIN_KICKS.with(|k| {
         for (idx, list) in k.borrow_mut().iter_mut().enumerate() {
-            if list.is_empty() {
-                continue;
+            if !list.is_empty() {
+                flush_kicks(idx, list);
             }
-            let t = &g.threads[idx];
-            t.inbox.lock().unwrap().extend(list.drain(..).map(Msg::Kick));
-            wake_thread(t);
         }
     });
+}
+
+/// Main-thread kicks per IO thread handed over before the end of the
+/// iteration.
+const KICK_BATCH: usize = 32;
+
+fn flush_kicks(idx: usize, list: &mut Vec<Arc<Conn>>) {
+    let t = &global().threads[idx];
+    t.inbox.lock().unwrap().extend(list.drain(..).map(Msg::Kick));
+    wake_thread(t);
 }
 
 /* ---------------------------------------------------------------------------
@@ -302,9 +353,7 @@ impl Worker {
         }
         let g = global();
         g.ready.lock().unwrap().append(&mut self.to_notify);
-        if !g.main_signaled.swap(true, Ordering::AcqRel) {
-            eventfd_signal(g.main_efd);
-        }
+        wake_main(g);
     }
 
     fn add_conn(&mut self, fd: RawFd) {
@@ -747,32 +796,40 @@ impl Worker {
         let mut timeout: c_int = -1;
         let mut events: Vec<libc::epoll_event> = vec![libc::epoll_event { events: 0, u64: 0 }; 256];
         loop {
-            let n = unsafe { libc::epoll_wait(me.epfd, events.as_mut_ptr(), events.len() as c_int, timeout) };
-            if n < 0 {
-                continue;
+            if timeout != 0 {
+                me.sleeping.store(true, Ordering::SeqCst);
+                if me.pending.load(Ordering::SeqCst) {
+                    timeout = 0;
+                }
             }
-            for i in 0..n as usize {
+            let n = unsafe { libc::epoll_wait(me.epfd, events.as_mut_ptr(), events.len() as c_int, timeout) };
+            me.sleeping.store(false, Ordering::SeqCst);
+            for i in 0..n.max(0) as usize {
                 let tok = events[i].u64;
                 let mask = events[i].events;
                 if tok == TOK_WAKE {
                     /* Drain before clearing: a producer that sees the flag
                      * set skips the eventfd write, so the flag must not be
-                     * cleared after its write was consumed. */
+                     * cleared after its write was consumed. The inbox is
+                     * taken below, after the clear. */
                     eventfd_drain(me.wakefd);
-                    me.signaled.store(false, Ordering::Release);
-                    let msgs = std::mem::take(&mut *me.inbox.lock().unwrap());
-                    for m in msgs {
-                        match m {
-                            Msg::NewFd(fd) => self.add_conn(fd),
-                            Msg::Kick(c) => self.on_kick(c),
-                        }
-                    }
+                    me.signaled.store(false, Ordering::SeqCst);
                 } else if tok == TOK_LISTEN {
                     self.accept_all();
                 } else {
                     self.on_event((tok - TOK_BASE) as usize, mask);
                 }
             }
+            if me.pending.swap(false, Ordering::SeqCst) {
+                let msgs = std::mem::take(&mut *me.inbox.lock().unwrap());
+                for m in msgs {
+                    match m {
+                        Msg::NewFd(fd) => self.add_conn(fd),
+                        Msg::Kick(c) => self.on_kick(c),
+                    }
+                }
+            }
+            timeout = -1;
             match rtc {
                 Some(r) => timeout = if self.rtc_cycle(r) { 0 } else { -1 },
                 None => self.flush_notify(),
@@ -819,7 +876,14 @@ pub extern "C" fn vio_start(cfg: *const VioConfig) -> c_int {
         }
         let mut ev = libc::epoll_event { events: libc::EPOLLIN as u32, u64: TOK_WAKE };
         unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, wakefd, &mut ev) };
-        threads.push(IoThread { epfd, wakefd, signaled: AtomicBool::new(false), inbox: Mutex::new(Vec::new()) });
+        threads.push(IoThread {
+            epfd,
+            wakefd,
+            signaled: AtomicBool::new(false),
+            sleeping: AtomicBool::new(false),
+            pending: AtomicBool::new(false),
+            inbox: Mutex::new(Vec::new()),
+        });
     }
     let mut ev = libc::epoll_event { events: libc::EPOLLIN as u32, u64: TOK_LISTEN };
     unsafe { libc::epoll_ctl(threads[0].epfd, libc::EPOLL_CTL_ADD, listen_fd, &mut ev) };
@@ -834,6 +898,8 @@ pub extern "C" fn vio_start(cfg: *const VioConfig) -> c_int {
         threads,
         main_efd,
         main_signaled: AtomicBool::new(false),
+        main_sleeping: AtomicBool::new(true),
+        main_pending: AtomicBool::new(false),
         ready: Mutex::new(Vec::new()),
         listen_fd,
     };
@@ -842,6 +908,9 @@ pub extern "C" fn vio_start(cfg: *const VioConfig) -> c_int {
         return -1;
     }
     IS_MAIN.with(|m| m.set(true));
+    if let Some(v) = std::env::var("VIO_HANDOFF_DISABLE").ok().and_then(|v| v.parse().ok()) {
+        HANDOFF_DISABLE.store(v, Ordering::Relaxed);
+    }
     for idx in 0..nthreads {
         let w = Worker { idx, slab: Vec::new(), free: Vec::new(), to_notify: Vec::new(), rr: 0 };
         std::thread::Builder::new()
@@ -868,9 +937,36 @@ pub extern "C" fn vio_main_begin_drain() {
     /* Drain, then clear, then take the list. Clearing first loses a wakeup
      * when a producer signals between the clear and the drain. */
     eventfd_drain(g.main_efd);
-    g.main_signaled.store(false, Ordering::Release);
+    g.main_signaled.store(false, Ordering::SeqCst);
+    vio_main_take_ready();
+}
+
+/// Take connections that became ready while the main thread was awake (no
+/// eventfd was written for them). Returns 1 when there was pending work.
+/// Called from beforeSleep() through the connection type's pending-data hook.
+#[no_mangle]
+pub extern "C" fn vio_main_take_ready() -> c_int {
+    let g = global();
+    if !g.main_pending.swap(false, Ordering::SeqCst) {
+        return 0;
+    }
     let batch = std::mem::take(&mut *g.ready.lock().unwrap());
     MAIN_READY.with(|r| r.borrow_mut().extend(batch));
+    1
+}
+
+/// Last call before the main thread polls. Returns 1 when work arrived that
+/// it must not sleep on (poll with a zero timeout).
+#[no_mangle]
+pub extern "C" fn vio_main_before_poll() -> c_int {
+    let g = global();
+    g.main_sleeping.store(true, Ordering::SeqCst);
+    g.main_pending.load(Ordering::SeqCst) as c_int
+}
+
+#[no_mangle]
+pub extern "C" fn vio_main_after_poll() {
+    global().main_sleeping.store(false, Ordering::SeqCst);
 }
 
 /// Next ready connection from the current batch, or NULL. The caller owns
@@ -1054,19 +1150,14 @@ pub extern "C" fn vio_conn_defer_to_main(h: *const Conn) {
     if !conn.in_ready.swap(true, Ordering::AcqRel) {
         let g = global();
         g.ready.lock().unwrap().push((*conn).clone());
-        if !g.main_signaled.swap(true, Ordering::AcqRel) {
-            eventfd_signal(g.main_efd);
-        }
+        wake_main(g);
     }
 }
 
 /// Wake the main thread's event loop (exec-rtc: it has beforeSleep() work).
 #[no_mangle]
 pub extern "C" fn vio_wake_main() {
-    let g = global();
-    if !g.main_signaled.swap(true, Ordering::AcqRel) {
-        eventfd_signal(g.main_efd);
-    }
+    wake_main(global());
 }
 
 #[no_mangle]

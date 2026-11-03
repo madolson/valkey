@@ -43,7 +43,8 @@ int rustIoTakesOverPort(void);
 int rustIoInitListeners(void);
 void rustIoLogReady(void);
 void rustIoPublishGlobals(void);
-void rustIoBeforePoll(void);
+int rustIoBeforePoll(int sleeping);
+void rustIoAfterPoll(void);
 
 #include "rust_io_precheck.h"
 /* Exec mode (src/rust_io_exec.c). */
