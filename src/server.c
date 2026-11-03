@@ -4668,6 +4668,324 @@ void unprepareCommand(client *c) {
  * If C_OK is returned the client is still alive and valid and
  * other operations can be performed by the caller. Otherwise
  * if C_ERR is returned the client was destroyed (i.e. after QUIT). */
+/* The flags processCommand() derives once per command and both halves read. */
+typedef struct commandContext {
+    uint64_t cmd_flags;
+    int is_exec;
+    int is_read_command, is_write_command, is_denyoom_command, is_denystale_command, is_denyloading_command;
+    int is_may_replicate_command, is_deny_async_loading_command;
+    int obey_client, is_keyless;
+} commandContext;
+
+/* The checks a session-aware IO layer can run off the engine thread against
+ * a policy snapshot (rust-io precheck): NO_MULTI, ACL, cluster routing.
+ * Returns 0 when the command was rejected (the reply is queued). */
+static inline int processCommandChecks(client *c, const commandContext *x) {
+
+    if (c->flag.multi && c->cmd->flags & CMD_NO_MULTI) {
+        sds nomulti_err =
+            sdscatprintf(sdsempty(), "Command '%s' not allowed inside a transaction", c->cmd->fullname);
+        sdsmapchars(nomulti_err, "\r\n", "  ", 2);
+        rejectCommandSds(c, nomulti_err, 1);
+        return 0;
+    }
+
+    /* Check if the user can run this command according to the current
+     * ACLs. */
+    int acl_errpos;
+    int acl_retval = ACLCheckAllPerm(c, &acl_errpos);
+    if (acl_retval != ACL_OK) {
+        addACLLogEntry(c, acl_retval, (c->flag.multi) ? ACL_LOG_CTX_MULTI : ACL_LOG_CTX_TOPLEVEL, acl_errpos, NULL,
+                       NULL);
+        sds msg = getAclErrorMessage(acl_retval, c->user, c->cmd, objectGetVal(c->argv[acl_errpos]), 0);
+        rejectCommandFormat(c, 0, "-NOPERM %s", msg);
+        sdsfree(msg);
+        uint64_t acl_subevent;
+        switch (acl_retval) {
+        case ACL_DENIED_DB: acl_subevent = VALKEYMODULE_ACL_LOG_DB; break;
+        case ACL_DENIED_KEY: acl_subevent = VALKEYMODULE_ACL_LOG_KEY; break;
+        case ACL_DENIED_CHANNEL: acl_subevent = VALKEYMODULE_ACL_LOG_CHANNEL; break;
+        default: acl_subevent = VALKEYMODULE_ACL_LOG_CMD; break;
+        }
+        moduleFireCommandACLRejectedEvent(c, acl_subevent, acl_errpos);
+        return 0;
+    }
+
+    /* If cluster is enabled perform the cluster redirection here.
+     * However we don't perform the redirection if:
+     * 1) The sender of this command is our primary.
+     * 2) The command has no key arguments. */
+    if (server.cluster_enabled && !x->obey_client && !x->is_keyless) {
+        int error_code;
+        clusterNode *n = getNodeByQuery(c, &error_code);
+        if (n == NULL || !clusterNodeIsMyself(n)) {
+            if (c->cmd->proc == execCommand) {
+                discardTransaction(c);
+            } else {
+                flagTransaction(c);
+            }
+            clusterRedirectClient(c, n, c->slot, error_code);
+            c->duration = 0;
+            c->cmd->rejected_calls++;
+            moduleFireCommandRejectedEvent(c, NULL);
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+/* Execute a prepared command: the live-state gates (redirect, OOM, disk
+ * errors, min-replicas, read-only replica, loading, busy script, pause,
+ * throttle), then MULTI queueing or call(). The #3381 durability bracket
+ * and a tiering gate belong here, right around call(). */
+static inline int processCommandExecute(client *c, const commandContext *x) {
+    /* If the client has the redirect capability, redirect keyless
+     * commands to the primary when this is a replica and the client
+     * has not opted into replica reads with READONLY. EXEC with all-keyless
+     * queued commands is also considered keyless (c->slot remains -1 as set
+     * by prepareCommand when no keys are found). */
+    int is_keyless_exec = x->is_exec && c->slot == -1;
+    if (server.cluster_enabled && !x->obey_client && (x->is_keyless || is_keyless_exec) && (x->is_read_command || x->is_write_command) &&
+        (c->capa & CLIENT_CAPA_REDIRECT) && !c->flag.readonly) {
+        clusterNode *myself = getMyClusterNode();
+        if (clusterNodeIsReplica(myself)) {
+            clusterNode *primary = clusterNodeGetPrimary(myself);
+            if (is_keyless_exec) {
+                discardTransaction(c);
+            } else {
+                flagTransaction(c);
+            }
+            int port = clusterNodeClientPort(primary, connIsTLS(c->conn), c);
+            addReplyErrorSds(c, sdscatprintf(sdsempty(), "-REDIRECT %s:%d",
+                                             clusterNodePreferredEndpoint(primary, c), port));
+            c->duration = 0;
+            c->cmd->rejected_calls++;
+            moduleFireCommandRejectedEvent(c, "-REDIRECT");
+            return C_OK;
+        }
+    }
+
+    if (clientSupportStandAloneRedirect(c) && !x->obey_client &&
+        (x->is_write_command || (x->is_read_command && !c->flag.readonly))) {
+        if (server.failover_state == FAILOVER_IN_PROGRESS) {
+            /* During the FAILOVER process, when conditions are met (such as
+             * when the force time is reached or the primary and replica offsets
+             * are consistent), the primary actively becomes the replica and
+             * transitions to the FAILOVER_IN_PROGRESS state.
+             *
+             * After the primary becomes the replica, and after handshaking
+             * and other operations, it will eventually send the PSYNC FAILOVER
+             * command to the replica, then the replica will become the primary.
+             * This means that the upgrade of the replica to the primary is an
+             * asynchronous operation, which implies that during the
+             * FAILOVER_IN_PROGRESS state, there may be a period of time where
+             * both nodes are replicas.
+             *
+             * In this scenario, if a -REDIRECT is returned, the request will be
+             * redirected to the replica and then redirected back, causing back
+             * and forth redirection. To avoid this situation, during the
+             * FAILOVER_IN_PROGRESS state, we temporarily suspend the clients
+             * that need to be redirected until the replica truly becomes the primary,
+             * and then resume the execution. */
+            blockPostponeClient(c);
+        } else {
+            if (c->cmd->proc == execCommand) {
+                discardTransaction(c);
+            } else {
+                flagTransaction(c);
+            }
+            c->duration = 0;
+            c->cmd->rejected_calls++;
+            moduleFireCommandRejectedEvent(c, "-REDIRECT");
+            addReplyErrorSds(c, sdscatprintf(sdsempty(), "-REDIRECT %s:%d", server.primary_host, server.primary_port));
+        }
+        return C_OK;
+    }
+
+    /* Disconnect some clients if total clients memory is too high. We do this
+     * before key eviction, after the last command was executed and consumed
+     * some client output buffer memory. */
+    evictClients();
+    if (server.current_client == NULL) {
+        /* If we evicted ourself then abort processing the command */
+        return C_ERR;
+    }
+
+    /* Handle the maxmemory directive.
+     *
+     * Note that we do not want to reclaim memory if we are here re-entering
+     * the event loop since there is a busy Lua script running in timeout
+     * condition, to avoid mixing the propagation of scripts with the
+     * propagation of DELs due to eviction. */
+    if (server.maxmemory && !isInsideYieldingLongCommand()) {
+        int out_of_memory = (performEvictions() == EVICT_FAIL);
+
+        /* performEvictions may evict keys, so we need flush pending tracking
+         * invalidation keys. If we don't do this, we may get an invalidation
+         * message after we perform operation on the key, where in fact this
+         * message belongs to the old value of the key before it gets evicted.*/
+        trackingHandlePendingKeyInvalidations();
+
+        /* performEvictions may flush replica output buffers. This may result
+         * in a replica, that may be the active client, to be freed. */
+        if (server.current_client == NULL) return C_ERR;
+
+        if (out_of_memory && x->is_denyoom_command) {
+            if (c->slot_migration_job != NULL) {
+                clusterHandleSlotMigrationClientOOM(c->slot_migration_job);
+                return C_ERR;
+            }
+
+            rejectCommand(c, shared.oomerr, 1);
+            return C_OK;
+        }
+
+        /* Save out_of_memory result at command start; otherwise, if we check OOM
+         * in the first write within script, memory used by lua stack and
+         * arguments might interfere. We need to save it for EXEC and module
+         * calls too, since these can call EVAL, but avoid saving it during an
+         * interrupted / yielding busy script / module. */
+        server.pre_command_oom_state = out_of_memory;
+    }
+
+    /* Make sure to use a reasonable amount of memory for client side
+     * caching metadata. */
+    if (server.tracking_clients) trackingLimitUsedSlots();
+
+    /* Don't accept write commands if there are problems persisting on disk
+     * unless coming from our primary, in which case check the replica ignore
+     * disk write error config to either log or crash. */
+    int deny_write_type = writeCommandsDeniedByDiskError();
+    if (deny_write_type != DISK_ERROR_TYPE_NONE && (x->is_write_command || c->cmd->proc == pingCommand)) {
+        if (x->obey_client) {
+            if (!server.repl_ignore_disk_write_error && c->cmd->proc != pingCommand) {
+                serverPanic("Replica was unable to write command to disk.");
+            } else {
+                static mstime_t last_log_time_ms = 0;
+                const mstime_t log_interval_ms = 10000;
+                if (server.mstime > last_log_time_ms + log_interval_ms) {
+                    last_log_time_ms = server.mstime;
+                    serverLog(LL_WARNING, "Replica is applying a command even though "
+                                          "it is unable to write to disk.");
+                }
+            }
+        } else {
+            sds err = writeCommandsGetDiskErrorMessage(deny_write_type);
+            /* remove the newline since rejectCommandSds adds it. */
+            sdssubstr(err, 0, sdslen(err) - 2);
+            rejectCommandSds(c, err, 1);
+            return C_OK;
+        }
+    }
+
+    /* Don't accept write commands if there are not enough good replicas and
+     * user configured the min-replicas-to-write option. */
+    if (x->is_write_command && !checkGoodReplicasStatus()) {
+        rejectCommand(c, shared.noreplicaserr, 1);
+        return C_OK;
+    }
+
+    /* Don't accept write commands if this is a read only replica. But
+     * accept write commands if this is our primary. */
+    if (server.primary_host && server.repl_replica_ro && !x->obey_client && x->is_write_command) {
+        rejectCommand(c, shared.roreplicaerr, 1);
+        return C_OK;
+    }
+
+    /* Only allow a subset of commands in the context of Pub/Sub if the
+     * connection is in RESP2 mode. With RESP3 there are no limits. */
+    if ((c->flag.pubsub && c->resp == 2) && c->cmd->proc != pingCommand && c->cmd->proc != subscribeCommand &&
+        c->cmd->proc != ssubscribeCommand && c->cmd->proc != unsubscribeCommand &&
+        c->cmd->proc != sunsubscribeCommand && c->cmd->proc != psubscribeCommand &&
+        c->cmd->proc != punsubscribeCommand && c->cmd->proc != quitCommand && c->cmd->proc != resetCommand) {
+        sds pubsub_err = sdscatprintf(sdsempty(),
+                                      "Can't execute '%s': only (P|S)SUBSCRIBE / "
+                                      "(P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context",
+                                      c->cmd->fullname);
+        sdsmapchars(pubsub_err, "\r\n", "  ", 2);
+        rejectCommandSds(c, pubsub_err, 1);
+        return C_OK;
+    }
+
+    /* Only allow commands with flag "t", such as INFO, REPLICAOF and so on,
+     * when replica-serve-stale-data is no and we are a replica with a broken
+     * link with primary. */
+    if (server.primary_host && server.repl_state != REPL_STATE_CONNECTED && server.repl_serve_stale_data == 0 &&
+        x->is_denystale_command) {
+        rejectCommand(c, shared.primarydownerr, 1);
+        return C_OK;
+    }
+
+    /* Loading DB? Return an error if the command has not the
+     * CMD_LOADING flag. */
+    if (server.loading && !server.async_loading && x->is_denyloading_command) {
+        rejectCommand(c, shared.loadingerr, 1);
+        return C_OK;
+    }
+
+    /* During async-loading, block certain commands. */
+    if (server.async_loading && x->is_deny_async_loading_command) {
+        rejectCommand(c, shared.loadingerr, 1);
+        return C_OK;
+    }
+
+    /* when a busy job is being done (script / module)
+     * Only allow a limited number of commands.
+     * Note that we need to allow the transactions commands; otherwise, clients
+     * sending a transaction with pipelining without error checking, may have
+     * the MULTI plus a few initial commands refused, then the timeout
+     * condition resolves, and the bottom-half of the transaction gets
+     * executed, see Github PR #7022. */
+    if (isInsideYieldingLongCommand() && !(c->cmd->flags & CMD_ALLOW_BUSY)) {
+        if (server.busy_module_yield_flags && server.busy_module_yield_reply) {
+            sds busy_err = sdscatprintf(sdsempty(), "-BUSY %s", server.busy_module_yield_reply);
+            sdsmapchars(busy_err, "\r\n", "  ", 2);
+            rejectCommandSds(c, busy_err, 1);
+        } else if (server.busy_module_yield_flags) {
+            rejectCommand(c, shared.slowmoduleerr, 1);
+        } else if (scriptIsEval()) {
+            rejectCommand(c, shared.slowevalerr, 1);
+        } else {
+            rejectCommand(c, shared.slowscripterr, 1);
+        }
+        return C_OK;
+    }
+
+    /* Prevent a replica from sending commands that access the keyspace.
+     * The main objective here is to prevent abuse of client pause check
+     * from which replicas are exempt. */
+    if (c->flag.replica && (x->is_may_replicate_command || x->is_write_command || x->is_read_command)) {
+        sds replica_err = sdsnew("Replica can't interact with the keyspace");
+        rejectCommandSds(c, replica_err, 1);
+        return C_OK;
+    }
+
+    /* If the server is paused, block the client until the pause has ended. Replicas and slot
+     * export clients are never paused to allow failover/slot migration to succeed. */
+    if (!c->flag.replica && (!c->slot_migration_job || isImportSlotMigrationJob(c->slot_migration_job)) &&
+        ((isPausedActions(PAUSE_ACTION_CLIENT_ALL)) || ((isPausedActions(PAUSE_ACTION_CLIENT_WRITE)) && x->is_may_replicate_command))) {
+        blockPostponeClient(c);
+        return C_OK;
+    }
+
+    if (throttle_throttleClientIfNeeded(c)) return C_OK;
+
+    /* Exec the command */
+    if (c->flag.multi && c->cmd->proc != execCommand && c->cmd->proc != discardCommand &&
+        c->cmd->proc != quitCommand &&
+        c->cmd->proc != resetCommand) {
+        queueMultiCommand(c, x->cmd_flags);
+        addReply(c, shared.queued);
+    } else {
+        int flags = CMD_CALL_FULL;
+        call(c, flags);
+        if (listLength(server.ready_keys) && !isInsideYieldingLongCommand()) handleClientsBlockedOnKeys();
+    }
+    return C_OK;
+}
+
+
 int processCommand(client *c) {
     RUST_IO_TIMING_HOOK(c, RIT_PROCESS);
     serverAssert(!c->flag.blocked && !c->flag.unblocked);
@@ -4768,321 +5086,27 @@ int processCommand(client *c) {
         }
     }
 
-    uint64_t cmd_flags = getCommandFlags(c);
+    commandContext ctx;
+    ctx.cmd_flags = getCommandFlags(c);
+    ctx.is_exec = (c->mstate && c->cmd->proc == execCommand);
+    int ms_flags = ctx.is_exec ? c->mstate->cmd_flags : 0;
+    int ms_inv_flags = ctx.is_exec ? c->mstate->cmd_inv_flags : 0;
+    int combined_flags = ctx.cmd_flags | ms_flags;
+    int combined_inv_flags = (~ctx.cmd_flags | ms_inv_flags);
 
-    int is_exec = (c->mstate && c->cmd->proc == execCommand);
-    int ms_flags = is_exec ? c->mstate->cmd_flags : 0;
-    int ms_inv_flags = is_exec ? c->mstate->cmd_inv_flags : 0;
-    int combined_flags = cmd_flags | ms_flags;
-    int combined_inv_flags = (~cmd_flags | ms_inv_flags);
+    ctx.is_read_command = (combined_flags & CMD_READONLY);
+    ctx.is_write_command = (combined_flags & CMD_WRITE);
+    ctx.is_denyoom_command = (combined_flags & CMD_DENYOOM);
+    ctx.is_denystale_command = (combined_inv_flags & CMD_STALE);
+    ctx.is_denyloading_command = (combined_inv_flags & CMD_LOADING);
+    ctx.is_may_replicate_command = (combined_flags & (CMD_WRITE | CMD_MAY_REPLICATE));
+    ctx.is_deny_async_loading_command = (combined_flags & CMD_NO_ASYNC_LOADING);
+    ctx.obey_client = mustObeyClient(c);
+    ctx.is_keyless = (c->read_flags & READ_FLAGS_NO_KEYS) && c->cmd->proc != execCommand;
 
-    int is_read_command = (combined_flags & CMD_READONLY);
-    int is_write_command = (combined_flags & CMD_WRITE);
-    int is_denyoom_command = (combined_flags & CMD_DENYOOM);
-    int is_denystale_command = (combined_inv_flags & CMD_STALE);
-    int is_denyloading_command = (combined_inv_flags & CMD_LOADING);
-    int is_may_replicate_command = (combined_flags & (CMD_WRITE | CMD_MAY_REPLICATE));
-    int is_deny_async_loading_command = (combined_flags & CMD_NO_ASYNC_LOADING);
-
-    const int obey_client = mustObeyClient(c);
-    int is_keyless = (c->read_flags & READ_FLAGS_NO_KEYS) && c->cmd->proc != execCommand;
-
-    if (prechecked) goto prechecked_resume;
-
-    if (c->flag.multi && c->cmd->flags & CMD_NO_MULTI) {
-        sds nomulti_err =
-            sdscatprintf(sdsempty(), "Command '%s' not allowed inside a transaction", c->cmd->fullname);
-        sdsmapchars(nomulti_err, "\r\n", "  ", 2);
-        rejectCommandSds(c, nomulti_err, 1);
-        return C_OK;
-    }
-
-    /* Check if the user can run this command according to the current
-     * ACLs. */
-    int acl_errpos;
-    int acl_retval = ACLCheckAllPerm(c, &acl_errpos);
-    if (acl_retval != ACL_OK) {
-        addACLLogEntry(c, acl_retval, (c->flag.multi) ? ACL_LOG_CTX_MULTI : ACL_LOG_CTX_TOPLEVEL, acl_errpos, NULL,
-                       NULL);
-        sds msg = getAclErrorMessage(acl_retval, c->user, c->cmd, objectGetVal(c->argv[acl_errpos]), 0);
-        rejectCommandFormat(c, 0, "-NOPERM %s", msg);
-        sdsfree(msg);
-        uint64_t acl_subevent;
-        switch (acl_retval) {
-        case ACL_DENIED_DB: acl_subevent = VALKEYMODULE_ACL_LOG_DB; break;
-        case ACL_DENIED_KEY: acl_subevent = VALKEYMODULE_ACL_LOG_KEY; break;
-        case ACL_DENIED_CHANNEL: acl_subevent = VALKEYMODULE_ACL_LOG_CHANNEL; break;
-        default: acl_subevent = VALKEYMODULE_ACL_LOG_CMD; break;
-        }
-        moduleFireCommandACLRejectedEvent(c, acl_subevent, acl_errpos);
-        return C_OK;
-    }
-
-    /* If cluster is enabled perform the cluster redirection here.
-     * However we don't perform the redirection if:
-     * 1) The sender of this command is our primary.
-     * 2) The command has no key arguments. */
-    if (server.cluster_enabled && !obey_client && !is_keyless) {
-        int error_code;
-        clusterNode *n = getNodeByQuery(c, &error_code);
-        if (n == NULL || !clusterNodeIsMyself(n)) {
-            if (c->cmd->proc == execCommand) {
-                discardTransaction(c);
-            } else {
-                flagTransaction(c);
-            }
-            clusterRedirectClient(c, n, c->slot, error_code);
-            c->duration = 0;
-            c->cmd->rejected_calls++;
-            moduleFireCommandRejectedEvent(c, NULL);
-            return C_OK;
-        }
-    }
-
-prechecked_resume:;
-    /* If the client has the redirect capability, redirect keyless
-     * commands to the primary when this is a replica and the client
-     * has not opted into replica reads with READONLY. EXEC with all-keyless
-     * queued commands is also considered keyless (c->slot remains -1 as set
-     * by prepareCommand when no keys are found). */
-    int is_keyless_exec = is_exec && c->slot == -1;
-    if (server.cluster_enabled && !obey_client && (is_keyless || is_keyless_exec) && (is_read_command || is_write_command) &&
-        (c->capa & CLIENT_CAPA_REDIRECT) && !c->flag.readonly) {
-        clusterNode *myself = getMyClusterNode();
-        if (clusterNodeIsReplica(myself)) {
-            clusterNode *primary = clusterNodeGetPrimary(myself);
-            if (is_keyless_exec) {
-                discardTransaction(c);
-            } else {
-                flagTransaction(c);
-            }
-            int port = clusterNodeClientPort(primary, connIsTLS(c->conn), c);
-            addReplyErrorSds(c, sdscatprintf(sdsempty(), "-REDIRECT %s:%d",
-                                             clusterNodePreferredEndpoint(primary, c), port));
-            c->duration = 0;
-            c->cmd->rejected_calls++;
-            moduleFireCommandRejectedEvent(c, "-REDIRECT");
-            return C_OK;
-        }
-    }
-
-    if (clientSupportStandAloneRedirect(c) && !obey_client &&
-        (is_write_command || (is_read_command && !c->flag.readonly))) {
-        if (server.failover_state == FAILOVER_IN_PROGRESS) {
-            /* During the FAILOVER process, when conditions are met (such as
-             * when the force time is reached or the primary and replica offsets
-             * are consistent), the primary actively becomes the replica and
-             * transitions to the FAILOVER_IN_PROGRESS state.
-             *
-             * After the primary becomes the replica, and after handshaking
-             * and other operations, it will eventually send the PSYNC FAILOVER
-             * command to the replica, then the replica will become the primary.
-             * This means that the upgrade of the replica to the primary is an
-             * asynchronous operation, which implies that during the
-             * FAILOVER_IN_PROGRESS state, there may be a period of time where
-             * both nodes are replicas.
-             *
-             * In this scenario, if a -REDIRECT is returned, the request will be
-             * redirected to the replica and then redirected back, causing back
-             * and forth redirection. To avoid this situation, during the
-             * FAILOVER_IN_PROGRESS state, we temporarily suspend the clients
-             * that need to be redirected until the replica truly becomes the primary,
-             * and then resume the execution. */
-            blockPostponeClient(c);
-        } else {
-            if (c->cmd->proc == execCommand) {
-                discardTransaction(c);
-            } else {
-                flagTransaction(c);
-            }
-            c->duration = 0;
-            c->cmd->rejected_calls++;
-            moduleFireCommandRejectedEvent(c, "-REDIRECT");
-            addReplyErrorSds(c, sdscatprintf(sdsempty(), "-REDIRECT %s:%d", server.primary_host, server.primary_port));
-        }
-        return C_OK;
-    }
-
-    /* Disconnect some clients if total clients memory is too high. We do this
-     * before key eviction, after the last command was executed and consumed
-     * some client output buffer memory. */
-    evictClients();
-    if (server.current_client == NULL) {
-        /* If we evicted ourself then abort processing the command */
-        return C_ERR;
-    }
-
-    /* Handle the maxmemory directive.
-     *
-     * Note that we do not want to reclaim memory if we are here re-entering
-     * the event loop since there is a busy Lua script running in timeout
-     * condition, to avoid mixing the propagation of scripts with the
-     * propagation of DELs due to eviction. */
-    if (server.maxmemory && !isInsideYieldingLongCommand()) {
-        int out_of_memory = (performEvictions() == EVICT_FAIL);
-
-        /* performEvictions may evict keys, so we need flush pending tracking
-         * invalidation keys. If we don't do this, we may get an invalidation
-         * message after we perform operation on the key, where in fact this
-         * message belongs to the old value of the key before it gets evicted.*/
-        trackingHandlePendingKeyInvalidations();
-
-        /* performEvictions may flush replica output buffers. This may result
-         * in a replica, that may be the active client, to be freed. */
-        if (server.current_client == NULL) return C_ERR;
-
-        if (out_of_memory && is_denyoom_command) {
-            if (c->slot_migration_job != NULL) {
-                clusterHandleSlotMigrationClientOOM(c->slot_migration_job);
-                return C_ERR;
-            }
-
-            rejectCommand(c, shared.oomerr, 1);
-            return C_OK;
-        }
-
-        /* Save out_of_memory result at command start; otherwise, if we check OOM
-         * in the first write within script, memory used by lua stack and
-         * arguments might interfere. We need to save it for EXEC and module
-         * calls too, since these can call EVAL, but avoid saving it during an
-         * interrupted / yielding busy script / module. */
-        server.pre_command_oom_state = out_of_memory;
-    }
-
-    /* Make sure to use a reasonable amount of memory for client side
-     * caching metadata. */
-    if (server.tracking_clients) trackingLimitUsedSlots();
-
-    /* Don't accept write commands if there are problems persisting on disk
-     * unless coming from our primary, in which case check the replica ignore
-     * disk write error config to either log or crash. */
-    int deny_write_type = writeCommandsDeniedByDiskError();
-    if (deny_write_type != DISK_ERROR_TYPE_NONE && (is_write_command || c->cmd->proc == pingCommand)) {
-        if (obey_client) {
-            if (!server.repl_ignore_disk_write_error && c->cmd->proc != pingCommand) {
-                serverPanic("Replica was unable to write command to disk.");
-            } else {
-                static mstime_t last_log_time_ms = 0;
-                const mstime_t log_interval_ms = 10000;
-                if (server.mstime > last_log_time_ms + log_interval_ms) {
-                    last_log_time_ms = server.mstime;
-                    serverLog(LL_WARNING, "Replica is applying a command even though "
-                                          "it is unable to write to disk.");
-                }
-            }
-        } else {
-            sds err = writeCommandsGetDiskErrorMessage(deny_write_type);
-            /* remove the newline since rejectCommandSds adds it. */
-            sdssubstr(err, 0, sdslen(err) - 2);
-            rejectCommandSds(c, err, 1);
-            return C_OK;
-        }
-    }
-
-    /* Don't accept write commands if there are not enough good replicas and
-     * user configured the min-replicas-to-write option. */
-    if (is_write_command && !checkGoodReplicasStatus()) {
-        rejectCommand(c, shared.noreplicaserr, 1);
-        return C_OK;
-    }
-
-    /* Don't accept write commands if this is a read only replica. But
-     * accept write commands if this is our primary. */
-    if (server.primary_host && server.repl_replica_ro && !obey_client && is_write_command) {
-        rejectCommand(c, shared.roreplicaerr, 1);
-        return C_OK;
-    }
-
-    /* Only allow a subset of commands in the context of Pub/Sub if the
-     * connection is in RESP2 mode. With RESP3 there are no limits. */
-    if ((c->flag.pubsub && c->resp == 2) && c->cmd->proc != pingCommand && c->cmd->proc != subscribeCommand &&
-        c->cmd->proc != ssubscribeCommand && c->cmd->proc != unsubscribeCommand &&
-        c->cmd->proc != sunsubscribeCommand && c->cmd->proc != psubscribeCommand &&
-        c->cmd->proc != punsubscribeCommand && c->cmd->proc != quitCommand && c->cmd->proc != resetCommand) {
-        sds pubsub_err = sdscatprintf(sdsempty(),
-                                      "Can't execute '%s': only (P|S)SUBSCRIBE / "
-                                      "(P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context",
-                                      c->cmd->fullname);
-        sdsmapchars(pubsub_err, "\r\n", "  ", 2);
-        rejectCommandSds(c, pubsub_err, 1);
-        return C_OK;
-    }
-
-    /* Only allow commands with flag "t", such as INFO, REPLICAOF and so on,
-     * when replica-serve-stale-data is no and we are a replica with a broken
-     * link with primary. */
-    if (server.primary_host && server.repl_state != REPL_STATE_CONNECTED && server.repl_serve_stale_data == 0 &&
-        is_denystale_command) {
-        rejectCommand(c, shared.primarydownerr, 1);
-        return C_OK;
-    }
-
-    /* Loading DB? Return an error if the command has not the
-     * CMD_LOADING flag. */
-    if (server.loading && !server.async_loading && is_denyloading_command) {
-        rejectCommand(c, shared.loadingerr, 1);
-        return C_OK;
-    }
-
-    /* During async-loading, block certain commands. */
-    if (server.async_loading && is_deny_async_loading_command) {
-        rejectCommand(c, shared.loadingerr, 1);
-        return C_OK;
-    }
-
-    /* when a busy job is being done (script / module)
-     * Only allow a limited number of commands.
-     * Note that we need to allow the transactions commands; otherwise, clients
-     * sending a transaction with pipelining without error checking, may have
-     * the MULTI plus a few initial commands refused, then the timeout
-     * condition resolves, and the bottom-half of the transaction gets
-     * executed, see Github PR #7022. */
-    if (isInsideYieldingLongCommand() && !(c->cmd->flags & CMD_ALLOW_BUSY)) {
-        if (server.busy_module_yield_flags && server.busy_module_yield_reply) {
-            sds busy_err = sdscatprintf(sdsempty(), "-BUSY %s", server.busy_module_yield_reply);
-            sdsmapchars(busy_err, "\r\n", "  ", 2);
-            rejectCommandSds(c, busy_err, 1);
-        } else if (server.busy_module_yield_flags) {
-            rejectCommand(c, shared.slowmoduleerr, 1);
-        } else if (scriptIsEval()) {
-            rejectCommand(c, shared.slowevalerr, 1);
-        } else {
-            rejectCommand(c, shared.slowscripterr, 1);
-        }
-        return C_OK;
-    }
-
-    /* Prevent a replica from sending commands that access the keyspace.
-     * The main objective here is to prevent abuse of client pause check
-     * from which replicas are exempt. */
-    if (c->flag.replica && (is_may_replicate_command || is_write_command || is_read_command)) {
-        sds replica_err = sdsnew("Replica can't interact with the keyspace");
-        rejectCommandSds(c, replica_err, 1);
-        return C_OK;
-    }
-
-    /* If the server is paused, block the client until the pause has ended. Replicas and slot
-     * export clients are never paused to allow failover/slot migration to succeed. */
-    if (!c->flag.replica && (!c->slot_migration_job || isImportSlotMigrationJob(c->slot_migration_job)) &&
-        ((isPausedActions(PAUSE_ACTION_CLIENT_ALL)) || ((isPausedActions(PAUSE_ACTION_CLIENT_WRITE)) && is_may_replicate_command))) {
-        blockPostponeClient(c);
-        return C_OK;
-    }
-
-    if (throttle_throttleClientIfNeeded(c)) return C_OK;
-
-    /* Exec the command */
-    if (c->flag.multi && c->cmd->proc != execCommand && c->cmd->proc != discardCommand &&
-        c->cmd->proc != quitCommand &&
-        c->cmd->proc != resetCommand) {
-        queueMultiCommand(c, cmd_flags);
-        addReply(c, shared.queued);
-    } else {
-        int flags = CMD_CALL_FULL;
-        call(c, flags);
-        if (listLength(server.ready_keys) && !isInsideYieldingLongCommand()) handleClientsBlockedOnKeys();
-    }
-    return C_OK;
+    /* rust-io precheck mode ran processCommandChecks() on the IO thread. */
+    if (!prechecked && !processCommandChecks(c, &ctx)) return C_OK;
+    return processCommandExecute(c, &ctx);
 }
 
 /* ====================== Error lookup and execution ===================== */
