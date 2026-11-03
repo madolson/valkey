@@ -50,9 +50,10 @@ pub unsafe extern "C" fn vio_set_limits(proto_max_bulk_len: c_longlong, client_m
 /// Engine thread only (the thread that called vio_start()).
 #[no_mangle]
 pub unsafe extern "C" fn vio_main_flush_kicks() {
-    if GLOBAL.get().is_none() {
+    let Some(g) = GLOBAL.get() else {
         return;
-    }
+    };
+    g.adm.flush_popped();
     MAIN_KICKS.with(|k| {
         MAIN_ARGV.with(|a| {
             let mut k = k.borrow_mut();
@@ -233,7 +234,7 @@ pub unsafe extern "C" fn vio_conn_pop_cmds(h: ConnRef<'_>, out: *mut VioCmd, max
         }
         (n, sh.cmds.len())
     };
-    global().adm.queued_sub(n);
+    global().adm.popped(n);
     if n > 0 && left < CMDS_LOW && conn.read_paused.load(Ordering::Acquire) {
         kick(&conn);
     }
@@ -403,7 +404,7 @@ pub unsafe extern "C" fn vio_conn_close(h: ConnRef<'_>) {
     /* Commands the engine will never pop: free them now instead of when
      * the output drains, so they stop counting against the queued budget. */
     let dropped: Vec<VioCmd> = conn.shared.lock().unwrap().cmds.drain(..).collect();
-    global().adm.queued_sub(dropped.len());
+    global().adm.popped(dropped.len());
     for cmd in dropped {
         if !cmd.argv.is_null() {
             (global().cbs.free_argv)(cmd.argv, cmd.argc);

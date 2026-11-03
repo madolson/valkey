@@ -40,6 +40,10 @@ pub(crate) struct Admission {
     rejected: AtomicUsize,
     /// The listener is out of thread 0's epoll set (unadopted reached NEW_HIGH).
     accept_paused: AtomicBool,
+    /// Commands the engine thread popped since its last flush_popped().
+    /// Engine thread only (plain load and store): a shared atomic RMW per
+    /// pop cost about 4% main-thread ns/request at -P 1.
+    popped: AtomicUsize,
 }
 
 impl Admission {
@@ -51,6 +55,7 @@ impl Admission {
             maxclients: AtomicUsize::new(usize::MAX),
             rejected: AtomicUsize::new(0),
             accept_paused: AtomicBool::new(false),
+            popped: AtomicUsize::new(0),
         }
     }
 
@@ -66,6 +71,22 @@ impl Admission {
 
     pub(crate) fn queued_add(&self, n: usize) {
         self.queued.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Engine thread: `n` commands left Rust. Counted against the budget
+    /// at the next flush_popped(), once per event-loop iteration, so the
+    /// budget overstates the queue by at most one iteration's pops.
+    pub(crate) fn popped(&self, n: usize) {
+        self.popped.store(self.popped.load(Ordering::Relaxed) + n, Ordering::Relaxed);
+    }
+
+    /// Engine thread, with the kicks.
+    pub(crate) fn flush_popped(&self) {
+        let n = self.popped.load(Ordering::Relaxed);
+        if n > 0 {
+            self.popped.store(0, Ordering::Relaxed);
+            self.queued.fetch_sub(n, Ordering::Relaxed);
+        }
     }
 
     pub(crate) fn queued_sub(&self, n: usize) {
