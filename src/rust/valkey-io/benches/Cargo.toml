@@ -1,0 +1,28 @@
+# Micro-benchmarks for valkey-io. A separate crate so criterion never enters
+# the staticlib's dependency graph or lockfile.
+#   cd src/rust/valkey-io/benches && cargo bench
+[package]
+name = "valkey-io-benches"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+valkey-io = { path = "..", features = ["bench"] }
+libc = "0.2"
+criterion = { version = "0.5", default-features = false }
+
+[[bench]]
+name = "resp"
+harness = false
+
+[[bench]]
+name = "handoff"
+harness = false
+
+[[bench]]
+name = "syscalls"
+harness = false
+
+[profile.bench]
+debug = 1
