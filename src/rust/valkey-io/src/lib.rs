@@ -1081,6 +1081,12 @@ pub extern "C" fn vio_conn_pending_cmds(h: *const Conn) -> usize {
     conn_ref(h).shared.lock().unwrap().cmds.len()
 }
 
+/// Bytes accepted from the engine and not yet written to the socket.
+#[no_mangle]
+pub extern "C" fn vio_conn_pending_out(h: *const Conn) -> usize {
+    conn_ref(h).out_bytes.load(Ordering::Acquire)
+}
+
 /// Copy engine output into the connection's outbound buffer and wake its
 /// IO thread. Returns bytes accepted, or -1 with errno EAGAIN (buffer full,
 /// engine keeps the rest and installs its write handler) or EPIPE.

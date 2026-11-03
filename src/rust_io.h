@@ -46,6 +46,8 @@ void rustIoLogReady(void);
 void rustIoPublishGlobals(void);
 int rustIoBeforePoll(int sleeping);
 void rustIoAfterPoll(void);
+/* Wait up to timeout_ms for Rust to write what replicas were handed. */
+void rustIoFlushReplicas(long long timeout_ms);
 
 #include "rust_io_precheck.h"
 /* Exec mode (src/rust_io_exec.c). */
