@@ -1,0 +1,17 @@
+# Rust_io_timing
+rust_io_timing_sample_n:64
+rust_io_timing_dropped:0
+rust_io_timing_evicted:0
+rust_io_timing_queued:0
+rust_io_timing_replied:0
+stage_parsed:count=0,p50=0,p90=0,p99=0,max=0
+stage_argv:count=0,p50=0,p90=0,p99=0,max=0
+stage_precheck:count=0,p50=0,p90=0,p99=0,max=0
+stage_enqueued:count=0,p50=0,p90=0,p99=0,max=0
+stage_dequeued:count=0,p50=0,p90=0,p99=0,max=0
+stage_process_entry:count=0,p50=0,p90=0,p99=0,max=0
+stage_call_entry:count=0,p50=0,p90=0,p99=0,max=0
+stage_call_exit:count=0,p50=0,p90=0,p99=0,max=0
+stage_reply_copied:count=0,p50=0,p90=0,p99=0,max=0
+stage_written:count=0,p50=0,p90=0,p99=0,max=0
+stage_end_to_end:count=0,p50=0,p90=0,p99=0,max=0
