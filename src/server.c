@@ -5387,6 +5387,9 @@ int finishShutdown(void) {
     /* Best effort flush of replica output buffers, so that we hopefully
      * send them pending writes. */
     flushReplicasOutputBuffers();
+#ifdef USE_RUST_IO
+    rustIoFlushReplicas(1000);
+#endif
 
     /* Close the listening sockets. Apparently this allows faster restarts. */
     closeListeningSockets(1);

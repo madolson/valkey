@@ -651,6 +651,29 @@ void rustIoAfterPoll(void) {
     if (vio_main_after_poll()) rustIoDrainReady();
 }
 
+/* Shutdown: flushReplicasOutputBuffers() only hands replica output to Rust,
+ * whose IO threads die with the process. Give them a bounded chance to
+ * write it, so the last commands (e.g. the auto failover request) reach the
+ * replicas as they would from a socket write. */
+void rustIoFlushReplicas(long long timeout_ms) {
+    if (!rust_started) return;
+    long long deadline = mstime() + timeout_ms;
+    while (mstime() < deadline) {
+        size_t pending = 0;
+        listIter li;
+        listNode *ln;
+        listRewind(server.replicas, &li);
+        while ((ln = listNext(&li))) {
+            client *r = listNodeValue(ln);
+            if (!r->conn || !connIsRust(r->conn)) continue;
+            rustConnection *rc = (rustConnection *)r->conn;
+            if (rc->h) pending += vio_conn_pending_out(rc->h);
+        }
+        if (pending == 0) return;
+        usleep(1000);
+    }
+}
+
 void rustIoLogReady(void) {
     if (rust_started) serverLog(LL_NOTICE, "Ready to accept connections rust");
 }
