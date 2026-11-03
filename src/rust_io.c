@@ -659,6 +659,10 @@ void rustIoAfterPoll(void) {
  * replicas as they would from a socket write. */
 void rustIoFlushReplicas(long long timeout_ms) {
     if (!rust_started) return;
+    /* The writes were kicked from the main thread, which hands kicks to the
+     * IO threads only at the end of beforeSleep(); no beforeSleep() runs
+     * again before exit. */
+    vio_main_flush_kicks();
     long long deadline = mstime() + timeout_ms;
     while (mstime() < deadline) {
         size_t pending = 0;
