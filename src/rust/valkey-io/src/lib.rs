@@ -147,6 +147,8 @@ pub struct Conn {
     parse_held: AtomicBool,
     /// Bytes accepted from the engine and not yet written to the socket.
     out_bytes: AtomicUsize,
+    /// vio_conn_shutdown() was called: shutdown(2) before close(2).
+    shutdown_wanted: AtomicBool,
     shared: Mutex<Shared>,
     /// Engine session mirror (precheck mode).
     session: precheck::SessionCell,
@@ -163,7 +165,12 @@ impl Drop for Conn {
                 (g.cbs.free_argv)(cmd.argv, cmd.argc);
             }
         }
-        unsafe { libc::close(self.fd) };
+        unsafe {
+            if self.shutdown_wanted.load(Ordering::Acquire) {
+                libc::shutdown(self.fd, libc::SHUT_RDWR);
+            }
+            libc::close(self.fd)
+        };
     }
 }
 
@@ -421,6 +428,7 @@ impl Worker {
             auth_required: AtomicBool::new(DEFAULT_AUTH_REQUIRED.load(Ordering::Relaxed)),
             parse_held: AtomicBool::new(false),
             out_bytes: AtomicUsize::new(0),
+            shutdown_wanted: AtomicBool::new(false),
             shared: Mutex::new(Shared { cmds: VecDeque::new(), out: Vec::new() }),
             session: precheck::SessionCell::new(),
         });
@@ -1337,5 +1345,10 @@ pub extern "C" fn vio_wake_main() {
 
 #[no_mangle]
 pub extern "C" fn vio_conn_shutdown(h: *const Conn) {
-    unsafe { libc::shutdown(conn_ref(h).fd, libc::SHUT_RDWR) };
+    /* freeClient() calls this while a fork child holds a copy of the fd,
+     * then connClose(). A socket write would already be in the kernel, but
+     * the output handed to Rust is not: shutting down now discarded it
+     * (CLIENT KILL SKIPME no lost its own reply during BGSAVE). Shut down
+     * when the IO thread closes the fd, after the output drained. */
+    conn_ref(h).shutdown_wanted.store(true, Ordering::Release);
 }
