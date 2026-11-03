@@ -54,6 +54,7 @@ start_cluster 2 2 {tags {external:skip cluster}} {
         assert_match "*@$base_bus_port *" [R 0 CLUSTER NODES]
     }
 
+    tags {needs:c-transport} {
     test "Test change port and tls-port on runtime" {
         if {$::tls} {
             set baseport [lindex [R 0 config get tls-port] 1]
@@ -91,5 +92,6 @@ start_cluster 2 2 {tags {external:skip cluster}} {
         } else {
             R 0 config set port $baseport
         }
-    } {} {needs:c-transport}
+    }
+    } ;# needs:c-transport
 }

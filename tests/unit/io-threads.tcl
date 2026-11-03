@@ -61,6 +61,7 @@ proc activate_io_threads_and_wait {} {
 start_server {config "minimal.conf" tags {"external:skip" "valgrind:skip"} overrides {enable-debug-command {yes} io-threads 5}} {
     # Skip if non io-threads mode - as it is relevant only for io-threads mode
     assert_equal {io-threads 5} [r config get io-threads]
+    tags {needs:c-transport} {
     test {Force the use of IO threads and assert active IO thread usage} {
         # Ensure all configured IO threads activate on any event, bypassing CPU-based ignition thresholds.
         r config set io-threads-always-active yes
@@ -136,7 +137,8 @@ start_server {config "minimal.conf" tags {"external:skip" "valgrind:skip"} overr
             set used_active_time [getInfoProperty $info used_active_time_io_thread_$i]
             assert {($used_active_time - $pre_sleep_active_times($i)) < ($elapsed_sec - $sleep_time_ms/1000.0)}
         }
-    } {} {needs:c-transport}
+    }
+    } ;# needs:c-transport
 }
 
 start_server {config "minimal.conf" tags {"external:skip" "valgrind:skip"} overrides {io-threads 5}} {

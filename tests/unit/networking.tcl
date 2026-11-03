@@ -137,6 +137,7 @@ start_server {config "minimal.conf" tags {"external:skip"}} {
         r ping
     } {PONG} {needs:c-transport}
 
+    tags {needs:c-transport} {
     test {Protected mode works as expected} {
         # Get a non-loopback address of this instance for this test.
         set myaddr [get_nonloopback_addr]
@@ -174,7 +175,8 @@ start_server {config "minimal.conf" tags {"external:skip"}} {
             assert_equal {PONG} [$r2 ping]
             $r2 close
         }
-    } {} {needs:c-transport}
+    }
+    } ;# needs:c-transport
 }
 
 start_server {config "minimal.conf" tags {"external:skip"} overrides {enable-debug-command {yes}}} {

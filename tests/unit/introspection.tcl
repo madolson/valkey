@@ -1521,6 +1521,7 @@ start_server {tags {"introspection"}} {
         assert_equal [r config set maxmemory $mm_backup] "OK"
     }
 
+    tags {needs:c-transport} {
     test {CONFIG SET rollback on apply error} {
         # This test tries to configure a used port number in the server. This is expected
         # to pass the `CONFIG SET` validity checking implementation but fail on
@@ -1580,7 +1581,8 @@ start_server {tags {"introspection"}} {
         set r1 [valkey_client]
         assert_equal [$r1 ping] "PONG"
         $r1 close
-    } {} {needs:c-transport}
+    }
+    } ;# needs:c-transport
 
     test {CONFIG SET duplicate configs} {
         assert_error "ERR *duplicate*" {r config set maxmemory 10000001 maxmemory 10000002}
