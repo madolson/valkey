@@ -164,3 +164,37 @@ Stage timer "reply_copied" (handed to Rust) at 64 B, precheck-t3 P16, RUST_IO_TI
 | precheck-t3 SET | 549.3 (-4.7%\*) | +5.1%\* | -3.5%\* |
 
 Micro-benchmarks (criterion, same host, base commit vs HEAD): every bench within ±2.5% except `syscall/tcp_loopback_write_read_64B` (-4.9%, kernel path). See `~/rust-io/iter1/report.md`.
+
+# Iteration 2 (stage 6c, branch rust-io/iter2)
+
+Base: `rust-io/iter1` a0d9c428b + `rust-io/bench` (refined threshold, full
+baseline) + `rust-io/harden` (merged by intent, below). Same host, same
+harness and core layout as iteration 1 (server 0-3, client 4-7), same noise
+file (`~/rust-io/iter1/m/noise.csv`). Per-step quick profile: the four Rust
+configs only (the C cells do not run changed code), against the previous
+step. Raw data: `~/rust-io/iter2/m/`, gates `~/rust-io/iter2/gates/<label>/`,
+profiles `~/rust-io/iter2/prof/`, stage timers `~/rust-io/iter2/m/timing-<label>/`.
+Predictions were written to `~/rust-io/iter2/notes.md` before each run.
+
+Metrics columns as in iteration 1, but counted by one script
+(`~/rust-io/iter2/metrics.sh`) for every row, so they differ from
+iteration 1's hand counts: exports = all `#[no_mangle]` fns minus the 7
+timing ones; unsafe = `unsafe` tokens outside `ffi/`/`sys.rs` (the 1 is the
+crate's `#![deny(unsafe_code)]` line); bridge = `rust_io.c` +
+`rust_io_precheck.c` + `engine_io.c`. By the same script, iteration 1's end
+(a0d9c428b) is exports 27, cb 7, ops 7, structs 3, unsafe 1, statics 13,
+ifdef 6, bridge 1055; integrate is exports 28, cb 5 (+34 exec ops),
+structs 4, unsafe 42, statics 11, ifdef 7, bridge 1474.
+
+| Step | Commit | Change | exports | cb | statics | bridge | Perf vs previous (key cells) | Gates | Verdict |
+|---|---|---|---|---|---|---|---|---|---|
+| A merge | 0736e616c | `rust-io/harden` merged by intent: compat picks kept once, rtc/exec fixes dropped, step 13's deferred shutdown kept (harden's shutdown-in-Drop dropped), admission control ported to `admission.rs` and held in `Global` (no new statics), iter1's stricter clippy kept | 29 | 7 | 13 | 1058 | vs iter1 end (`quick-head2`): -P 16 all Rust cells within noise (main ns -4.4% to +3.0%); -P 1 Rust main ns +3% to +5% everywhere (precheck-t1 SET +4.9%\*, precheck-t3 SET +5.1%\*) | all pass, only the known failures; unit/qos 16/0 and unit/limits 1/0 in io and precheck; overload soak below | FIXED (next row) |
+| A fixup | e610e558a | the engine thread counts pops in a counter only it writes and subtracts them from the shared budget once per iteration | 29 | 7 | 13 | 1058 | -P 1 vs merge: main ns -1.6% to -6.2% (io-t1 SET -6.2%\*, precheck-t1 GET -4.8%\*); vs iter1 end every -P 1 cell within noise (-5.2% to +3.7%) | (code path covered by the s1 gates) | KEEP |
+| C1 (plan 16) | 88b5b69b9 | session view: single-writer seqlock written only on change, `consumed` atomic, `vio_conn_publish()` replaces `vio_conn_set_auth_required()` + per-delivery `vio_conn_set_session()` | 29 | 7 | 13 | 1072 | predicted -1% to -3% main ns at -P 1 t3: first run precheck-t3 GET -1.8%, SET -1.7% (inside the prediction, below noise), but a rerun of the same cells gave 2152 vs 1746 ns for the same binary, so these client-bound cells cannot resolve it; -P 16 within noise (precheck-t3 GET 393 ns, -1.9%) | all pass; hazards barrier fallbacks 13 (iter1: 13), no_session 4 (iter1: 5) | KEEP (effect below resolution) |
+| B (plan 11) | b9b2cc0b5 | `handoff.rs`: `Waker` + `Mailbox` replace the IO-inbox and main-ready Dekker copies; protocol unit tests under Miri | 29 | 7 | 13 | 1072 | predicted neutral: -P 16 within noise (main ns -2.4% to +1.6%); -P 1 t3 cells +10%/+19% in the first run, a rerun gave -1.7%/+16.7% for SET only and the c1 rerun itself moved 23%: noise of those cells. cs.sh t1 -P 16 (3 runs each): main 2034/2897/2043 vs 2977/2035/2055 voluntary switches, rust-io-0 96/19/97 vs 0/108/115 | all pass; stall.py 600 s precheck: `stalls 0`, max burst latency 0.102 s | KEEP |
+| B (plan 14) | db4bf6a84 | `engine_io.{h,c}`: `engineSubmit()` fills `cmd_queue`/`parsedCommand` (VioCmd = `engineCmd`, static_assert), `engineAccountRead()` | 29 | 7 | 13 | 1098 | predicted neutral: -P 16 main ns -2.2% to +2.2%, RPS within noise | all pass | KEEP (partial: deliver and stall stay in rust_io.c) |
+| C2 (plan 17) | fb8a89752 | one `create_argvs` and one `precheck_batch` crossing per parsed batch; snapshot pinned once per poll iteration | 29 | 7 | 13 | 1117 | first version: precheck-t1 GET -P 16 RPS -4.3%\*, io-t3 IO CPU +9% to +20%\*; IO-thread profile showed `_int_malloc`+`_int_free`+`malloc` 3.7% (three Vecs grown per batch) | (fixup) | FIXED |
+| C2 fixup | eb888ed0d | batch buffers are Worker fields | 29 | 7 | 13 | 1117 | predicted IO CPU/request -1% to -5% where the IO thread is the limit: two back-to-back reruns, precheck-t1 -P 16 RPS GET +0.9%, SET +2.3% (IO thread at 100%), i.e. -1% to -2% IO CPU per request. Main-bound t3 cells: main ns +0.5% to +3.5% in reruns (below the 4.8% threshold); main-thread profiles of io-t3 show no new frame (io mode runs none of the changed code on main) | all pass (Tcl rerun after a gate-harness error, see deviations) | KEEP |
+| C3 (plan 20) | dc0537dad, fixup 3a26b934c | adaptive 2-20 us spin on IO threads, awake check on by default | | | | | first version live-locked (rust-io-0 at 100%, a -P 1 benchmark hung: the spin returned for an inbox whose eventfd write only TOK_WAKE drains), fixed in 3a26b934c. Then, predicted t1 -P 16 RPS within 3% and -P 1 main -11% to -16%: quick io/precheck-t1 -P 16 RPS -30% to -38%\*; sweep on 8 server cores (GET) t1 -28%, t2 -22%, t3 -11%, t6 +0.7% RPS at -P 16; -P 1 main ns -8% to -18% as predicted but p99 +11% to +16%. cs.sh t1 -P 16: rust-io-0 and main both block 814 times per 3 s with `VIO_SPIN_US` 0, 20 and 200 alike | | REVERTED (8da21ddac) |
+| C4 (plan 21) | c7d34a90f | ready connections' commands go through the memory_prefetch batch (the C IO threads' scheme), tails run by client id after the batch; resumable from a nested drain | 29 | 7 | 13 | 1186 | bound first (C io4, `-r 10000000`, prefetch on vs `prefetch-batch-max-size 0`): -P 1 main ns -0.8%/-1.1%, so no prefetch gain at -P 1 for C; -P 16 +44%/+28% without it. Rust, 8 server cores: -P 1 main ns -4.5% to -11.8% (t3, t6, r1M and r10M); -P 16 GET RPS -3.7% to -8.8%\* | all pass incl. scriptkill io/precheck | FIXED (next row) |
+| C4 fixup | 43538efc4 | only queues of <= 2 commands go into the batch (a pipelined queue is prefetched per client by processInputBuffer()) | 29 | 7 | 13 | ~1190 | vs C2 fixup, r1M: -P 1 main ns -10.3% (t3 GET and SET), -7.5%/-7.4% (t6); -P 16 within noise except precheck-t3 SET RPS -2.7%\* (threshold 2.5%) | final gates (below) | KEEP |

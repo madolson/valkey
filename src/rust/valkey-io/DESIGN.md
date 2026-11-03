@@ -1113,3 +1113,88 @@ not to the connection.
   precheck runs off-thread; `processCommandExecute()` holds the live-state
   gates and `call()`. The precheck fast path skips the first call instead of
   jumping to a label.
+
+# Iteration 2 (stage 6c): the API as it now stands
+
+Exec mode is gone (iteration 1), so the stage 5a sections on rtc
+("beforeSleep() under rtc", "Shutdown and engine-lock fairness (rtc)") are
+history; their fixes were not merged. Admission control and the deferred
+shutdown are current (below).
+
+## Rust symbols the engine calls (`include/valkey_io.h`, cbindgen)
+
+- Startup and config: `vio_start`, `vio_set_limits`, `vio_set_maxclients`,
+  `vio_set_default_auth_required`.
+- Engine-thread drain: `vio_main_begin_drain`, `vio_main_next_ready`,
+  `vio_main_next_done`, `vio_main_has_ready`, `vio_main_before_poll`,
+  `vio_main_after_poll`, `vio_main_flush_kicks`, `vio_take_rejected`.
+- Per connection (`VioConnRef` borrowed, `VioConnHandle` owned):
+  `retain`/`release`, `take_events`, `udata`/`set_udata`, `fd`,
+  `pop_cmds`, `pending_cmds`, `pending_out`, `writev` (copy path),
+  `submit_write` (zero-copy job), `return_argv`, `want_writable`,
+  `publish` (consumed count and auth limits, after a delivery, only when
+  either changed), `set_session` (precheck session view, only when a field
+  changed), `close`, `shutdown` (deferred until the output drains).
+- 29 exports plus 7 under `RUST_IO_TIMING`.
+
+## Engine callbacks Rust calls on IO threads (`VioCallbacks`)
+
+`create_argvs` (all commands of one parsed batch), `free_argv`,
+`write_job` (zero-copy), and in precheck mode `precheck_begin`/`precheck_end`
+(pin the policy snapshot once per IO-thread poll iteration) and
+`precheck_batch` (one parsed batch; returns its last session barrier).
+Before iteration 2 every command crossed twice (`create_argv`,
+`precheck_cmd`) and every readable connection pinned the snapshot.
+
+## Engine side (C)
+
+- `connection_external.c`: the "external" connection type; `rust_io.c`
+  registers its ops.
+- `engine_io.{h,c}`: `engineSubmit()` is the only writer of a client's
+  `cmd_queue` for an external connection. `engineCmd` is the layout the IO
+  layer's `VioCmd` must have (static_assert in `rust_io.c`).
+- `rust_io.c`: the bridge. Delivery runs ready connections' commands through
+  the key-prefetch batch when their queue is shallow (step 21, below).
+
+## Session view (step 16)
+
+One `SessionView` per connection: the fields the precheck reads (user,
+generation, flags, db) are a single-writer seqlock the engine writes only
+when one changes; `consumed` (commands the engine popped) is an atomic
+stored with Release after the pop and loaded with Acquire by the IO thread,
+which is what lifts a session barrier. The engine keeps its own last-written
+copy (`rustConnection.sess`) for token validation and change detection;
+that copy is the writer's, not a mirror. `Conn.auth_required` and
+`DEFAULT_AUTH_REQUIRED` stay: they set parser limits in io mode too and
+carry the parse_held kick.
+
+## Wakeups (step 11)
+
+`handoff.rs`: one `Waker` (eventfd, `pending`, `sleeping`, `signaled`) and
+`Mailbox<B>` (mutex-guarded queue plus waker). IO-thread inboxes and the
+engine's ready list are both mailboxes. Protocol and its unit tests (Miri)
+are in the module. The IO-thread awake check stays off by default
+(`VIO_HANDOFF_DISABLE` 2): step 20 (spin + awake check) was measured and
+reverted; with one to three IO threads at -P 16 the engine and IO threads
+fall into lock step once per client round (ITERATIONS.md).
+
+## Cross-connection prefetch (step 21)
+
+`rustIoDrainReady()` pulls each ready connection's commands, and when the
+queue holds one or two commands adds the client to the `memory_prefetch`
+batch (`addCommandToBatchAndProcessIfFull()`), as the C IO threads do in
+`processClientIOReadsDone()`. After the drain (or every 128 batched
+clients), `processClientsCommandsBatch()` prefetches and runs them, then
+the per-client tail (protocol error, queue trim, publish) runs by client
+id. A drain nested in `processEventsWhileBlocked()` first runs what is left
+of the outer batch, the same rule C uses, so a SCRIPT KILL from a client
+in that batch is reached (scriptkill.py). Deeper queues keep the immediate
+path, where `processInputBuffer()` prefetches the client's own queue.
+
+## Admission control (stage 5a, ported)
+
+Unchanged semantics (stage 5a section above), now in `admission.rs` and held
+in `Global` instead of six statics. One change: the engine thread no longer
+does a shared atomic RMW per pop; it counts pops in a counter only it writes
+and subtracts them in `vio_main_flush_kicks()` (that RMW cost about 4%
+main-thread ns/request at -P 1).
