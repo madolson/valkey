@@ -293,6 +293,11 @@ static pthread_t rtc_real_main;
 static void rtcTakeEngine(void) {
     server.main_thread_id = pthread_self();
     updateCachedTime(0);
+    /* As afterSleep() does: processCommand() checks expiry before call()
+     * takes its own snapshot (getNodeByQuery() missed an expired key in a
+     * migrating slot and served it as missing instead of -ASK). The lock is
+     * never taken here while a command yields, so no call() is in flight. */
+    server.cmd_time_snapshot = server.mstime;
 }
 
 static int rtcTryLock(void) {
