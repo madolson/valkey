@@ -26,7 +26,7 @@
 void trimCommandQueue(client *c);
 int _writeToClient(client *c);
 
-rustIoConfig rust_io_config = {RUST_IO_MODE_OFF, 0, 1, 0, -1};
+rustIoConfig rust_io_config = {RUST_IO_MODE_OFF, 0, 1, 0, 2048};
 int rust_io_precheck_active = 0;
 
 configEnum rust_io_mode_enum[] = {

@@ -913,7 +913,15 @@ Rules, each inherited from the C IO threads rather than re-invented:
 Threshold. `rust-io-zero-copy-min-bytes` (modifiable): a write is offloaded
 when the reply list is non-empty, `c->buf` holds bulk-string references, or
 `c->bufpos` is at least the threshold. -1 always copies (step 22's
-behaviour). The default is chosen from the size sweep (ITERATIONS.md).
+behaviour). Default 2048, chosen from the sweep (ITERATIONS.md "Reply-size
+sweep"): the job costs a fixed round trip per write (about +5% to +18%
+main-thread ns per request for 64-1024 B replies at -P 1, where the main
+thread is about 50% idle), and breaks even at about 1.2 KB per write (64 B
+x 16 pipelined: -0.5% to +0.8%); above that it only wins (1 KB x 16: -6%
+main ns, +6.6% RPS at 3 IO threads; 16 KB x 16: -79% main ns, +50% RPS).
+The threshold applies to the bytes of one write, so one 64 B reply is
+copied and 16 pipelined 128 B replies are not. Strings of 16 KiB and more
+are referenced, never copied, so they always take the job.
 
 Scope. Replica, primary and slot-migration connections stay on the copy
 path (`getClientType()` check in `rustIoTrySendWrite()`): their output is
