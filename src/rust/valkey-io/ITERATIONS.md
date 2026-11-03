@@ -215,3 +215,31 @@ citations: `~/rust-io/iter2/report.md`; data `~/rust-io/iter2fin/`.
   20 -> 39 ns).
 - Zero-copy (T=4, -P 16, GET): main ns/req 2200 -> 371 (16 KB) and
   20284 -> 511 (200 KB); RPS +2% / +10%, IO-thread bound.
+
+# Iteration 3b (stage 7b): engine features over external connections
+
+Branch `rust-io/iter3b` on iter2 `300a1c03a`. Design: DESIGN.md
+"Iteration 3b". Report with pasted results: `~/rust-io/iter3b/report.md`
+on the stage 7b host.
+
+| Commit | Feature | Target tests, io and precheck with takeover (before: iter2) |
+|---|---|---|
+| af6e1e199 | slot import over cmd_queue (B2 refusal removed) | unit/cluster/cluster-migrateslots 123/0 (iter2 io: 9/53 and aborted), unit/cluster/cli 40/0, unit/cluster/socket-prioritization 5/0; ASAN io and precheck 123/0, no sanitizer report |
+| 30d70cbda | detached connections: fork-child and synchronous IO | integration/dual-channel-replication 43/0, unit/auth 16/0, unit/scripting 670/0 (debugger tests included), integration/replication 95/0 and replication-psync 90/0 (no 40-minute cap) |
+| 466bdba26 | client memory and query buffer accounting | unit/client-eviction 18/1, unit/maxmemory 30/0, unit/querybuf 3/0, unit/protocol 37/0 |
+| 9c739c136 | protocol-error log line with the query buffer sample | integration/logging 10/0 |
+| 2f0840970 | priority connections | unit/socket-prioritization 8/0 |
+| 1ca6807e7 | slot import stream pulled in PROTO_IOBUF_LEN rounds | fixes "Evictions on a full import target are replicated" (OOM, 3 of 3 runs after 466bdba26) |
+
+Full default suite (174 files, per file `--single`, as stage 5a), io /
+precheck: 6110 / 6102 pass, 14 / 14 fail, 0 RUST-IO-BUG. Remaining:
+config-set-bind 6 and config-set-port 1 (intended), c-io-threads 2,
+rust-held-output-not-in-cob 4 (stage 7a), and client-eviction "BLPOP +
+maxmemory-clients: successor eviction during ready-key reexec"
+(TRANSPORT-ASSUMPTION: the test measures tot-mem while the IO thread is
+still handing output to the kernel; 4.87 MB after its fill loop, 1.94 MB
+once blocked).
+
+Perf, precheck-t3, GET/SET -P 16 -c 200 -d 64, 3 reps x 2 rounds,
+iter2 HEAD vs 1ca6807e7: GET RPS -1.8%, main ns/req +1.7%; SET RPS +1.4%,
+main ns/req -1.4%.
