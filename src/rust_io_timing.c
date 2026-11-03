@@ -23,6 +23,18 @@ typedef struct {
 } ritEntry;
 
 int rit_nq = 0, rit_nr = 0;
+uint64_t rit_fa_ticks = 0, rit_fa_n = 0;
+static uint64_t rit_fa_tsc0 = 0, rit_fa_ns0 = 0;
+
+uint64_t ritTicks(void) {
+    return __builtin_ia32_rdtsc();
+}
+
+static uint64_t ritMonoNs(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
 client *rit_cur_c = NULL;
 static ritEntry rit_q[RIT_MAX], rit_r[RIT_MAX], rit_cur;
 static int rit_cur_depth = -1; /* server.in_call at call() entry; -1 before */
@@ -109,6 +121,10 @@ sds ritCatInfo(sds info) {
                         "rust_io_timing_queued:%d\r\n"
                         "rust_io_timing_replied:%d\r\n",
                         vio_timing_sample_n(), (unsigned long long)vio_timing_dropped(), rit_evicted, rit_nq, rit_nr);
+    if (!rit_fa_tsc0) rit_fa_tsc0 = ritTicks(), rit_fa_ns0 = ritMonoNs();
+    double ns_per_tick = (double)(ritMonoNs() - rit_fa_ns0) / (double)(ritTicks() - rit_fa_tsc0 + 1);
+    info = sdscatprintf(info, "free_argv_calls:%llu\r\nfree_argv_ns_per_call:%.1f\r\n", (unsigned long long)rit_fa_n,
+                        rit_fa_n ? (double)rit_fa_ticks * ns_per_tick / (double)rit_fa_n : 0.0);
     /* Stage k = stamp k minus the latest earlier stamp present. */
     for (unsigned k = 1; k < sizeof(rit_names) / sizeof(rit_names[0]); k++) {
         VioTimingStat s;
@@ -122,6 +138,9 @@ sds ritCatInfo(sds info) {
 
 void ritReset(void) {
     vio_timing_reset();
+    rit_fa_ticks = rit_fa_n = 0;
+    rit_fa_tsc0 = ritTicks();
+    rit_fa_ns0 = ritMonoNs();
     rit_evicted = 0;
 }
 #endif

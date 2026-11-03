@@ -23,6 +23,9 @@ void ritProcess(struct client *c);
 void ritCall(struct client *c, int stage);
 void ritWritev(struct connection *conn);
 sds ritCatInfo(sds info);
+/* Main-thread time in freeClientArgv(), every call (not sampled). */
+extern uint64_t rit_fa_ticks, rit_fa_n;
+uint64_t ritTicks(void);
 void ritReset(void);
 
 /* Each hook costs one load and compare when the command is not sampled. */
@@ -38,7 +41,15 @@ void ritReset(void);
     do {                                     \
         if (rit_nr) ritWritev((conn));       \
     } while (0)
+#define RUST_IO_TIMING_FREE_ARGV_BEGIN() uint64_t rit_fa0 = ritTicks()
+#define RUST_IO_TIMING_FREE_ARGV_END()        \
+    do {                                      \
+        rit_fa_ticks += ritTicks() - rit_fa0; \
+        rit_fa_n++;                           \
+    } while (0)
 #else
+#define RUST_IO_TIMING_FREE_ARGV_BEGIN() ((void)0)
+#define RUST_IO_TIMING_FREE_ARGV_END() ((void)0)
 #define RUST_IO_TIMING_HOOK(c, stage) ((void)0)
 #define RUST_IO_TIMING_WRITEV(conn) ((void)0)
 #endif
