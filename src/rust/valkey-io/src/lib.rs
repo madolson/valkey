@@ -9,6 +9,7 @@
 #![deny(unsafe_code, unsafe_op_in_unsafe_fn)]
 
 mod admission;
+mod conn_state;
 mod ffi;
 mod handoff;
 pub mod precheck;
@@ -19,6 +20,7 @@ pub mod timing;
 #[cfg(feature = "bench")]
 pub mod benchapi;
 
+use conn_state::{Event, C_CLOSED, FX_NOTIFY_CLOSED, FX_POST_KICK, FX_PUSH_READY, FX_REMOVE, FX_SHUTDOWN, HALF_CLOSE, PEER_CLOSED};
 use resp::{Arg, Limits, Outcome, Parser};
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -123,19 +125,15 @@ pub struct Conn {
     token: AtomicUsize,
     /// Engine connection pointer. Main thread only.
     udata: AtomicPtr<c_void>,
-    in_ready: AtomicBool,
-    kicked: AtomicBool,
+    /// Lifecycle flags (conn_state.rs): kicked, in_ready, engine closed,
+    /// peer closed, shutdown pending.
+    state: conn_state::ConnState,
     events: AtomicU32,
-    c_closed: AtomicBool,
-    peer_closed: AtomicBool,
     want_writable: AtomicBool,
     read_paused: AtomicBool,
     auth_required: AtomicBool,
     /// Unparsed input held until the engine republishes auth_required.
     parse_held: AtomicBool,
-    /// The engine asked for shutdown(2) (a fork child shares the fd): done
-    /// by the IO thread once the output accepted before it is written.
-    half_close: AtomicBool,
     /// Bytes accepted from the engine and not yet written to the socket.
     out_bytes: AtomicUsize,
     /// `shared.cmds.len()`, stored under the lock by whoever changed it, so
@@ -299,9 +297,27 @@ const HD_MAIN_AWAKE: u32 = 4;
 /// resume reading, finish a close). Coalesced: one inbox entry per conn
 /// until the IO thread picks it up, one eventfd write per wakeup.
 fn kick(rt: &Runtime, conn: &Arc<Conn>) {
-    if conn.kicked.swap(true, Ordering::AcqRel) {
-        return;
+    if conn.state.apply(Event::Kick) & FX_POST_KICK != 0 {
+        post_kick(rt, conn);
     }
+}
+
+/// vio_conn_close(): released by the IO thread once the output is written
+/// or the peer is gone.
+fn close_conn(rt: &Runtime, conn: &Arc<Conn>) {
+    if conn.state.apply(Event::EngineClose) & FX_POST_KICK != 0 {
+        post_kick(rt, conn);
+    }
+}
+
+/// vio_conn_shutdown(): shutdown(2) deferred until the output is written.
+fn shutdown_conn(rt: &Runtime, conn: &Arc<Conn>) {
+    if conn.state.apply(Event::EngineShutdown) & FX_POST_KICK != 0 {
+        post_kick(rt, conn);
+    }
+}
+
+fn post_kick(rt: &Runtime, conn: &Arc<Conn>) {
     let g = rt.g;
     /* Main thread: collect, and hand each IO thread its kicks in one inbox
      * append and at most one eventfd write at the end of beforeSleep()
@@ -446,7 +462,7 @@ impl Worker {
         if ev != 0 {
             conn.events.fetch_or(ev, Ordering::AcqRel);
         }
-        if !conn.in_ready.swap(true, Ordering::AcqRel) {
+        if conn.state.apply(Event::Notify) & FX_PUSH_READY != 0 {
             self.to_notify.push(conn.clone());
         }
     }
@@ -476,7 +492,7 @@ impl Worker {
         if job == 0 {
             return;
         }
-        let can = !l.conn.peer_closed.load(Ordering::Acquire) && l.woff == l.wbuf.len();
+        let can = !l.conn.state.has(PEER_CLOSED) && l.woff == l.wbuf.len();
         let r = (self.g.cbs.write_job.expect("write_job"))(job as *mut c_void, l.conn.fd, can as c_int);
         #[cfg(feature = "timing")]
         if l.woff == l.wbuf.len() {
@@ -487,7 +503,7 @@ impl Worker {
         }
         /* Would block, or copied bytes still wait for the socket: report
          * VIO_EV_WRITABLE only after EPOLLOUT. */
-        if (can && r == 0) || (!can && !l.conn.peer_closed.load(Ordering::Acquire)) {
+        if (can && r == 0) || (!can && !l.conn.state.has(PEER_CLOSED)) {
             l.sock_blocked = true;
         }
         self.done.push(job);
@@ -500,16 +516,12 @@ impl Worker {
             thread: self.idx,
             token: AtomicUsize::new(0),
             udata: AtomicPtr::new(std::ptr::null_mut()),
-            in_ready: AtomicBool::new(false),
-            kicked: AtomicBool::new(false),
+            state: conn_state::ConnState::new(),
             events: AtomicU32::new(0),
-            c_closed: AtomicBool::new(false),
-            peer_closed: AtomicBool::new(false),
             want_writable: AtomicBool::new(false),
             read_paused: AtomicBool::new(false),
             auth_required: AtomicBool::new(self.g.default_auth_required.load(Ordering::Relaxed)),
             parse_held: AtomicBool::new(false),
-            half_close: AtomicBool::new(false),
             ncmds: AtomicUsize::new(0),
             out_bytes: AtomicUsize::new(0),
             job: AtomicUsize::new(0),
@@ -563,7 +575,7 @@ impl Worker {
         }
         let c = &l.conn;
         let mut want = 0u32;
-        if !c.read_paused.load(Ordering::Acquire) && !c.c_closed.load(Ordering::Acquire) && !l.proto_err {
+        if !c.read_paused.load(Ordering::Acquire) && !c.state.has(C_CLOSED) && !l.proto_err {
             want |= libc::EPOLLIN as u32;
         }
         if l.woff < l.wbuf.len() || l.sock_blocked {
@@ -588,11 +600,11 @@ impl Worker {
             }
             l.conn.clone()
         };
-        conn.peer_closed.store(true, Ordering::Release);
+        let fx = conn.state.apply(Event::PeerClosed);
         self.run_job(idx);
-        if conn.c_closed.load(Ordering::Acquire) {
+        if fx & FX_REMOVE != 0 {
             self.remove(idx);
-        } else {
+        } else if fx & FX_NOTIFY_CLOSED != 0 {
             self.notify(&conn, VIO_EV_CLOSED);
         }
     }
@@ -604,7 +616,7 @@ impl Worker {
             None => return,
         };
         let conn = l.conn.clone();
-        if conn.c_closed.load(Ordering::Acquire) || l.proto_err {
+        if conn.state.has(C_CLOSED) || l.proto_err {
             return;
         }
 
@@ -659,7 +671,7 @@ impl Worker {
             None => return,
         };
         let conn = l.conn.clone();
-        if conn.c_closed.load(Ordering::Acquire) || l.proto_err {
+        if conn.state.has(C_CLOSED) || l.proto_err {
             return;
         }
         let auth_required = conn.auth_required.load(Ordering::Acquire);
@@ -794,7 +806,7 @@ impl Worker {
             None => return,
         };
         let conn = l.conn.clone();
-        if conn.peer_closed.load(Ordering::Acquire) {
+        if conn.state.has(PEER_CLOSED) {
             self.run_job(idx);
             return;
         }
@@ -857,7 +869,7 @@ impl Worker {
     }
 
     fn on_kick(&mut self, conn: Arc<Conn>) {
-        conn.kicked.store(false, Ordering::Release);
+        conn.state.apply(Event::KickTaken);
         let idx = conn.token.load(Ordering::Relaxed);
         match self.slab.get(idx) {
             Some(Some(l)) if Arc::ptr_eq(&l.conn, &conn) => {}
@@ -871,7 +883,7 @@ impl Worker {
                 return;
             }
         }
-        if conn.c_closed.load(Ordering::Acquire) && conn.peer_closed.load(Ordering::Acquire) {
+        if conn.state.get() & (C_CLOSED | PEER_CLOSED) == C_CLOSED | PEER_CLOSED {
             self.remove(idx);
             return;
         }
@@ -879,39 +891,39 @@ impl Worker {
             conn.read_paused.store(false, Ordering::Release);
         }
         self.flush(idx);
-        self.maybe_half_close(idx);
+        if self.after_flush(idx) {
+            return;
+        }
         if conn.parse_held.swap(false, Ordering::AcqRel) {
             self.parse_buffered(idx);
-        }
-        if conn.c_closed.load(Ordering::Acquire) {
-            let drained = match self.slab[idx].as_ref() {
-                Some(l) => l.woff == l.wbuf.len() && conn.out_bytes.load(Ordering::Acquire) == 0,
-                None => return,
-            };
-            if drained || conn.peer_closed.load(Ordering::Acquire) {
-                self.remove(idx);
-                return;
-            }
         }
         self.update_interest(idx);
     }
 
-    /// shutdown(2) once everything the engine handed over before
-    /// vio_conn_shutdown() is on the socket (or the peer is gone).
-    fn maybe_half_close(&mut self, idx: usize) {
+    /// After a flush: the deferred shutdown(2) once everything the engine
+    /// handed over before vio_conn_shutdown() is on the socket, and the
+    /// release of an engine-closed connection once its output drained or
+    /// its peer left. True when the connection was released.
+    fn after_flush(&mut self, idx: usize) -> bool {
         let l = match self.slab[idx].as_ref() {
             Some(l) => l,
-            None => return,
+            None => return true,
         };
         let c = &l.conn;
-        if !c.half_close.load(Ordering::Acquire) {
-            return;
+        if c.state.get() & (HALF_CLOSE | C_CLOSED) == 0 {
+            return false;
         }
-        let drained = l.woff == l.wbuf.len() && c.out_bytes.load(Ordering::Acquire) == 0 && c.job.load(Ordering::Acquire) == 0;
-        if drained || c.peer_closed.load(Ordering::Acquire) {
-            c.half_close.store(false, Ordering::Release);
+        let out_drained = l.woff == l.wbuf.len() && c.out_bytes.load(Ordering::Acquire) == 0;
+        let job_idle = c.job.load(Ordering::Acquire) == 0;
+        let fx = c.state.apply(Event::Flushed { out_drained, job_idle });
+        if fx & FX_SHUTDOWN != 0 {
             sys::shutdown(c.fd);
         }
+        if fx & FX_REMOVE != 0 {
+            self.remove(idx);
+            return true;
+        }
+        false
     }
 
     fn on_event(&mut self, idx: usize, mask: u32) {
@@ -920,17 +932,8 @@ impl Worker {
                 l.sock_blocked = false;
             }
             self.flush(idx);
-            self.maybe_half_close(idx);
-            /* A closing connection is released once its output drains. */
-            if let Some(l) = self.slab[idx].as_ref() {
-                let c = l.conn.clone();
-                if c.c_closed.load(Ordering::Acquire)
-                    && l.woff == l.wbuf.len()
-                    && c.out_bytes.load(Ordering::Acquire) == 0
-                {
-                    self.remove(idx);
-                    return;
-                }
+            if self.after_flush(idx) {
+                return;
             }
         }
         if mask & ((libc::EPOLLIN | libc::EPOLLHUP | libc::EPOLLERR) as u32) != 0 && self.slab[idx].is_some() {

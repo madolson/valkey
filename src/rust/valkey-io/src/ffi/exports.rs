@@ -121,7 +121,7 @@ pub unsafe extern "C" fn vio_main_after_poll(rt: &Runtime) -> c_int {
 #[no_mangle]
 pub unsafe extern "C" fn vio_main_next_ready(rt: &Runtime) -> Option<ConnHandle> {
     rt.main.borrow_mut().ready.pop_front().map(|c| {
-        c.in_ready.store(false, Ordering::Release);
+        c.state.apply(crate::conn_state::Event::ReadyTaken);
         ConnHandle::new(c)
     })
 }
@@ -269,7 +269,7 @@ pub unsafe extern "C" fn vio_conn_pending_out(_rt: &Runtime, h: ConnRef<'_>) -> 
 #[no_mangle]
 pub unsafe extern "C" fn vio_conn_writev(rt: &Runtime, h: ConnRef<'_>, iov: *const libc::iovec, iovcnt: c_int) -> isize {
     let conn = h.arc();
-    if conn.peer_closed.load(Ordering::Acquire) {
+    if conn.state.has(crate::conn_state::PEER_CLOSED) {
         sys::set_errno(libc::EPIPE);
         return -1;
     }
@@ -421,8 +421,7 @@ pub unsafe extern "C" fn vio_conn_close(rt: &Runtime, h: ConnRef<'_>) {
     }
     conn.udata.store(std::ptr::null_mut(), Ordering::Relaxed);
     conn.want_writable.store(false, Ordering::Release);
-    conn.c_closed.store(true, Ordering::Release);
-    kick(rt, &conn);
+    close_conn(rt, &conn);
 }
 
 /// # Safety
@@ -431,8 +430,7 @@ pub unsafe extern "C" fn vio_conn_close(rt: &Runtime, h: ConnRef<'_>) {
 pub unsafe extern "C" fn vio_conn_shutdown(rt: &Runtime, h: ConnRef<'_>) {
     /* Not shutdown(2) here: the IO thread may not have written the reply
      * the engine just handed over (CLIENT KILL during BGSAVE lost it). */
-    h.half_close.store(true, Ordering::Release);
-    kick(rt, &h.arc());
+    shutdown_conn(rt, &h.arc());
 }
 
 /* ---------------------------------------------------------------------------

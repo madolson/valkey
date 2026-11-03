@@ -498,3 +498,50 @@ claim the gain for this step. Gates (`gates/s4/summary.txt`): the same as
 s2 line for line, plus the new cargo test (19 passed); miri 18 passed and
 1 ignored (`two_runtimes` uses sockets). `make check-rust-header` passes
 with the regenerated header. Verdict: KEEP.
+
+## Step 5: sans-IO connection state machine (API plan step 10)
+
+Change: `conn_state.rs`. The five lifecycle flags that both threads change
+(`kicked`, `in_ready`, `c_closed`, `peer_closed`, `half_close`, five
+`AtomicBool`s on `Conn`) become one `AtomicU32`. `step(flags, event) ->
+(flags, effects)` is pure; `ConnState::apply()` installs the result with
+one compare-exchange (none when nothing changes) and the caller carries out
+the effects (post a kick, push to the ready list, notify VIO_EV_CLOSED,
+release, shutdown(2)). The IO thread's three hand-written release and
+shutdown checks (`on_kick`, `maybe_half_close`, the EPOLLOUT path) become
+one `after_flush()` that applies `Flushed { out_drained, job_idle }`.
+`want_writable`, `read_paused`, `auth_required` and `parse_held` stay
+separate atomics: each has one writer per direction and no effect to
+decide. Unit tests (also under Miri): peer close before adopt, engine
+close with output pending, kick and notify coalescing, deferred shutdown
+(waits for the output and the job, happens once, moot after a peer
+close), and a two-thread kick/take race that checks one post per take.
+
+Prediction: neutral. A Kick that coalesces is now a load instead of a
+swap; one that posts is a load plus a CAS instead of a swap. Main ns/req
+within +-1% at T=4/T=8, GET/SET, -P 1 and -P 16.
+
+Result (`tools/alt.sh`, s4 vs s5, 3 rounds):
+
+| T | test | P | RPS s4 -> s5 | main ns/req s4 -> s5 | spreads |
+|---|---|---|---|---|---|
+| 4 | GET | 1 | 221,919 -> 221,478 (-0.2%) | 789 -> 806 (+2.2%) | 0.4% / 0.9% |
+| 4 | GET | 16 | 2,786,862 -> 2,783,458 (-0.1%) | 330 -> 332 (+0.6%) | 0.5% / 0.3% |
+| 4 | SET | 1 | 220,886 -> 219,671 (-0.6%) | 1028 -> 1039 (+1.1%) | 0.0% / 1.1% |
+| 4 | SET | 16 | 1,791,160 -> 1,778,214 (-0.7%) | 558 -> 562 (+0.6%) | 0.7% / 0.3% |
+| 8 | GET | 1 | 518,581 -> 517,418 (-0.2%) | 937 -> 929 (-0.9%) | 0.2% / 0.3% |
+| 8 | GET | 16 | 2,847,860 -> 2,870,116 (+0.8%) | 351 -> 348 (-1.0%) | 0.9% / 2.0% |
+| 8 | SET | 1 | 511,850 -> 510,608 (-0.2%) | 1160 -> 1148 (-1.1%) | 1.1% / 0.3% |
+| 8 | SET | 16 | 1,745,088 -> 1,763,285 (+1.0%) | 573 -> 567 (-1.0%) | 1.2% / 1.7% |
+
+Within the +-1% prediction except T=4 GET -P 1 main ns +2.2% (client-bound
+cell, RPS -0.2%). Gates (`gates/s5/summary.txt`): the same as s4 line for
+line, cargo test 24 passed (5 new), miri 23 passed and 1 ignored. Stall
+detector, precheck, 600 s, 400 connections (`gates/s5/stall-precheck.txt`):
+
+```
+duration 601 s, connections 400, bursts 2174779, requests 35869275, max burst latency 0.133 s, p99.9 0.000 s, stalls 0
+EXIT 0
+```
+
+Verdict: KEEP.
