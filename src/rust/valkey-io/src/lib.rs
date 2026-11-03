@@ -997,12 +997,16 @@ impl Worker {
         let me = self.me();
         let t0 = std::time::Instant::now();
         loop {
-            if me.inbox.waker.is_pending() {
-                return Some(0);
-            }
             let n = sys::epoll_wait(me.epfd, events, 0);
             if n > 0 {
                 return Some(n);
+            }
+            /* Inbox work announced by an eventfd write is taken through
+             * TOK_WAKE (run() skips take_inbox() while signaled), which the
+             * epoll_wait above reports; returning for it here would loop
+             * without ever draining the eventfd. */
+            if me.inbox.waker.is_pending() && !me.inbox.waker.signaled() {
+                return Some(0);
             }
             if t0.elapsed().as_nanos() as u64 >= budget {
                 return None;
