@@ -845,6 +845,15 @@ pub extern "C" fn vio_main_next_ready() -> *const Conn {
     }
 }
 
+/// Whether the current batch still holds connections. True inside a long
+/// command (script, module) that was started from vio_main_next_ready():
+/// the rest of that batch is only reachable through this list, because the
+/// eventfd that announced it was already drained.
+#[no_mangle]
+pub extern "C" fn vio_main_has_ready() -> c_int {
+    MAIN_READY.with(|r| !r.borrow().is_empty()) as c_int
+}
+
 /* ---------------------------------------------------------------------------
  * Exported API: per connection (main thread)
  * ------------------------------------------------------------------------- */

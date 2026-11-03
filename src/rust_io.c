@@ -312,17 +312,24 @@ void rustIoHandleReady(const VioConn *h) {
     }
 }
 
+static int rustIoDrainReady(void) {
+    const VioConn *h;
+    int n = 0;
+    while ((h = vio_main_next_ready()) != NULL) {
+        rustIoHandleReady(h);
+        vio_conn_release(h);
+        n++;
+    }
+    return n;
+}
+
 static void rustIoEventHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
     UNUSED(el);
     UNUSED(fd);
     UNUSED(privdata);
     UNUSED(mask);
     vio_main_begin_drain();
-    const VioConn *h;
-    while ((h = vio_main_next_ready()) != NULL) {
-        rustIoHandleReady(h);
-        vio_conn_release(h);
-    }
+    rustIoDrainReady();
 }
 
 /* Clients whose input waits in Rust (cmd_queue full, blocked, protected).
@@ -339,8 +346,12 @@ void rustIoPublishGlobals(void) {
 
 static int connRustProcessPendingData(void) {
     rustIoPublishGlobals();
-    if (!rust_stalled || listLength(rust_stalled) == 0) return 0;
-    int processed = 0;
+    /* A long command started from rustIoEventHandler() leaves the rest of
+     * its batch in Rust's main-thread list, behind an eventfd that was
+     * already drained. processEventsWhileBlocked() reaches it only here
+     * (SCRIPT KILL from a connection in the same batch never ran). */
+    int processed = rustIoDrainReady();
+    if (!rust_stalled || listLength(rust_stalled) == 0) return processed;
     unsigned long n = listLength(rust_stalled);
     uint64_t *ids = zmalloc(sizeof(uint64_t) * n);
     listIter li;
@@ -368,6 +379,7 @@ static int connRustProcessPendingData(void) {
 }
 
 static int connRustHasPendingData(void) {
+    if (rust_started && vio_main_has_ready()) return 1;
     if (!rust_stalled || listLength(rust_stalled) == 0) return 0;
     listIter li;
     listNode *ln;

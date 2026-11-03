@@ -96,6 +96,8 @@ int vio_start(const VioConfig *cfg);
 /* Main thread: consume the wakeup and iterate connections with work. Each
  * handle from vio_main_next_ready() carries one reference to release. */
 void vio_main_begin_drain(void);
+/* Connections left in the current batch (processEventsWhileBlocked()). */
+int vio_main_has_ready(void);
 const VioConn *vio_main_next_ready(void);
 
 /* Per connection, main thread only. */
