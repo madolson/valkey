@@ -79,8 +79,7 @@ pub unsafe extern "C" fn vio_main_begin_drain() {
     let g = global();
     /* Drain, then clear, then take the list. Clearing first loses a wakeup
      * when a producer signals between the clear and the drain. */
-    sys::eventfd_drain(g.main_efd);
-    g.main_signaled.store(false, Ordering::SeqCst);
+    g.ready.waker.drain();
     take_ready(g);
 }
 
@@ -92,8 +91,7 @@ pub unsafe extern "C" fn vio_main_begin_drain() {
 #[no_mangle]
 pub unsafe extern "C" fn vio_main_before_poll() -> c_int {
     let g = global();
-    g.main_sleeping.store(true, Ordering::SeqCst);
-    g.main_pending.load(Ordering::SeqCst) as c_int
+    g.ready.waker.prepare_sleep() as c_int
 }
 
 /// First call after the main thread polled. Takes work handed over while
@@ -106,8 +104,8 @@ pub unsafe extern "C" fn vio_main_before_poll() -> c_int {
 #[no_mangle]
 pub unsafe extern "C" fn vio_main_after_poll() -> c_int {
     let g = global();
-    g.main_sleeping.store(false, Ordering::SeqCst);
-    if g.main_signaled.load(Ordering::SeqCst) {
+    g.ready.waker.awake();
+    if g.ready.waker.signaled() {
         return 0;
     }
     take_ready(g)
@@ -169,9 +167,7 @@ pub unsafe extern "C" fn vio_conn_release(h: ConnHandle) {
 pub unsafe extern "C" fn vio_conn_take_events(h: ConnRef<'_>) -> u32 {
     let ev = h.events.swap(0, Ordering::AcqRel);
     if ev & VIO_EV_NEW != 0 && global().adm.adopted() {
-        let t = &global().threads[0];
-        t.inbox.lock().unwrap().push(Msg::ResumeAccept);
-        wake_thread(t);
+        global().threads[0].post(|q| q.push(Msg::ResumeAccept));
     }
     ev
 }

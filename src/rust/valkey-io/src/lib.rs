@@ -10,6 +10,7 @@
 
 mod admission;
 mod ffi;
+mod handoff;
 pub mod precheck;
 pub mod sys;
 pub mod resp;
@@ -173,14 +174,14 @@ enum Msg {
 
 struct IoThread {
     epfd: RawFd,
-    wakefd: RawFd,
-    signaled: AtomicBool,
-    /// Set just before epoll_wait, cleared after: producers skip the eventfd
-    /// write while the thread is awake.
-    sleeping: AtomicBool,
-    /// Inbox has entries the thread has not taken yet.
-    pending: AtomicBool,
-    inbox: Mutex<Vec<Msg>>,
+    /// Messages for this thread; its waker's eventfd is in `epfd`.
+    inbox: handoff::Mailbox<Vec<Msg>>,
+}
+
+impl IoThread {
+    fn post(&self, f: impl FnOnce(&mut Vec<Msg>)) {
+        self.inbox.post(hd(HD_IO_AWAKE), f)
+    }
 }
 
 /// What the IO threads hand the engine thread: connections with work, and
@@ -222,15 +223,9 @@ struct Global {
     cbs: VioCallbacks,
     limits: EngineLimits,
     threads: Vec<IoThread>,
-    main_efd: RawFd,
-    main_signaled: AtomicBool,
-    /// Main thread is (about to be) blocked in poll; set by
-    /// vio_main_before_poll, cleared by vio_main_after_poll. While it is
-    /// clear, producers skip the eventfd write.
-    main_sleeping: AtomicBool,
-    /// `ready` has entries that the main thread has not taken yet.
-    main_pending: AtomicBool,
-    ready: Mutex<Ready>,
+    /// What the IO threads hand the engine thread. Its waker's sleeping flag
+    /// is set by vio_main_before_poll and cleared by vio_main_after_poll.
+    ready: handoff::Mailbox<Ready>,
     listen_fd: RawFd,
     adm: admission::Admission,
 }
@@ -288,30 +283,7 @@ fn kick(conn: &Arc<Conn>) {
         });
         return;
     }
-    let t = &global().threads[conn.thread];
-    t.inbox.lock().unwrap().push(Msg::Kick(conn.clone()));
-    wake_thread(t);
-}
-
-/// Call after pushing to `t.inbox`. Pairs with the sleep check in
-/// Worker::run (Dekker, all SeqCst): either this sees `sleeping` set and
-/// writes the eventfd, or the thread sees `pending` set and does not block.
-/// Call after pushing to `g.ready` (or creating beforeSleep() work). Pairs
-/// with vio_main_before_poll (Dekker, all SeqCst): either this sees the main
-/// thread sleeping and writes the eventfd, or the main thread sees
-/// `main_pending` and polls without blocking.
-fn wake_main(g: &Global) {
-    g.main_pending.store(true, Ordering::SeqCst);
-    if (hd(HD_MAIN_AWAKE) || g.main_sleeping.load(Ordering::SeqCst)) && !g.main_signaled.swap(true, Ordering::SeqCst) {
-        sys::eventfd_signal(g.main_efd);
-    }
-}
-
-fn wake_thread(t: &IoThread) {
-    t.pending.store(true, Ordering::SeqCst);
-    if (hd(HD_IO_AWAKE) || t.sleeping.load(Ordering::SeqCst)) && !t.signaled.swap(true, Ordering::SeqCst) {
-        sys::eventfd_signal(t.wakefd);
-    }
+    global().threads[conn.thread].post(|q| q.push(Msg::Kick(conn.clone())));
 }
 
 
@@ -320,9 +292,7 @@ fn wake_thread(t: &IoThread) {
 const KICK_BATCH: usize = 32;
 
 fn flush_kicks(idx: usize, list: &mut Vec<Arc<Conn>>) {
-    let t = &global().threads[idx];
-    t.inbox.lock().unwrap().extend(list.drain(..).map(Msg::Kick));
-    wake_thread(t);
+    global().threads[idx].post(|q| q.extend(list.drain(..).map(Msg::Kick)));
 }
 
 /// Argv returned per IO thread handed over before the end of the iteration.
@@ -340,9 +310,7 @@ fn return_argv(thread: usize, argv: usize, argc: c_int) {
         a[thread].push((argv, argc));
         if a[thread].len() >= ARGV_BATCH {
             let v = std::mem::take(&mut a[thread]);
-            let t = &global().threads[thread];
-            t.inbox.lock().unwrap().push(Msg::FreeArgv(v));
-            wake_thread(t);
+            global().threads[thread].post(|q| q.push(Msg::FreeArgv(v)));
         }
     });
 }
@@ -354,15 +322,12 @@ fn flush_thread(idx: usize, kicks: &mut Vec<Arc<Conn>>, argv: Option<&mut Vec<(u
     if kicks.is_empty() && argv.is_none() {
         return;
     }
-    let t = &global().threads[idx];
-    {
-        let mut inbox = t.inbox.lock().unwrap();
-        inbox.extend(kicks.drain(..).map(Msg::Kick));
+    global().threads[idx].post(|q| {
+        q.extend(kicks.drain(..).map(Msg::Kick));
         if let Some(v) = argv {
-            inbox.push(Msg::FreeArgv(v));
+            q.push(Msg::FreeArgv(v));
         }
-    }
-    wake_thread(t);
+    });
 }
 
 /* ---------------------------------------------------------------------------
@@ -428,13 +393,11 @@ impl Worker {
         if self.to_notify.is_empty() && self.done.is_empty() {
             return;
         }
-        let g = global();
-        {
-            let mut r = g.ready.lock().unwrap();
-            r.conns.append(&mut self.to_notify);
-            r.done.append(&mut self.done);
-        }
-        wake_main(g);
+        let (conns, done) = (&mut self.to_notify, &mut self.done);
+        global().ready.post(hd(HD_MAIN_AWAKE), |r| {
+            r.conns.append(conns);
+            r.done.append(done);
+        });
     }
 
     /// Run and complete the connection's write job, if any. Writes only
@@ -942,17 +905,14 @@ impl Worker {
             if target == self.idx {
                 self.add_conn(fd);
             } else {
-                let t = &g.threads[target];
-                t.inbox.lock().unwrap().push(Msg::NewFd(fd));
-                wake_thread(t);
+                g.threads[target].post(|q| q.push(Msg::NewFd(fd)));
             }
         }
     }
 
     fn take_inbox(&mut self) {
         let me = self.me();
-        if me.pending.swap(false, Ordering::SeqCst) {
-            let msgs = std::mem::take(&mut *me.inbox.lock().unwrap());
+        if let Some(msgs) = me.inbox.take() {
             for m in msgs {
                 match m {
                     Msg::NewFd(fd) => self.add_conn(fd),
@@ -977,24 +937,17 @@ impl Worker {
         let mut timeout: c_int = -1;
         let mut events: Vec<sys::EpollEvent> = vec![sys::EpollEvent { events: 0, u64: 0 }; 256];
         loop {
-            if timeout != 0 {
-                me.sleeping.store(true, Ordering::SeqCst);
-                if me.pending.load(Ordering::SeqCst) {
-                    timeout = 0;
-                }
+            if timeout != 0 && me.inbox.waker.prepare_sleep() {
+                timeout = 0;
             }
             let n = sys::epoll_wait(me.epfd, &mut events, timeout);
-            me.sleeping.store(false, Ordering::SeqCst);
+            me.inbox.waker.awake();
             for ev in events.iter().take(n) {
                 let tok = ev.u64;
                 let mask = ev.events;
                 if tok == TOK_WAKE {
-                    /* Drain before clearing: a producer that sees the flag
-                     * set skips the eventfd write, so the flag must not be
-                     * cleared after its write was consumed. The inbox is
-                     * taken below, after the clear. */
-                    sys::eventfd_drain(me.wakefd);
-                    me.signaled.store(false, Ordering::SeqCst);
+                    /* Drain, then take (handoff.rs). */
+                    me.inbox.waker.drain();
                     self.take_inbox();
                 } else if tok == TOK_LISTEN {
                     self.accept_all();
@@ -1006,7 +959,7 @@ impl Worker {
              * written for them. When one was, leave them to its TOK_WAKE:
              * taking them here too, ahead of the notification, tripled the
              * IO thread's sleeps and cost 18% at -P 16 with one IO thread. */
-            if !me.signaled.load(Ordering::SeqCst) {
+            if !me.inbox.waker.signaled() {
                 self.take_inbox();
             }
             timeout = -1;
@@ -1046,14 +999,7 @@ fn start(bind: Option<String>, port: c_int, threads: c_int, cbs: VioCallbacks, l
             return Err(sys::errno());
         }
         sys::epoll_add(epfd, wakefd, sys::EPOLLIN, TOK_WAKE);
-        threads.push(IoThread {
-            epfd,
-            wakefd,
-            signaled: AtomicBool::new(false),
-            sleeping: AtomicBool::new(false),
-            pending: AtomicBool::new(false),
-            inbox: Mutex::new(Vec::new()),
-        });
+        threads.push(IoThread { epfd, inbox: handoff::Mailbox::new(wakefd, false) });
     }
     sys::epoll_add(threads[0].epfd, listen_fd, sys::EPOLLIN, TOK_LISTEN);
     let main_efd = sys::eventfd();
@@ -1064,11 +1010,7 @@ fn start(bind: Option<String>, port: c_int, threads: c_int, cbs: VioCallbacks, l
         cbs,
         limits,
         threads,
-        main_efd,
-        main_signaled: AtomicBool::new(false),
-        main_sleeping: AtomicBool::new(true),
-        main_pending: AtomicBool::new(false),
-        ready: Mutex::new(Ready::default()),
+        ready: handoff::Mailbox::new(main_efd, true),
         listen_fd,
         adm: admission::Admission::new(),
     };
@@ -1103,10 +1045,9 @@ thread_local! {
 /// Take connections that became ready while the main thread was awake (no
 /// eventfd was written for them). Returns 1 when there was pending work.
 fn take_ready(g: &Global) -> c_int {
-    if !g.main_pending.swap(false, Ordering::SeqCst) {
+    let Some(batch) = g.ready.take() else {
         return 0;
-    }
-    let batch = std::mem::take(&mut *g.ready.lock().unwrap());
+    };
     MAIN_READY.with(|r| r.borrow_mut().extend(batch.conns));
     MAIN_DONE.with(|d| d.borrow_mut().extend(batch.done));
     1
