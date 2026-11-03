@@ -65,15 +65,6 @@
 #define VIO_SESS_SPECIAL (1 << 3)
 
 
-
-
-
-
-
-
-
-
-
 #if defined(RUST_IO_TIMING)
 #define ST_DEQUEUED 5
 #endif
@@ -114,92 +105,92 @@ typedef struct VioRuntime VioRuntime;
  One parsed command, or a protocol error when `err != 0`.
  */
 typedef struct {
-  void **argv;
-  int argc;
-  /*
-   resp::ProtoError value, 0 for a command.
-   */
-  int err;
-  /*
-   Offending byte for ProtoError::UnexpectedChar.
-   */
-  int err_byte;
-  /*
-   Sampled stage-timing id (RUST_IO_TIMING builds), else 0. Always
-   present: cbindgen emits a `#[cfg]` field's `;` after the `#endif`,
-   which -pedantic rejects when the feature is off. It sits in the
-   padding before argv_len_sum, so it costs no space.
-   */
-  uint32_t trace;
-  size_t argv_len_sum;
-  uint64_t input_bytes;
-  /*
-   Precheck mode: struct serverCommand *, slot, read flags and token
-   filled on the IO thread; token 0 when not prechecked.
-   */
-  void *cmd;
-  int slot;
-  int read_flags;
-  uint64_t token;
+    void **argv;
+    int argc;
+    /*
+     resp::ProtoError value, 0 for a command.
+     */
+    int err;
+    /*
+     Offending byte for ProtoError::UnexpectedChar.
+     */
+    int err_byte;
+    /*
+     Sampled stage-timing id (RUST_IO_TIMING builds), else 0. Always
+     present: cbindgen emits a `#[cfg]` field's `;` after the `#endif`,
+     which -pedantic rejects when the feature is off. It sits in the
+     padding before argv_len_sum, so it costs no space.
+     */
+    uint32_t trace;
+    size_t argv_len_sum;
+    uint64_t input_bytes;
+    /*
+     Precheck mode: struct serverCommand *, slot, read flags and token
+     filled on the IO thread; token 0 when not prechecked.
+     */
+    void *cmd;
+    int slot;
+    int read_flags;
+    uint64_t token;
 } VioCmd;
 
 typedef struct {
-  void *user;
-  uint32_t gen;
-  uint32_t flags;
-  int dbid;
+    void *user;
+    uint32_t gen;
+    uint32_t flags;
+    int dbid;
 } VioSession;
 
 /*
  Engine callbacks. Called on Rust IO threads, so they must be thread safe.
  */
 typedef struct {
-  /*
-   Build the argv of every command in `cmds[0..n]` (entries with
-   `err == 0`): `robj **` arrays of `argc` string objects, taking the
-   byte slices from `ptrs`/`lens` in order. One call per parsed batch.
-   */
-  void (*create_argvs)(const uint8_t *const *ptrs, const size_t *lens, VioCmd *cmds, size_t n);
-  /*
-   Free an argv built by create_argv that the engine never consumed.
-   */
-  void (*free_argv)(void **argv, int argc);
-  /*
-   Zero-copy replies: write the sealed reply chunk of `job` (an engine
-   session, see vio_conn_submit_write) to `fd`, from engine memory, on
-   the IO thread. `can_write` 0: do not write (copied bytes are still
-   queued ahead of it, or the peer is gone), only complete. Returns 1
-   when the chunk was written, 0 when the socket would block, -1 on a
-   socket error. The job is complete when this returns; the engine
-   releases it on its own thread (vio_main_next_done). NULL disables.
-   */
-  int (*write_job)(void *job, int fd, int can_write);
-  /*
-   Precheck mode only (cut point 2), NULL otherwise. See precheck.rs.
-   begin/end pin the policy snapshot for one IO-thread poll iteration;
-   precheck_batch checks one parsed batch and returns the 1-based index
-   of its last session barrier, 0 if none.
-   */
-  void *(*precheck_begin)(int tid);
-  void (*precheck_end)(int tid);
-  size_t (*precheck_batch)(void *snap,
-                           const VioSession *sess,
-                           int barrier_active,
-                           VioCmd *cmds,
-                           size_t n);
+    /*
+     Build the argv of every command in `cmds[0..n]` (entries with
+     `err == 0`): `robj **` arrays of `argc` string objects, taking the
+     byte slices from `ptrs`/`lens` in order. One call per parsed batch.
+     */
+    void (*create_argvs)(const uint8_t *const *ptrs, const size_t *lens, VioCmd *cmds, size_t n);
+    /*
+     Free an argv built by create_argv that the engine never consumed.
+     */
+    void (*free_argv)(void **argv, int argc);
+    /*
+     Zero-copy replies: write the sealed reply chunk of `job` (an engine
+     session, see vio_conn_submit_write) to `fd`, from engine memory, on
+     the IO thread. `can_write` 0: do not write (copied bytes are still
+     queued ahead of it, or the peer is gone), only complete. Returns 1
+     when the chunk was written, 0 when the socket would block, -1 on a
+     socket error. The job is complete when this returns; the engine
+     releases it on its own thread (vio_main_next_done). NULL disables.
+     */
+    int (*write_job)(void *job, int fd, int can_write);
+    /*
+     Precheck mode only (cut point 2), NULL otherwise. See precheck.rs.
+     begin/end pin the policy snapshot for one IO-thread poll iteration;
+     precheck_batch checks one parsed batch and returns the 1-based index
+     of its last session barrier, 0 if none.
+     */
+    void *(*precheck_begin)(int tid);
+    void (*precheck_end)(int tid);
+    size_t (*precheck_batch)(void *snap,
+                             const VioSession *sess,
+                             int barrier_active,
+                             VioCmd *cmds,
+                             size_t n);
 } VioCallbacks;
 
 typedef struct {
-  const char *bindaddr;
-  int port;
-  int threads;
-  /*
-   proto-max-bulk-len and client-query-buffer-limit at start;
-   vio_set_limits() publishes later changes.
-   */
-  long long proto_max_bulk_len;
-  size_t client_max_querybuf_len;
-  VioCallbacks cbs;
+    const char *bindaddr;
+    int port;
+    int threads;
+    /*
+     proto-max-bulk-len and client-query-buffer-limit at start;
+     vio_set_limits() publishes later changes.
+     */
+    long long proto_max_bulk_len;
+    size_t client_max_querybuf_len;
+    VioCallbacks cbs;
 } VioConfig;
 
 /*
@@ -220,34 +211,34 @@ typedef VioConn *VioConnRef;
  Memory this layer holds for one connection (client memory accounting).
  */
 typedef struct {
-  /*
-   Input read and not parsed yet.
-   */
-  size_t in_unparsed;
-  /*
-   Capacity of the connection's private read buffer (0 when it reads
-   into the thread's shared buffer).
-   */
-  size_t in_alloc;
-  /*
-   Parsed commands not yet taken by the engine: their input bytes and
-   their argv bytes (argv_len_sum plus the pointer array).
-   */
-  size_t queued_input;
-  size_t queued_argv;
-  /*
-   Output accepted and not yet written (copy path).
-   */
-  size_t out_pending;
+    /*
+     Input read and not parsed yet.
+     */
+    size_t in_unparsed;
+    /*
+     Capacity of the connection's private read buffer (0 when it reads
+     into the thread's shared buffer).
+     */
+    size_t in_alloc;
+    /*
+     Parsed commands not yet taken by the engine: their input bytes and
+     their argv bytes (argv_len_sum plus the pointer array).
+     */
+    size_t queued_input;
+    size_t queued_argv;
+    /*
+     Output accepted and not yet written (copy path).
+     */
+    size_t out_pending;
 } VioConnMem;
 
 #if defined(RUST_IO_TIMING)
 typedef struct {
-  uint64_t count;
-  uint64_t p50_ns;
-  uint64_t p90_ns;
-  uint64_t p99_ns;
-  uint64_t max_ns;
+    uint64_t count;
+    uint64_t p50_ns;
+    uint64_t p90_ns;
+    uint64_t p99_ns;
+    uint64_t max_ns;
 } VioTimingStat;
 #endif
 
@@ -618,4 +609,4 @@ void vio_timing_drop(uint32_t id);
 void vio_timing_stat(uint32_t stage, VioTimingStat *out);
 #endif
 
-#endif  /* VALKEY_IO_H */
+#endif /* VALKEY_IO_H */

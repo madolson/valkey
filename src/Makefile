@@ -790,11 +790,16 @@ rust-io-cargo:
 	cd rust/valkey-io && $(CARGO) clippy --release --quiet $(RUST_IO_CARGO_FEATURES) -- -D warnings
 	cd rust/valkey-io && $(CARGO) build --release --quiet $(RUST_IO_CARGO_FEATURES)
 .PHONY: rust-io-cargo
-# include/valkey_io.h is generated from the crate; check it in.
+# include/valkey_io.h is generated from the crate; check it in. The output
+# goes through clang-format (CI's clang-format check covers src/**/*.h), so
+# CLANG_FORMAT must be the version CI pins (18.1.8).
+CLANG_FORMAT ?= clang-format
+RUST_HEADER_GEN = cbindgen --config cbindgen.toml --crate valkey-io -q | \
+	  $(CLANG_FORMAT) --assume-filename=include/valkey_io.h
 rust-header:
-	cd rust/valkey-io && cbindgen --config cbindgen.toml --crate valkey-io -o include/valkey_io.h -q
+	cd rust/valkey-io && $(RUST_HEADER_GEN) > /tmp/valkey_io.h.$$$$ && mv /tmp/valkey_io.h.$$$$ include/valkey_io.h
 check-rust-header:
-	cd rust/valkey-io && cbindgen --config cbindgen.toml --crate valkey-io -o /tmp/valkey_io.h.$$$$ -q && \
+	cd rust/valkey-io && $(RUST_HEADER_GEN) > /tmp/valkey_io.h.$$$$ && \
 	  diff -u include/valkey_io.h /tmp/valkey_io.h.$$$$ && rm -f /tmp/valkey_io.h.$$$$
 .PHONY: rust-header check-rust-header
 endif
