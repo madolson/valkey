@@ -6,11 +6,11 @@ use std::os::unix::io::RawFd;
 use std::sync::Mutex;
 
 pub fn eventfd_signal(fd: RawFd) {
-    super::eventfd_signal(fd)
+    super::sys::eventfd_signal(fd)
 }
 
 pub fn eventfd_drain(fd: RawFd) {
-    super::eventfd_drain(fd)
+    super::sys::eventfd_drain(fd)
 }
 
 pub fn empty_cmd() -> VioCmd {

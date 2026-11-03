@@ -6,7 +6,11 @@
 //! model and the full FFI surface; the C declarations live in
 //! include/valkey_io.h.
 
+#![deny(unsafe_code, unsafe_op_in_unsafe_fn)]
+
+mod ffi;
 pub mod precheck;
+pub mod sys;
 pub mod resp;
 #[cfg(feature = "timing")]
 pub mod timing;
@@ -17,6 +21,7 @@ use resp::{Arg, Limits, Outcome, Parser};
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::ffi::{c_char, c_int, c_void, CStr};
+use ffi::LimitPtrs;
 use std::os::unix::io::{IntoRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -70,7 +75,6 @@ pub struct VioCmd {
     #[cfg(feature = "timing")]
     pub trace: u32,
 }
-unsafe impl Send for VioCmd {}
 
 pub const VIO_EV_NEW: u32 = 1 << 0;
 pub const VIO_EV_CLOSED: u32 = 1 << 1;
@@ -128,7 +132,7 @@ impl Drop for Conn {
                 (g.cbs.free_argv)(cmd.argv, cmd.argc);
             }
         }
-        unsafe { libc::close(self.fd) };
+        sys::close(self.fd);
     }
 }
 
@@ -155,8 +159,7 @@ struct IoThread {
 
 struct Global {
     cbs: VioCallbacks,
-    max_bulk_len: *const i64,
-    max_querybuf_len: *const usize,
+    limits: LimitPtrs,
     threads: Vec<IoThread>,
     main_efd: RawFd,
     main_signaled: AtomicBool,
@@ -170,8 +173,6 @@ struct Global {
     listen_fd: RawFd,
 }
 
-unsafe impl Sync for Global {}
-unsafe impl Send for Global {}
 
 static GLOBAL: OnceLock<Global> = OnceLock::new();
 
@@ -197,24 +198,6 @@ fn hd(bit: u32) -> bool {
 
 fn global() -> &'static Global {
     GLOBAL.get().expect("valkey-io not started")
-}
-
-fn eventfd_signal(fd: RawFd) {
-    let one: u64 = 1;
-    unsafe { libc::write(fd, &one as *const u64 as *const c_void, 8) };
-}
-
-fn eventfd_drain(fd: RawFd) {
-    let mut v: u64 = 0;
-    unsafe { libc::read(fd, &mut v as *mut u64 as *mut c_void, 8) };
-}
-
-fn errno() -> i32 {
-    std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
-}
-
-fn set_errno(e: i32) {
-    unsafe { *libc::__errno_location() = e };
 }
 
 /// Ask the owning IO thread to re-evaluate a connection (flush output,
@@ -258,33 +241,17 @@ fn kick(conn: &Arc<Conn>) {
 fn wake_main(g: &Global) {
     g.main_pending.store(true, Ordering::SeqCst);
     if (hd(HD_MAIN_AWAKE) || g.main_sleeping.load(Ordering::SeqCst)) && !g.main_signaled.swap(true, Ordering::SeqCst) {
-        eventfd_signal(g.main_efd);
+        sys::eventfd_signal(g.main_efd);
     }
 }
 
 fn wake_thread(t: &IoThread) {
     t.pending.store(true, Ordering::SeqCst);
     if (hd(HD_IO_AWAKE) || t.sleeping.load(Ordering::SeqCst)) && !t.signaled.swap(true, Ordering::SeqCst) {
-        eventfd_signal(t.wakefd);
+        sys::eventfd_signal(t.wakefd);
     }
 }
 
-/// Hand the kicks collected on the main thread to their IO threads. Called
-/// once per event-loop iteration, before the main thread polls, and inside
-/// processEventsWhileBlocked().
-#[no_mangle]
-pub extern "C" fn vio_main_flush_kicks() {
-    if GLOBAL.get().is_none() {
-        return;
-    }
-    MAIN_KICKS.with(|k| {
-        for (idx, list) in k.borrow_mut().iter_mut().enumerate() {
-            if !list.is_empty() {
-                flush_kicks(idx, list);
-            }
-        }
-    });
-}
 
 /// Main-thread kicks per IO thread handed over before the end of the
 /// iteration.
@@ -386,8 +353,7 @@ impl Worker {
             }
         };
         conn.token.store(idx, Ordering::Relaxed);
-        let mut ev = libc::epoll_event { events: libc::EPOLLIN as u32, u64: idx as u64 + TOK_BASE };
-        unsafe { libc::epoll_ctl(self.me().epfd, libc::EPOLL_CTL_ADD, fd, &mut ev) };
+        sys::epoll_add(self.me().epfd, fd, sys::EPOLLIN, idx as u64 + TOK_BASE);
         self.slab[idx] = Some(Local {
             conn: conn.clone(),
             rbuf: Vec::new(),
@@ -406,7 +372,7 @@ impl Worker {
     fn remove(&mut self, idx: usize) {
         if let Some(l) = self.slab[idx].take() {
             if l.registered {
-                unsafe { libc::epoll_ctl(self.me().epfd, libc::EPOLL_CTL_DEL, l.conn.fd, std::ptr::null_mut()) };
+                sys::epoll_del(self.me().epfd, l.conn.fd);
             }
             self.free.push(idx);
         }
@@ -430,8 +396,7 @@ impl Worker {
             want |= libc::EPOLLOUT as u32;
         }
         if want != l.interest {
-            let mut ev = libc::epoll_event { events: want, u64: idx as u64 + TOK_BASE };
-            unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_MOD, c.fd, &mut ev) };
+            sys::epoll_mod(epfd, c.fd, want, idx as u64 + TOK_BASE);
             l.interest = want;
         }
     }
@@ -444,7 +409,7 @@ impl Worker {
         let conn = {
             let l = self.slab[idx].as_mut().unwrap();
             if l.registered {
-                unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_DEL, l.conn.fd, std::ptr::null_mut()) };
+                sys::epoll_del(epfd, l.conn.fd);
                 l.registered = false;
             }
             l.conn.clone()
@@ -471,22 +436,18 @@ impl Worker {
         /* Size the read for a large pending bulk so it lands in one buffer. */
         let have = l.rbuf.len() - l.rpos;
         let want = l.parser.needed().saturating_sub(have).max(READ_CHUNK);
-        l.rbuf.reserve(want);
-        let n = unsafe {
-            libc::read(conn.fd, l.rbuf.as_mut_ptr().add(l.rbuf.len()) as *mut c_void, want)
-        };
+        let n = sys::read_append(conn.fd, &mut l.rbuf, want);
         if n == 0 {
             self.peer_gone(idx);
             return;
         }
         if n < 0 {
-            let e = errno();
+            let e = sys::errno();
             if e != libc::EAGAIN && e != libc::EINTR {
                 self.peer_gone(idx);
             }
             return;
         }
-        unsafe { l.rbuf.set_len(l.rbuf.len() + n as usize) };
         #[cfg(feature = "timing")]
         timing::on_read();
 
@@ -494,7 +455,7 @@ impl Worker {
          * unparsed bytes, before parsing what this read added. */
         let auth_required = conn.auth_required.load(Ordering::Relaxed);
         let unparsed = l.rbuf.len() - l.rpos;
-        let qb_limit = unsafe { std::ptr::read_volatile(g.max_querybuf_len) };
+        let qb_limit = g.limits.max_querybuf_len();
         if unparsed > qb_limit || (auth_required && unparsed > 1024 * 1024) {
             l.proto_err = true;
             l.rbuf = Vec::new();
@@ -526,7 +487,7 @@ impl Worker {
             return;
         }
         let auth_required = conn.auth_required.load(Ordering::Acquire);
-        let lim = Limits { max_bulk_len: unsafe { std::ptr::read_volatile(g.max_bulk_len) }, auth_required };
+        let lim = Limits { max_bulk_len: g.limits.max_bulk_len(), auth_required };
         let mut batch: Vec<VioCmd> = Vec::new();
         let mut ptrs: Vec<*const u8> = Vec::new();
         let mut lens: Vec<usize> = Vec::new();
@@ -666,14 +627,12 @@ impl Worker {
                     break;
                 }
             }
-            let n = unsafe {
-                libc::write(conn.fd, l.wbuf.as_ptr().add(l.woff) as *const c_void, l.wbuf.len() - l.woff)
-            };
+            let n = sys::write(conn.fd, &l.wbuf[l.woff..]);
             if n > 0 {
                 l.woff += n as usize;
                 conn.out_bytes.fetch_sub(n as usize, Ordering::AcqRel);
             } else {
-                let e = errno();
+                let e = sys::errno();
                 if n < 0 && (e == libc::EAGAIN || e == libc::EINTR) {
                     break;
                 }
@@ -760,16 +719,10 @@ impl Worker {
     fn accept_all(&mut self) {
         let g = global();
         loop {
-            let fd = unsafe {
-                libc::accept4(g.listen_fd, std::ptr::null_mut(), std::ptr::null_mut(), libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC)
+            let fd = match sys::accept_nodelay(g.listen_fd) {
+                Some(fd) => fd,
+                None => return,
             };
-            if fd < 0 {
-                return;
-            }
-            let one: c_int = 1;
-            unsafe {
-                libc::setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY, &one as *const c_int as *const c_void, 4);
-            }
             let target = self.rr % g.threads.len();
             self.rr = self.rr.wrapping_add(1);
             if target == self.idx {
@@ -798,7 +751,7 @@ impl Worker {
     fn run(mut self) {
         let me = self.me();
         let mut timeout: c_int = -1;
-        let mut events: Vec<libc::epoll_event> = vec![libc::epoll_event { events: 0, u64: 0 }; 256];
+        let mut events: Vec<sys::EpollEvent> = vec![sys::EpollEvent { events: 0, u64: 0 }; 256];
         loop {
             if timeout != 0 {
                 me.sleeping.store(true, Ordering::SeqCst);
@@ -806,9 +759,9 @@ impl Worker {
                     timeout = 0;
                 }
             }
-            let n = unsafe { libc::epoll_wait(me.epfd, events.as_mut_ptr(), events.len() as c_int, timeout) };
+            let n = sys::epoll_wait(me.epfd, &mut events, timeout);
             me.sleeping.store(false, Ordering::SeqCst);
-            for i in 0..n.max(0) as usize {
+            for i in 0..n {
                 let tok = events[i].u64;
                 let mask = events[i].events;
                 if tok == TOK_WAKE {
@@ -816,7 +769,7 @@ impl Worker {
                      * set skips the eventfd write, so the flag must not be
                      * cleared after its write was consumed. The inbox is
                      * taken below, after the clear. */
-                    eventfd_drain(me.wakefd);
+                    sys::eventfd_drain(me.wakefd);
                     me.signaled.store(false, Ordering::SeqCst);
                     self.take_inbox();
                 } else if tok == TOK_LISTEN {
@@ -839,43 +792,36 @@ impl Worker {
 }
 
 /* ---------------------------------------------------------------------------
- * Exported API: startup
+ * Startup
  * ------------------------------------------------------------------------- */
 
-/// Bind the listener and start the IO threads. Returns the eventfd the
-/// engine must poll for readability (then call vio_main_begin_drain), or
-/// -1 with errno set.
-#[no_mangle]
-pub extern "C" fn vio_start(cfg: *const VioConfig) -> c_int {
-    let cfg = unsafe { &*cfg };
-    let addr = if cfg.bindaddr.is_null() {
-        "0.0.0.0".to_string()
-    } else {
-        let s = unsafe { CStr::from_ptr(cfg.bindaddr) }.to_string_lossy().into_owned();
-        let s = s.trim_start_matches('-').to_string();
-        if s == "*" { "0.0.0.0".to_string() } else if s == "::*" { "::".to_string() } else { s }
+/// Bind the listener and start the IO threads (vio_start). Returns the
+/// engine's eventfd, or an errno value.
+fn start(bind: Option<String>, port: c_int, threads: c_int, cbs: VioCallbacks, limits: LimitPtrs) -> Result<RawFd, i32> {
+    let addr = match bind {
+        None => "0.0.0.0".to_string(),
+        Some(s) => {
+            let s = s.trim_start_matches('-').to_string();
+            if s == "*" { "0.0.0.0".to_string() } else if s == "::*" { "::".to_string() } else { s }
+        }
     };
     let listener = match std::net::TcpListener::bind((addr.as_str(), cfg.port as u16)) {
         Ok(l) => l,
-        Err(e) => {
-            set_errno(e.raw_os_error().unwrap_or(libc::EINVAL));
-            return -1;
-        }
+        Err(e) => return Err(e.raw_os_error().unwrap_or(libc::EINVAL)),
     };
-    if listener.set_nonblocking(true).is_err() {
-        return -1;
+    if let Err(e) = listener.set_nonblocking(true) {
+        return Err(e.raw_os_error().unwrap_or(libc::EINVAL));
     }
     let listen_fd = listener.into_raw_fd();
-    let nthreads = cfg.threads.max(1) as usize;
+    let nthreads = threads.max(1) as usize;
     let mut threads = Vec::with_capacity(nthreads);
     for _ in 0..nthreads {
-        let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
-        let wakefd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+        let epfd = sys::epoll_create();
+        let wakefd = sys::eventfd();
         if epfd < 0 || wakefd < 0 {
-            return -1;
+            return Err(sys::errno());
         }
-        let mut ev = libc::epoll_event { events: libc::EPOLLIN as u32, u64: TOK_WAKE };
-        unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, wakefd, &mut ev) };
+        sys::epoll_add(epfd, wakefd, sys::EPOLLIN, TOK_WAKE);
         threads.push(IoThread {
             epfd,
             wakefd,
@@ -885,16 +831,14 @@ pub extern "C" fn vio_start(cfg: *const VioConfig) -> c_int {
             inbox: Mutex::new(Vec::new()),
         });
     }
-    let mut ev = libc::epoll_event { events: libc::EPOLLIN as u32, u64: TOK_LISTEN };
-    unsafe { libc::epoll_ctl(threads[0].epfd, libc::EPOLL_CTL_ADD, listen_fd, &mut ev) };
-    let main_efd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+    sys::epoll_add(threads[0].epfd, listen_fd, sys::EPOLLIN, TOK_LISTEN);
+    let main_efd = sys::eventfd();
     if main_efd < 0 {
-        return -1;
+        return Err(sys::errno());
     }
     let g = Global {
-        cbs: cfg.cbs,
-        max_bulk_len: cfg.proto_max_bulk_len,
-        max_querybuf_len: cfg.client_max_querybuf_len,
+        cbs,
+        limits,
         threads,
         main_efd,
         main_signaled: AtomicBool::new(false),
@@ -904,8 +848,7 @@ pub extern "C" fn vio_start(cfg: *const VioConfig) -> c_int {
         listen_fd,
     };
     if GLOBAL.set(g).is_err() {
-        set_errno(libc::EALREADY);
-        return -1;
+        return Err(libc::EALREADY);
     }
     IS_MAIN.with(|m| m.set(true));
     if let Some(v) = std::env::var("VIO_HANDOFF_DISABLE").ok().and_then(|v| v.parse().ok()) {
@@ -918,28 +861,17 @@ pub extern "C" fn vio_start(cfg: *const VioConfig) -> c_int {
             .spawn(move || w.run())
             .expect("spawn rust-io thread");
     }
-    main_efd
+    Ok(main_efd)
 }
 
 /* ---------------------------------------------------------------------------
- * Exported API: main thread
+ * Main thread state (exports in ffi/exports.rs)
  * ------------------------------------------------------------------------- */
 
 thread_local! {
     static MAIN_READY: RefCell<VecDeque<Arc<Conn>>> = RefCell::new(VecDeque::new());
 }
 
-/// Consume the main eventfd and take the current batch of ready
-/// connections. Connections that become ready later go to the next batch.
-#[no_mangle]
-pub extern "C" fn vio_main_begin_drain() {
-    let g = global();
-    /* Drain, then clear, then take the list. Clearing first loses a wakeup
-     * when a producer signals between the clear and the drain. */
-    eventfd_drain(g.main_efd);
-    g.main_signaled.store(false, Ordering::SeqCst);
-    take_ready(g);
-}
 
 /// Take connections that became ready while the main thread was awake (no
 /// eventfd was written for them). Returns 1 when there was pending work.
@@ -952,219 +884,24 @@ fn take_ready(g: &Global) -> c_int {
     1
 }
 
-/// Last call before the main thread polls. Returns 1 when work arrived that
-/// it must not sleep on (poll with a zero timeout).
-#[no_mangle]
-pub extern "C" fn vio_main_before_poll() -> c_int {
-    let g = global();
-    g.main_sleeping.store(true, Ordering::SeqCst);
-    g.main_pending.load(Ordering::SeqCst) as c_int
-}
 
-/// First call after the main thread polled. Takes work handed over while
-/// it was awake and returns 1 if there is some, unless an eventfd write is
-/// pending: then the eventfd handler takes it in this iteration, and taking
-/// it here as well would run two batches before the first one's replies.
-#[no_mangle]
-pub extern "C" fn vio_main_after_poll() -> c_int {
-    let g = global();
-    g.main_sleeping.store(false, Ordering::SeqCst);
-    if g.main_signaled.load(Ordering::SeqCst) {
-        return 0;
-    }
-    take_ready(g)
-}
 
-/// Next ready connection from the current batch, or NULL. The caller owns
-/// one reference and must vio_conn_release() it.
-#[no_mangle]
-pub extern "C" fn vio_main_next_ready() -> *const Conn {
-    match MAIN_READY.with(|r| r.borrow_mut().pop_front()) {
-        Some(c) => {
-            c.in_ready.store(false, Ordering::Release);
-            Arc::into_raw(c)
-        }
-        None => std::ptr::null(),
-    }
-}
 
-/// Whether the current batch still holds connections. True inside a long
-/// command (script, module) that was started from vio_main_next_ready():
-/// the rest of that batch is only reachable through this list, because the
-/// eventfd that announced it was already drained.
-#[no_mangle]
-pub extern "C" fn vio_main_has_ready() -> c_int {
-    MAIN_READY.with(|r| !r.borrow().is_empty()) as c_int
-}
 
-/* ---------------------------------------------------------------------------
- * Exported API: per connection (main thread)
- * ------------------------------------------------------------------------- */
 
-fn conn_ref<'a>(h: *const Conn) -> &'a Conn {
-    unsafe { &*h }
-}
 
-/// Borrow the handle as an Arc without changing the refcount.
-fn conn_arc(h: *const Conn) -> std::mem::ManuallyDrop<Arc<Conn>> {
-    std::mem::ManuallyDrop::new(unsafe { Arc::from_raw(h) })
-}
 
-#[no_mangle]
-pub extern "C" fn vio_conn_retain(h: *const Conn) {
-    unsafe { Arc::increment_strong_count(h) };
-}
 
-#[no_mangle]
-pub extern "C" fn vio_conn_release(h: *const Conn) {
-    unsafe { Arc::decrement_strong_count(h) };
-}
 
-#[no_mangle]
-pub extern "C" fn vio_conn_take_events(h: *const Conn) -> u32 {
-    conn_ref(h).events.swap(0, Ordering::AcqRel)
-}
 
-#[no_mangle]
-pub extern "C" fn vio_conn_udata(h: *const Conn) -> *mut c_void {
-    conn_ref(h).udata.load(Ordering::Relaxed)
-}
 
-#[no_mangle]
-pub extern "C" fn vio_conn_set_udata(h: *const Conn, p: *mut c_void) {
-    conn_ref(h).udata.store(p, Ordering::Relaxed)
-}
 
-#[no_mangle]
-pub extern "C" fn vio_conn_fd(h: *const Conn) -> c_int {
-    conn_ref(h).fd
-}
 
-/// Move up to `max` parsed commands into `out`, in order.
-#[no_mangle]
-pub extern "C" fn vio_conn_pop_cmds(h: *const Conn, out: *mut VioCmd, max: usize) -> usize {
-    let conn = conn_arc(h);
-    let (n, left) = {
-        let mut sh = conn.shared.lock().unwrap();
-        let n = max.min(sh.cmds.len());
-        for i in 0..n {
-            unsafe { out.add(i).write(sh.cmds.pop_front().unwrap()) };
-        }
-        (n, sh.cmds.len())
-    };
-    if n > 0 && left < CMDS_LOW && conn.read_paused.load(Ordering::Acquire) {
-        kick(&conn);
-    }
-    n
-}
 
-#[no_mangle]
-pub extern "C" fn vio_conn_pending_cmds(h: *const Conn) -> usize {
-    conn_ref(h).shared.lock().unwrap().cmds.len()
-}
 
-/// Bytes accepted from the engine and not yet written to the socket.
-#[no_mangle]
-pub extern "C" fn vio_conn_pending_out(h: *const Conn) -> usize {
-    conn_ref(h).out_bytes.load(Ordering::Acquire)
-}
 
-/// Copy engine output into the connection's outbound buffer and wake its
-/// IO thread. Returns bytes accepted, or -1 with errno EAGAIN (buffer full,
-/// engine keeps the rest and installs its write handler) or EPIPE.
-#[no_mangle]
-pub extern "C" fn vio_conn_writev(h: *const Conn, iov: *const libc::iovec, iovcnt: c_int) -> isize {
-    let conn = conn_arc(h);
-    if conn.peer_closed.load(Ordering::Acquire) {
-        set_errno(libc::EPIPE);
-        return -1;
-    }
-    let pending = conn.out_bytes.load(Ordering::Acquire);
-    if pending >= OUT_HIGH {
-        set_errno(libc::EAGAIN);
-        return -1;
-    }
-    let mut room = OUT_HIGH - pending;
-    let mut written = 0usize;
-    {
-        let mut sh = conn.shared.lock().unwrap();
-        #[cfg(feature = "timing")]
-        {
-            let t = timing::take_next_write();
-            if t != 0 {
-                /* One trace per flush: keep the older one. */
-                if conn.trace.compare_exchange(0, t, Ordering::Relaxed, Ordering::Relaxed).is_err() {
-                    timing::drop_trace(t);
-                }
-            }
-        }
-        for i in 0..iovcnt as usize {
-            if room == 0 {
-                break;
-            }
-            let v = unsafe { &*iov.add(i) };
-            let n = v.iov_len.min(room);
-            let s = unsafe { std::slice::from_raw_parts(v.iov_base as *const u8, n) };
-            sh.out.extend_from_slice(s);
-            room -= n;
-            written += n;
-        }
-    }
-    if written > 0 {
-        conn.out_bytes.fetch_add(written, Ordering::AcqRel);
-        kick(&conn);
-    }
-    written as isize
-}
 
-/// The engine wants VIO_EV_WRITABLE once outbound bytes drop below the low
-/// watermark (it has data it could not hand over).
-#[no_mangle]
-pub extern "C" fn vio_conn_want_writable(h: *const Conn, on: c_int) {
-    let conn = conn_arc(h);
-    conn.want_writable.store(on != 0, Ordering::Release);
-    if on != 0 {
-        kick(&conn);
-    }
-}
 
-/// Published engine state the parser needs: unauthenticated clients get
-/// tighter multibulk/bulk limits.
-#[no_mangle]
-pub extern "C" fn vio_conn_set_auth_required(h: *const Conn, on: c_int) {
-    let conn = conn_arc(h);
-    conn.auth_required.store(on != 0, Ordering::Release);
-    /* Store, then check: the IO thread sets parse_held before the engine
-     * can see the command it stopped after, so this cannot miss it. */
-    if conn.parse_held.load(Ordering::Acquire) {
-        kick(&conn);
-    }
-}
 
-#[no_mangle]
-pub extern "C" fn vio_set_default_auth_required(on: c_int) {
-    DEFAULT_AUTH_REQUIRED.store(on != 0, Ordering::Relaxed);
-}
 
-/// Publish the session fields the precheck reads (cut point 2). Read by
-/// the IO thread once per parsed batch.
-#[no_mangle]
-pub extern "C" fn vio_conn_set_session(h: *const Conn, s: *const precheck::VioSession) {
-    conn_ref(h).session.set(unsafe { &*s });
-}
 
-/// The engine is done with the connection. Pending output is flushed, then
-/// the socket is closed once every reference is released.
-#[no_mangle]
-pub extern "C" fn vio_conn_close(h: *const Conn) {
-    let conn = conn_arc(h);
-    conn.udata.store(std::ptr::null_mut(), Ordering::Relaxed);
-    conn.want_writable.store(false, Ordering::Release);
-    conn.c_closed.store(true, Ordering::Release);
-    kick(&conn);
-}
-
-#[no_mangle]
-pub extern "C" fn vio_conn_shutdown(h: *const Conn) {
-    unsafe { libc::shutdown(conn_ref(h).fd, libc::SHUT_RDWR) };
-}

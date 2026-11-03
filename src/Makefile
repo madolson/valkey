@@ -787,6 +787,7 @@ $(SERVER_NAME): $(RUST_IO_LIB)
 # Always ask cargo; it is a no-op when the crate is up to date.
 $(RUST_IO_LIB): rust-io-cargo
 rust-io-cargo:
+	cd rust/valkey-io && $(CARGO) clippy --release --quiet $(RUST_IO_CARGO_FEATURES) -- -D warnings
 	cd rust/valkey-io && $(CARGO) build --release --quiet $(RUST_IO_CARGO_FEATURES)
 .PHONY: rust-io-cargo
 endif

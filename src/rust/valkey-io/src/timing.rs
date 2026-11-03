@@ -55,18 +55,11 @@ static STATE: OnceLock<State> = OnceLock::new();
 
 #[inline(always)]
 pub fn rdtsc() -> u64 {
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        core::arch::x86_64::_rdtsc()
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    mono_ns()
+    crate::sys::rdtsc()
 }
 
 fn mono_ns() -> u64 {
-    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
-    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+    crate::sys::monotonic_ns()
 }
 
 fn st() -> &'static State {
@@ -98,15 +91,37 @@ thread_local! {
     static NEXT_WRITE: Cell<u32> = const { Cell::new(0) };
 }
 
+/// Main thread: tag the bytes of the next vio_conn_writev() (vio_timing_next_write).
+pub fn set_next_write(id: u32) {
+    NEXT_WRITE.with(|c| c.set(id));
+}
+
+pub fn sample_n() -> u32 {
+    st().n
+}
+
+pub fn dropped() -> u64 {
+    st().dropped.load(Ordering::Relaxed)
+}
+
+/// Clear all histograms (vio_timing_reset).
+pub fn reset() {
+    let s = st();
+    for h in &s.hist {
+        h.count.store(0, Ordering::Relaxed);
+        h.max.store(0, Ordering::Relaxed);
+        for b in &h.b {
+            b.store(0, Ordering::Relaxed);
+        }
+    }
+    s.dropped.store(0, Ordering::Relaxed);
+}
+
 /// Main thread: the trace id for the next vio_conn_writev().
 pub fn take_next_write() -> u32 {
     NEXT_WRITE.with(|c| c.replace(0))
 }
 
-#[no_mangle]
-pub extern "C" fn vio_timing_next_write(id: u32) {
-    NEXT_WRITE.with(|c| c.set(id));
-}
 
 /// IO thread: a read(2) just returned bytes.
 #[inline(always)]
@@ -230,8 +245,8 @@ fn ns_per_tick() -> f64 {
     }
 }
 
-#[no_mangle]
-pub extern "C" fn vio_timing_stat(stage: u32, out: *mut VioTimingStat) {
+/// Histogram summary for one stage (exported as vio_timing_stat).
+pub fn stat(stage: u32) -> VioTimingStat {
     let s = st();
     let h = &s.hist[(stage as usize).min(NHIST - 1)];
     let k = ns_per_tick();
@@ -251,49 +266,19 @@ pub extern "C" fn vio_timing_stat(stage: u32, out: *mut VioTimingStat) {
         }
         0
     };
-    unsafe {
-        *out = VioTimingStat {
-            count: total,
-            p50_ns: q(0.50),
-            p90_ns: q(0.90),
-            p99_ns: q(0.99),
-            max_ns: (h.max.load(Ordering::Relaxed) as f64 * k) as u64,
-        }
-    };
-}
-
-#[no_mangle]
-pub extern "C" fn vio_timing_sample_n() -> u32 {
-    st().n
-}
-
-#[no_mangle]
-pub extern "C" fn vio_timing_dropped() -> u64 {
-    st().dropped.load(Ordering::Relaxed)
-}
-
-#[no_mangle]
-pub extern "C" fn vio_timing_reset() {
-    let s = st();
-    for h in &s.hist {
-        h.count.store(0, Ordering::Relaxed);
-        h.max.store(0, Ordering::Relaxed);
-        for b in &h.b {
-            b.store(0, Ordering::Relaxed);
-        }
+    VioTimingStat {
+        count: total,
+        p50_ns: q(0.50),
+        p90_ns: q(0.90),
+        p99_ns: q(0.99),
+        max_ns: (h.max.load(Ordering::Relaxed) as f64 * k) as u64,
     }
-    s.dropped.store(0, Ordering::Relaxed);
 }
 
-#[no_mangle]
-pub extern "C" fn vio_timing_stamp(id: u32, stage: u32) {
-    stamp(id, stage as usize);
-}
 
-#[no_mangle]
-pub extern "C" fn vio_timing_drop(id: u32) {
-    drop_trace(id);
-}
+
+
+
 
 #[cfg(test)]
 mod tests {

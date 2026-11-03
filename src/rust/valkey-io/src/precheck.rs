@@ -28,7 +28,6 @@ pub struct VioSession {
     pub flags: u32,
     pub dbid: c_int,
 }
-unsafe impl Send for VioSession {}
 
 impl VioSession {
     pub const fn empty() -> Self {
@@ -103,6 +102,7 @@ impl Drop for Batch<'_> {
 }
 
 #[cfg(test)]
+#[allow(unsafe_code)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
