@@ -136,7 +136,7 @@ start_server {config "minimal.conf" tags {"external:skip" "valgrind:skip"} overr
             set used_active_time [getInfoProperty $info used_active_time_io_thread_$i]
             assert {($used_active_time - $pre_sleep_active_times($i)) < ($elapsed_sec - $sleep_time_ms/1000.0)}
         }
-    }
+    } {} {needs:c-transport}
 }
 
 start_server {config "minimal.conf" tags {"external:skip" "valgrind:skip"} overrides {io-threads 5}} {

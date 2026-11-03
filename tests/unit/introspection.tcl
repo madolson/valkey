@@ -1379,6 +1379,10 @@ start_server {tags {"introspection"}} {
             rdma-bind
             rdma-port
             forkless-infrastructure-enabled
+            rust-io-mode
+            rust-io-port
+            rust-io-threads
+            rust-io-takeover
         }
 
         if {!$::tls} {
@@ -1576,7 +1580,7 @@ start_server {tags {"introspection"}} {
         set r1 [valkey_client]
         assert_equal [$r1 ping] "PONG"
         $r1 close
-    }
+    } {} {needs:c-transport}
 
     test {CONFIG SET duplicate configs} {
         assert_error "ERR *duplicate*" {r config set maxmemory 10000001 maxmemory 10000002}

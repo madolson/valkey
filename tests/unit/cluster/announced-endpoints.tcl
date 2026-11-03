@@ -91,5 +91,5 @@ start_cluster 2 2 {tags {external:skip cluster}} {
         } else {
             R 0 config set port $baseport
         }
-    }
+    } {} {needs:c-transport}
 }

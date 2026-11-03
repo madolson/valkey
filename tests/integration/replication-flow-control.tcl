@@ -31,6 +31,6 @@ start_server {tags {"repl network external:skip cluster:skip"} overrides {save "
             }
             set client_reads [getInfoProperty [$replica info stats] io_threaded_reads_processed]
             assert_morethan $client_reads $reads_after
-        }
+        } {} {needs:c-transport}
     }
 }
