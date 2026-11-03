@@ -395,10 +395,10 @@ taken through `pending.swap(false)` at `TOK_WAKE` (after the stage 1
 drain-then-clear), and at the end of an iteration only when no eventfd
 write is pending (`take_inbox()`, `lib.rs`).
 
-It is off by default (`VIO_HANDOFF_DISABLE` defaults to 2). Measured: it
-saves the main thread 3-6% CPU per request at `-P 1` with 4-6 IO threads
-(first pass, `bench-v2-firstpass.csv` in the stage 4a report directory),
-but with one IO thread at `-P 16` GET drops from 999k to 841k RPS. The
+It is off by default (`VIO_HANDOFF_DISABLE` defaults to 2). Measured (see
+"Measured" below): on top of the default it saves the main thread 11-16%
+CPU per request at `-P 1` with 4-6 IO threads, but with one IO thread at
+`-P 16` GET drops from 959k to 685k RPS and SET from 958k to 630k. The
 voluntary context switches of the IO thread over 3 s go from 4 to 832: an
 IO thread that takes its kicks as soon as they appear drains them, finds
 nothing else, sleeps, and is woken again for the next reply. With the
@@ -468,14 +468,16 @@ three. Raw rows: `bench.csv` (variants `final-d7`, `final-d6`, `final`,
 Reading it: the default cuts main-thread time per request at `-P 1` by 3%
 (4 threads, SET) to 8% (6 threads), and t6 `-P 1` p99 from 0.97/1.11 ms to
 0.62/0.65 ms (GET/SET), with no throughput loss. The IO-thread awake check
-(0) is the larger lever on CPU, -15% to -22% at `-P 1` with 4-6 threads,
-and costs 29-34% throughput with one IO thread at `-P 16` and 5% at
-4 threads `-P 1`. `-P 16` RPS at 4-6 threads moves in 4% steps (12M
+(0) is the larger lever on CPU, -11% to -16% against the default at `-P 1`
+with 4-6 threads, and costs 29-34% throughput with one IO thread at
+`-P 16` and 5% at 4 threads `-P 1`. `-P 16` RPS at 4-6 threads moves in 4% steps (12M
 requests in 6.0 vs 6.26 s), within noise.
 
 With 8 benchmark threads the stage 1 figure (4.0 s/1M at `-P 1`, 4 IO
 threads) does not appear: the baseline is 1.4-1.8 s/1M. Stages 1-3 used 4
-benchmark threads, client-bound at 210-222k RPS.
+benchmark threads, client-bound at 210-222k RPS. Rerun that way (4 IO
+threads, `-P 1`, GET/SET): 3.99/4.04 s/1M for the merge binary, 3.81/3.87
+with the default, 3.13/3.21 with all three parts on, all at 222k RPS.
 
 ## Edits to shared files in stage 4a
 
