@@ -132,9 +132,26 @@ struct Shared {
     /// the pointer array) of `cmds`.
     cmds_input: usize,
     cmds_argv: usize,
+    /// Protocol error: a sample of the input at the error and its length,
+    /// for the engine's "Query buffer: ..." log line (vio_conn_err_sample).
+    err_sample: Vec<u8>,
+    err_input_len: usize,
     out: Vec<u8>,
 }
 
+/// setProtocolError()'s PROTO_DUMP_LEN.
+const PROTO_DUMP_LEN: usize = 128;
+
+/// What setProtocolError() logs of the query buffer: all of it below
+/// PROTO_DUMP_LEN bytes, else the first and last PROTO_DUMP_LEN / 2.
+fn err_sample(input: &[u8]) -> Vec<u8> {
+    if input.len() < PROTO_DUMP_LEN {
+        input.to_vec()
+    } else {
+        let h = PROTO_DUMP_LEN / 2;
+        [&input[..h], &input[input.len() - h..]].concat()
+    }
+}
 
 /// argv bytes of a parsed command, as getClientMemoryUsage() counts argv.
 fn cmd_argv_bytes(c: &VioCmd) -> usize {
@@ -575,7 +592,14 @@ impl Worker {
             in_cap: AtomicUsize::new(0),
             out_bytes: AtomicUsize::new(0),
             job: AtomicUsize::new(0),
-            shared: Mutex::new(Shared { cmds: VecDeque::new(), cmds_input: 0, cmds_argv: 0, out: Vec::new() }),
+            shared: Mutex::new(Shared {
+                cmds: VecDeque::new(),
+                cmds_input: 0,
+                cmds_argv: 0,
+                err_sample: Vec::new(),
+                err_input_len: 0,
+                out: Vec::new(),
+            }),
             session: precheck::SessionView::new(),
             #[cfg(feature = "timing")]
             trace: AtomicU32::new(0),
@@ -850,6 +874,7 @@ impl Worker {
         ptrs.clear();
         lens.clear();
         let mut ncmds = 0usize;
+        let mut sample: Option<(Vec<u8>, usize)> = None;
         loop {
             let frame = &l.rbuf[l.rpos..];
             match l.parser.parse(frame, &lim) {
@@ -897,6 +922,9 @@ impl Worker {
                 Outcome::Empty { consumed } => l.rpos += consumed,
                 Outcome::Incomplete => break,
                 Outcome::Error(e, b) => {
+                    /* C's qb_pos is past the parts already parsed. */
+                    let at = &frame[l.parser.frame_consumed().min(frame.len())..];
+                    sample = Some((err_sample(at), at.len()));
                     batch.push(VioCmd {
                         argv: std::ptr::null_mut(),
                         argc: 0,
@@ -945,6 +973,10 @@ impl Worker {
                 let mut sh = conn.shared.lock().unwrap();
                 sh.cmds_input += input;
                 sh.cmds_argv += argv;
+                if let Some((v, n)) = sample.take() {
+                    sh.err_sample = v;
+                    sh.err_input_len = n;
+                }
                 #[cfg(feature = "timing")]
                 for c in batch.iter().filter(|c| c.trace != 0) {
                     timing::stamp(c.trace, timing::ST_ENQUEUED);
@@ -1399,6 +1431,7 @@ fn take_ready(g: &Global) -> c_int {
     let Some(batch) = g.ready.take() else {
         return 0;
     };
+
     MAIN_READY.with(|r| r.borrow_mut().extend(batch.conns));
     MAIN_DONE.with(|d| d.borrow_mut().extend(batch.done));
     1

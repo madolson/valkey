@@ -20,6 +20,8 @@
 #include "memory_prefetch.h"
 #include "io_threads.h"
 
+#include <ctype.h>
+
 #ifdef USE_RUST_IO
 
 #include "rust/valkey-io/include/valkey_io.h"
@@ -211,7 +213,34 @@ static void rustIoPublish(rustConnection *rc, client *c) {
     }
 }
 
-static void rustIoProtocolError(client *c, int err, int byte) {
+/* setProtocolError()'s log line, with the query buffer sample Rust kept
+ * from where the parser stopped. */
+#define RUST_IO_PROTO_DUMP_LEN 128
+static void rustIoLogProtocolError(rustConnection *rc, client *c, const char *errstr) {
+    if (server.verbosity > LL_VERBOSE) return;
+    sds ci = catClientInfoString(sdsempty(), c, server.hide_user_data_from_log);
+    char buf[256];
+    buf[0] = '\0';
+    if (server.hide_user_data_from_log) {
+        snprintf(buf, sizeof(buf), "*redacted*");
+    } else if (rc->h) {
+        unsigned char sample[RUST_IO_PROTO_DUMP_LEN];
+        size_t total = 0;
+        size_t n = vio_conn_err_sample(rc->h, sample, sizeof(sample), &total);
+        if (total < RUST_IO_PROTO_DUMP_LEN) {
+            snprintf(buf, sizeof(buf), "'%.*s'", (int)n, sample);
+        } else if (n == RUST_IO_PROTO_DUMP_LEN) {
+            snprintf(buf, sizeof(buf), "'%.*s' (... more %zu bytes ...) '%.*s'", RUST_IO_PROTO_DUMP_LEN / 2, sample,
+                     total - RUST_IO_PROTO_DUMP_LEN, RUST_IO_PROTO_DUMP_LEN / 2, sample + RUST_IO_PROTO_DUMP_LEN / 2);
+        }
+        for (char *p = buf; *p != '\0'; p++)
+            if (!isprint((unsigned char)*p)) *p = '.';
+    }
+    serverLog(LL_VERBOSE, "Protocol error (%s) from client: %s. Query buffer: %s", errstr, ci, buf);
+    sdsfree(ci);
+}
+
+static void rustIoProtocolError(rustConnection *rc, client *c, int err, int byte) {
     const char *msg = NULL;
     switch (err) {
     case VIO_ERR_BIG_INLINE: msg = "Protocol error: too big inline request"; break;
@@ -227,11 +256,16 @@ static void rustIoProtocolError(client *c, int err, int byte) {
     case VIO_ERR_UNEXPECTED_CHAR: break;
     default: serverPanic("Unknown rust-io protocol error %d", err);
     }
-    if (msg)
+    /* setProtocolError() logs at parse time, before the reply. */
+    if (msg) {
+        rustIoLogProtocolError(rc, c, msg + strlen("Protocol error: "));
         addReplyError(c, msg);
-    else
+    } else {
+        char errstr[32];
+        snprintf(errstr, sizeof(errstr), "expected '$', got '%c'", byte);
+        rustIoLogProtocolError(rc, c, errstr);
         addReplyErrorFormat(c, "Protocol error: expected '$', got '%c'", byte);
-    serverLog(LL_VERBOSE, "Protocol error (%d) from rust-io client id=%llu", err, (unsigned long long)c->id);
+    }
     c->flag.close_after_reply = 1;
     c->flag.protocol_error = 1;
 }
@@ -250,7 +284,7 @@ static bool rustIoCanProgress(rustConnection *rc, client *c) {
  * the queue trim, and what Rust reads about the client. */
 static void rustIoAfterCommands(rustConnection *rc, client *c) {
     if (rc->pending_err > 0 && engineCmdQueuePending(c) == 0 && canParseCommand(c)) {
-        rustIoProtocolError(c, rc->pending_err, rc->pending_err_byte);
+        rustIoProtocolError(rc, c, rc->pending_err, rc->pending_err_byte);
         rc->pending_err = -1;
     }
     trimCommandQueue(c);

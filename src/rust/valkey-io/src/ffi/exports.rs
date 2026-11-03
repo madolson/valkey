@@ -284,6 +284,27 @@ pub unsafe extern "C" fn vio_conn_mem(h: ConnRef<'_>, out: *mut VioConnMem) {
     unsafe { out.write(m) };
 }
 
+/// After a protocol error (VioCmd.err): copy up to `cap` bytes of the
+/// input sample (the whole input from the error on if shorter than 128
+/// bytes, else its first and last 64) to `buf`, and store the input's
+/// length in `total`. Returns the bytes copied.
+///
+/// # Safety
+/// `h` must be a live handle, `buf` writable for `cap` bytes, `total`
+/// writable.
+#[no_mangle]
+pub unsafe extern "C" fn vio_conn_err_sample(h: ConnRef<'_>, buf: *mut u8, cap: usize, total: *mut usize) -> usize {
+    let sh = h.shared.lock().unwrap();
+    let n = sh.err_sample.len().min(cap);
+    // SAFETY: the caller provides `cap` writable bytes at `buf` and a
+    // writable `total`.
+    unsafe {
+        std::ptr::copy_nonoverlapping(sh.err_sample.as_ptr(), buf, n);
+        total.write(sh.err_input_len);
+    }
+    n
+}
+
 /// Sum of in_alloc over every connection: read buffers live in the system
 /// allocator, so the engine adds this to used memory for maxmemory.
 ///
