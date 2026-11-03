@@ -140,3 +140,9 @@ pub fn rdtsc() -> u64 {
     #[cfg(not(target_arch = "x86_64"))]
     monotonic_ns()
 }
+
+/// pthread_self() as an integer, to compare threads.
+pub fn thread_self() -> usize {
+    // SAFETY: pthread_self has no preconditions.
+    unsafe { libc::pthread_self() as usize }
+}

@@ -96,6 +96,13 @@
 typedef struct VioConn VioConn;
 
 /*
+ One IO layer instance (`VioRuntime` in C): returned by vio_start() and
+ passed to every export. It lives until the process exits (there is no
+ vio_stop), so its IO threads and connections hold `&'static Global`.
+ */
+typedef struct VioRuntime VioRuntime;
+
+/*
  One parsed command, or a protocol error when `err != 0`.
  */
 typedef struct {
@@ -212,14 +219,16 @@ typedef struct {
 #endif
 
 /*
- Bind the listener and start the IO threads. Returns the eventfd the
- engine must poll for readability (then call vio_main_begin_drain), or
- -1 with errno set.
+ Bind the listener and start the IO threads. Returns the runtime every
+ other export takes, and stores in `*efd` the eventfd the engine must
+ poll for readability (then call vio_main_begin_drain); NULL with errno
+ set on failure. The calling thread is the runtime's engine thread.
 
  # Safety
- `cfg` must point at a valid VioConfig. Call once, on the engine thread.
+ `cfg` must point at a valid VioConfig and `efd` be writable. Call on the
+ engine thread.
  */
-int vio_start(const VioConfig *cfg);
+const VioRuntime *vio_start(const VioConfig *cfg, int *efd);
 
 /*
  The engine changed proto-max-bulk-len or client-query-buffer-limit.
@@ -227,7 +236,9 @@ int vio_start(const VioConfig *cfg);
  # Safety
  None beyond the FFI ABI; any thread, after vio_start().
  */
-void vio_set_limits(long long proto_max_bulk_len, size_t client_max_querybuf_len);
+void vio_set_limits(const VioRuntime *rt,
+                    long long proto_max_bulk_len,
+                    size_t client_max_querybuf_len);
 
 /*
  Hand the kicks collected on the main thread to their IO threads. Called
@@ -237,7 +248,7 @@ void vio_set_limits(long long proto_max_bulk_len, size_t client_max_querybuf_len
  # Safety
  Engine thread only (the thread that called vio_start()).
  */
-void vio_main_flush_kicks(void);
+void vio_main_flush_kicks(const VioRuntime *rt);
 
 /*
  Consume the main eventfd and take the current batch of ready
@@ -246,7 +257,7 @@ void vio_main_flush_kicks(void);
  # Safety
  Engine thread only (the thread that called vio_start()).
  */
-void vio_main_begin_drain(void);
+void vio_main_begin_drain(const VioRuntime *rt);
 
 /*
  Last call before the main thread polls. Returns 1 when work arrived that
@@ -255,7 +266,7 @@ void vio_main_begin_drain(void);
  # Safety
  Engine thread only (the thread that called vio_start()).
  */
-int vio_main_before_poll(void);
+int vio_main_before_poll(const VioRuntime *rt);
 
 /*
  First call after the main thread polled. Takes work handed over while
@@ -266,7 +277,7 @@ int vio_main_before_poll(void);
  # Safety
  Engine thread only (the thread that called vio_start()).
  */
-int vio_main_after_poll(void);
+int vio_main_after_poll(const VioRuntime *rt);
 
 /*
  Next ready connection from the current batch, or NULL. The caller owns
@@ -275,7 +286,7 @@ int vio_main_after_poll(void);
  # Safety
  Engine thread only (the thread that called vio_start()).
  */
-VioConnHandle vio_main_next_ready(void);
+VioConnHandle vio_main_next_ready(const VioRuntime *rt);
 
 /*
  Next completed zero-copy write job from the current batch, or NULL.
@@ -283,7 +294,7 @@ VioConnHandle vio_main_next_ready(void);
  # Safety
  Engine thread only (the thread that called vio_start()).
  */
-void *vio_main_next_done(void);
+void *vio_main_next_done(const VioRuntime *rt);
 
 /*
  Whether the current batch still holds connections. True inside a long
@@ -294,7 +305,7 @@ void *vio_main_next_done(void);
  # Safety
  Engine thread only (the thread that called vio_start()).
  */
-int vio_main_has_ready(void);
+int vio_main_has_ready(const VioRuntime *rt);
 
 /*
  A new strong reference to `h`.
@@ -302,19 +313,19 @@ int vio_main_has_ready(void);
  # Safety
  `h` must be a live handle.
  */
-VioConnHandle vio_conn_retain(VioConnRef h);
+VioConnHandle vio_conn_retain(const VioRuntime *_rt, VioConnRef h);
 
 /*
  # Safety
  `h` must be a live handle; the caller gives up this reference.
  */
-void vio_conn_release(VioConnHandle h);
+void vio_conn_release(const VioRuntime *_rt, VioConnHandle h);
 
 /*
  # Safety
  `h` must be a live handle.
  */
-uint32_t vio_conn_take_events(VioConnRef h);
+uint32_t vio_conn_take_events(const VioRuntime *rt, VioConnRef h);
 
 /*
  Publish the engine's maxclients (admission control).
@@ -322,7 +333,7 @@ uint32_t vio_conn_take_events(VioConnRef h);
  # Safety
  None beyond the FFI ABI; any thread.
  */
-void vio_set_maxclients(size_t n);
+void vio_set_maxclients(const VioRuntime *rt, size_t n);
 
 /*
  Connections refused at maxclients since the last call.
@@ -330,25 +341,25 @@ void vio_set_maxclients(size_t n);
  # Safety
  None beyond the FFI ABI; any thread.
  */
-size_t vio_take_rejected(void);
+size_t vio_take_rejected(const VioRuntime *rt);
 
 /*
  # Safety
  `h` must be a live handle.
  */
-void *vio_conn_udata(VioConnRef h);
+void *vio_conn_udata(const VioRuntime *_rt, VioConnRef h);
 
 /*
  # Safety
  `h` must be a live handle. Rust stores `p` and never dereferences it.
  */
-void vio_conn_set_udata(VioConnRef h, void *p);
+void vio_conn_set_udata(const VioRuntime *_rt, VioConnRef h, void *p);
 
 /*
  # Safety
  `h` must be a live handle.
  */
-int vio_conn_fd(VioConnRef h);
+int vio_conn_fd(const VioRuntime *_rt, VioConnRef h);
 
 /*
  Move up to `max` parsed commands into `out`, in order. argv ownership
@@ -357,13 +368,13 @@ int vio_conn_fd(VioConnRef h);
  # Safety
  `h` must be a live handle and `out` valid for `max` writes.
  */
-size_t vio_conn_pop_cmds(VioConnRef h, VioCmd *out, size_t max);
+size_t vio_conn_pop_cmds(const VioRuntime *rt, VioConnRef h, VioCmd *out, size_t max);
 
 /*
  # Safety
  `h` must be a live handle.
  */
-size_t vio_conn_pending_cmds(VioConnRef h);
+size_t vio_conn_pending_cmds(const VioRuntime *_rt, VioConnRef h);
 
 /*
  Bytes accepted from the engine and not yet written to the socket.
@@ -371,7 +382,7 @@ size_t vio_conn_pending_cmds(VioConnRef h);
  # Safety
  `h` must be a live handle.
  */
-size_t vio_conn_pending_out(VioConnRef h);
+size_t vio_conn_pending_out(const VioRuntime *_rt, VioConnRef h);
 
 /*
  Copy engine output into the connection's outbound buffer and wake its
@@ -382,7 +393,7 @@ size_t vio_conn_pending_out(VioConnRef h);
  `h` must be a live handle and `iov[0..iovcnt]` valid iovecs, each
  pointing at `iov_len` readable bytes, for the duration of the call.
  */
-ptrdiff_t vio_conn_writev(VioConnRef h, const struct iovec *iov, int iovcnt);
+ptrdiff_t vio_conn_writev(const VioRuntime *rt, VioConnRef h, const struct iovec *iov, int iovcnt);
 
 /*
  Hand the IO thread a sealed reply chunk to write from engine memory
@@ -395,7 +406,7 @@ ptrdiff_t vio_conn_writev(VioConnRef h, const struct iovec *iov, int iovcnt);
  `h` must be a live handle with no job in flight; `job` stays valid until
  it is returned.
  */
-void vio_conn_submit_write(VioConnRef h, void *job, uint64_t release_offset);
+void vio_conn_submit_write(const VioRuntime *rt, VioConnRef h, void *job, uint64_t release_offset);
 
 /*
  Return an executed argv to the IO thread that built it, to be freed
@@ -404,7 +415,7 @@ void vio_conn_submit_write(VioConnRef h, void *job, uint64_t release_offset);
  # Safety
  `h` must be a live handle; ownership of `argv[0..argc]` moves to Rust.
  */
-void vio_conn_return_argv(VioConnRef h, void **argv, int argc);
+void vio_conn_return_argv(const VioRuntime *rt, VioConnRef h, void **argv, int argc);
 
 /*
  The engine wants VIO_EV_WRITABLE once outbound bytes drop below the low
@@ -413,7 +424,7 @@ void vio_conn_return_argv(VioConnRef h, void **argv, int argc);
  # Safety
  `h` must be a live handle.
  */
-void vio_conn_want_writable(VioConnRef h, int on);
+void vio_conn_want_writable(const VioRuntime *rt, VioConnRef h, int on);
 
 /*
  After each delivery: the commands the engine has popped so far (the
@@ -424,13 +435,13 @@ void vio_conn_want_writable(VioConnRef h, int on);
  # Safety
  `h` must be a live handle.
  */
-void vio_conn_publish(VioConnRef h, uint64_t consumed, int auth_required);
+void vio_conn_publish(const VioRuntime *rt, VioConnRef h, uint64_t consumed, int auth_required);
 
 /*
  # Safety
  None beyond the FFI ABI; any thread.
  */
-void vio_set_default_auth_required(int on);
+void vio_set_default_auth_required(const VioRuntime *rt, int on);
 
 /*
  Publish the session fields the precheck reads (cut point 2), when one
@@ -439,7 +450,7 @@ void vio_set_default_auth_required(int on);
  # Safety
  `h` must be a live handle and `s` a valid VioSession for the call.
  */
-void vio_conn_set_session(VioConnRef h, const VioSession *s);
+void vio_conn_set_session(const VioRuntime *_rt, VioConnRef h, const VioSession *s);
 
 /*
  The engine is done with the connection. Pending output is flushed, then
@@ -448,13 +459,13 @@ void vio_conn_set_session(VioConnRef h, const VioSession *s);
  # Safety
  `h` must be a live handle.
  */
-void vio_conn_close(VioConnRef h);
+void vio_conn_close(const VioRuntime *rt, VioConnRef h);
 
 /*
  # Safety
  `h` must be a live handle.
  */
-void vio_conn_shutdown(VioConnRef h);
+void vio_conn_shutdown(const VioRuntime *rt, VioConnRef h);
 
 #if defined(RUST_IO_TIMING)
 /*

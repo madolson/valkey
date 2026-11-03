@@ -20,12 +20,12 @@ pub mod timing;
 pub mod benchapi;
 
 use resp::{Arg, Limits, Outcome, Parser};
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::ffi::{c_char, c_int, c_void};
 use std::os::unix::io::{IntoRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 /* ---------------------------------------------------------------------------
  * FFI types (keep in sync with include/valkey_io.h)
@@ -116,6 +116,8 @@ struct Shared {
 }
 
 pub struct Conn {
+    /// The runtime this connection belongs to.
+    g: &'static Global,
     fd: RawFd,
     thread: usize,
     token: AtomicUsize,
@@ -154,7 +156,7 @@ pub struct Conn {
 
 impl Drop for Conn {
     fn drop(&mut self) {
-        let g = global();
+        let g = self.g;
         let sh = self.shared.get_mut().unwrap();
         g.adm.queued_sub(sh.cmds.len());
         g.adm.closed();
@@ -190,8 +192,8 @@ struct IoThread {
 }
 
 impl IoThread {
-    fn post(&self, f: impl FnOnce(&mut Vec<Msg>)) {
-        self.inbox.post(hd(HD_IO_AWAKE), f)
+    fn post(&self, g: &Global, f: impl FnOnce(&mut Vec<Msg>)) {
+        self.inbox.post(g.hd(HD_IO_AWAKE), f)
     }
 }
 
@@ -238,49 +240,76 @@ struct Global {
     /// is set by vio_main_before_poll and cleared by vio_main_after_poll.
     ready: handoff::Mailbox<Ready>,
     listen_fd: RawFd,
+    /// The port the listener is bound to (the configured one, or the
+    /// kernel's choice for port 0).
+    #[cfg_attr(not(test), allow(dead_code))]
+    port: u16,
     adm: admission::Admission,
+    /// authRequired() of a client that has not authenticated yet, published
+    /// by the engine. New connections start with it, so their first read is
+    /// parsed with the right limits before the engine adopts them.
+    default_auth_required: AtomicBool,
+    /// Measurement switch, read once from VIO_HANDOFF_DISABLE at
+    /// vio_start(): bit 1 = no main-thread kick batching, bit 2 = always
+    /// write the IO-thread eventfd, bit 4 = always write the main eventfd
+    /// (the stage 1 handoff is 7). Default 2: skipping the eventfd for an
+    /// awake IO thread lets it drain its kicks early, sleep, and be woken
+    /// again; with one IO thread at -P 16 that cost 16% throughput
+    /// (DESIGN.md "Handoff v2").
+    handoff_disable: u32,
+}
+
+impl Global {
+    fn hd(&self, bit: u32) -> bool {
+        self.handoff_disable & bit != 0
+    }
+}
+
+/// Engine-thread state: what used to be thread-locals of the thread that
+/// called vio_start().
+#[derive(Default)]
+pub(crate) struct MainState {
+    /// Kicks per IO thread, flushed by vio_main_flush_kicks().
+    kicks: Vec<Vec<Arc<Conn>>>,
+    /// Returned argv per IO thread, flushed with the kicks.
+    argv: Vec<Vec<(usize, c_int)>>,
+    ready: VecDeque<Arc<Conn>>,
+    /// Completed write jobs taken with the current batch.
+    done: VecDeque<usize>,
+    /// Swapped with the ready mailbox (handoff::Mailbox::swap).
+    swap: Ready,
+}
+
+/// One IO layer instance (`VioRuntime` in C): returned by vio_start() and
+/// passed to every export. It lives until the process exits (there is no
+/// vio_stop), so its IO threads and connections hold `&'static Global`.
+pub struct Runtime {
+    pub(crate) g: &'static Global,
+    /// Engine thread only (exports document it); checked in kick().
+    pub(crate) main: RefCell<MainState>,
+    main_thread: usize,
 }
 
 
-static GLOBAL: OnceLock<Global> = OnceLock::new();
-
-/// authRequired() of a client that has not authenticated yet, published by
-/// the engine. New connections start with it, so their first read is parsed
-/// with the right limits before the engine adopts them.
-static DEFAULT_AUTH_REQUIRED: AtomicBool = AtomicBool::new(false);
-
-/// Measurement switch, read once from VIO_HANDOFF_DISABLE at vio_start():
-/// bit 1 = no main-thread kick batching, bit 2 = always write the IO-thread
-/// eventfd, bit 4 = always write the main eventfd (the stage 1 handoff is 7).
-/// Default 2: skipping the eventfd for an awake IO thread lets it drain its
-/// kicks early, sleep, and be woken again; with one IO thread at -P 16 that
-/// cost 16% throughput (DESIGN.md "Handoff v2").
-static HANDOFF_DISABLE: AtomicU32 = AtomicU32::new(HD_IO_AWAKE);
 const HD_KICK_BATCH: u32 = 1;
 const HD_IO_AWAKE: u32 = 2;
 const HD_MAIN_AWAKE: u32 = 4;
 
-fn hd(bit: u32) -> bool {
-    HANDOFF_DISABLE.load(Ordering::Relaxed) & bit != 0
-}
-
-fn global() -> &'static Global {
-    GLOBAL.get().expect("valkey-io not started")
-}
-
 /// Ask the owning IO thread to re-evaluate a connection (flush output,
 /// resume reading, finish a close). Coalesced: one inbox entry per conn
 /// until the IO thread picks it up, one eventfd write per wakeup.
-fn kick(conn: &Arc<Conn>) {
+fn kick(rt: &Runtime, conn: &Arc<Conn>) {
     if conn.kicked.swap(true, Ordering::AcqRel) {
         return;
     }
+    let g = rt.g;
     /* Main thread: collect, and hand each IO thread its kicks in one inbox
      * append and at most one eventfd write at the end of beforeSleep()
      * (vio_main_flush_kicks). */
-    if IS_MAIN.with(|m| m.get()) && !hd(HD_KICK_BATCH) {
-        MAIN_KICKS.with(|k| {
-            let mut k = k.borrow_mut();
+    if sys::thread_self() == rt.main_thread && !g.hd(HD_KICK_BATCH) {
+        {
+            let mut m = rt.main.borrow_mut();
+            let k = &mut m.kicks;
             if k.len() <= conn.thread {
                 k.resize_with(conn.thread + 1, Vec::new);
             }
@@ -289,12 +318,12 @@ fn kick(conn: &Arc<Conn>) {
             /* Large batches: hand over early so the IO thread writes while
              * the main thread is still producing replies. */
             if list.len() >= KICK_BATCH {
-                flush_kicks(conn.thread, list);
+                flush_kicks(g, conn.thread, list);
             }
-        });
+        }
         return;
     }
-    global().threads[conn.thread].post(|q| q.push(Msg::Kick(conn.clone())));
+    g.threads[conn.thread].post(g, |q| q.push(Msg::Kick(conn.clone())));
 }
 
 
@@ -302,8 +331,8 @@ fn kick(conn: &Arc<Conn>) {
 /// iteration.
 const KICK_BATCH: usize = 32;
 
-fn flush_kicks(idx: usize, list: &mut Vec<Arc<Conn>>) {
-    global().threads[idx].post(|q| q.extend(list.drain(..).map(Msg::Kick)));
+fn flush_kicks(g: &Global, idx: usize, list: &mut Vec<Arc<Conn>>) {
+    g.threads[idx].post(g, |q| q.extend(list.drain(..).map(Msg::Kick)));
 }
 
 /// Argv returned per IO thread handed over before the end of the iteration.
@@ -312,28 +341,30 @@ const ARGV_BATCH: usize = 256;
 /// Main thread: queue an executed argv for the IO thread that built it.
 /// Handed over with the kicks (vio_main_flush_kicks), or early when the
 /// batch is large.
-fn return_argv(thread: usize, argv: usize, argc: c_int) {
-    MAIN_ARGV.with(|a| {
-        let mut a = a.borrow_mut();
+fn return_argv(rt: &Runtime, thread: usize, argv: usize, argc: c_int) {
+    let g = rt.g;
+    {
+        let mut m = rt.main.borrow_mut();
+        let a = &mut m.argv;
         if a.len() <= thread {
             a.resize_with(thread + 1, Vec::new);
         }
         a[thread].push((argv, argc));
         if a[thread].len() >= ARGV_BATCH {
             let v = &mut a[thread];
-            global().threads[thread].post(|q| q.extend(v.drain(..).map(|(p, n)| Msg::FreeArgv(p, n))));
+            g.threads[thread].post(g, |q| q.extend(v.drain(..).map(|(p, n)| Msg::FreeArgv(p, n))));
         }
-    });
+    }
 }
 
 /// Main thread: hand IO thread `idx` its kicks and returned argv with one
 /// inbox lock and at most one wakeup.
-fn flush_thread(idx: usize, kicks: &mut Vec<Arc<Conn>>, argv: Option<&mut Vec<(usize, c_int)>>) {
+fn flush_thread(g: &Global, idx: usize, kicks: &mut Vec<Arc<Conn>>, argv: Option<&mut Vec<(usize, c_int)>>) {
     let argv = argv.filter(|a| !a.is_empty());
     if kicks.is_empty() && argv.is_none() {
         return;
     }
-    global().threads[idx].post(|q| {
+    g.threads[idx].post(g, |q| {
         q.extend(kicks.drain(..).map(Msg::Kick));
         if let Some(v) = argv {
             q.extend(v.drain(..).map(|(p, n)| Msg::FreeArgv(p, n)));
@@ -345,14 +376,6 @@ fn flush_thread(idx: usize, kicks: &mut Vec<Arc<Conn>>, argv: Option<&mut Vec<(u
  * IO thread
  * ------------------------------------------------------------------------- */
 
-thread_local! {
-    /// True on the thread that called vio_start() (the engine main thread).
-    static IS_MAIN: Cell<bool> = const { Cell::new(false) };
-    /// Main thread: kicks per IO thread, flushed by vio_main_flush_kicks().
-    static MAIN_KICKS: RefCell<Vec<Vec<Arc<Conn>>>> = const { RefCell::new(Vec::new()) };
-    /// Main thread: returned argv per IO thread, flushed with the kicks.
-    static MAIN_ARGV: RefCell<Vec<Vec<(usize, c_int)>>> = const { RefCell::new(Vec::new()) };
-}
 
 const TOK_WAKE: u64 = 0;
 const TOK_LISTEN: u64 = 1;
@@ -375,6 +398,7 @@ struct Local {
 }
 
 struct Worker {
+    g: &'static Global,
     idx: usize,
     slab: Vec<Option<Local>>,
     free: Vec<usize>,
@@ -397,13 +421,13 @@ struct Worker {
 
 impl Worker {
     fn me(&self) -> &'static IoThread {
-        &global().threads[self.idx]
+        &self.g.threads[self.idx]
     }
 
     /// Precheck mode: the policy snapshot, pinned on first use in this poll
     /// iteration and released by unpin() before the thread sleeps.
     fn pin(&mut self) -> Option<*mut c_void> {
-        let g = global();
+        let g = self.g;
         let begin = g.cbs.precheck_begin?;
         g.cbs.precheck_batch?;
         let p = *self.pinned.get_or_insert_with(|| begin(self.idx as c_int) as usize);
@@ -412,7 +436,7 @@ impl Worker {
 
     fn unpin(&mut self) {
         if self.pinned.take().is_some() {
-            if let Some(end) = global().cbs.precheck_end {
+            if let Some(end) = self.g.cbs.precheck_end {
                 end(self.idx as c_int);
             }
         }
@@ -434,7 +458,7 @@ impl Worker {
             return;
         }
         let (conns, done) = (&mut self.to_notify, &mut self.done);
-        global().ready.post(hd(HD_MAIN_AWAKE), |r| {
+        self.g.ready.post(self.g.hd(HD_MAIN_AWAKE), |r| {
             r.conns.append(conns);
             r.done.append(done);
         });
@@ -453,7 +477,7 @@ impl Worker {
             return;
         }
         let can = !l.conn.peer_closed.load(Ordering::Acquire) && l.woff == l.wbuf.len();
-        let r = (global().cbs.write_job.expect("write_job"))(job as *mut c_void, l.conn.fd, can as c_int);
+        let r = (self.g.cbs.write_job.expect("write_job"))(job as *mut c_void, l.conn.fd, can as c_int);
         #[cfg(feature = "timing")]
         if l.woff == l.wbuf.len() {
             let t = l.conn.trace.swap(0, Ordering::Relaxed);
@@ -471,6 +495,7 @@ impl Worker {
 
     fn add_conn(&mut self, fd: RawFd) {
         let conn = Arc::new(Conn {
+            g: self.g,
             fd,
             thread: self.idx,
             token: AtomicUsize::new(0),
@@ -482,7 +507,7 @@ impl Worker {
             peer_closed: AtomicBool::new(false),
             want_writable: AtomicBool::new(false),
             read_paused: AtomicBool::new(false),
-            auth_required: AtomicBool::new(DEFAULT_AUTH_REQUIRED.load(Ordering::Relaxed)),
+            auth_required: AtomicBool::new(self.g.default_auth_required.load(Ordering::Relaxed)),
             parse_held: AtomicBool::new(false),
             half_close: AtomicBool::new(false),
             ncmds: AtomicUsize::new(0),
@@ -573,7 +598,7 @@ impl Worker {
     }
 
     fn on_readable(&mut self, idx: usize) {
-        let g = global();
+        let g = self.g;
         let l = match self.slab[idx].as_mut() {
             Some(l) => l,
             None => return,
@@ -627,7 +652,7 @@ impl Worker {
     /// like the C parser: AUTH/HELLO change the limits for what follows.
     /// The engine's next vio_conn_publish() resumes parsing.
     fn parse_buffered(&mut self, idx: usize) {
-        let g = global();
+        let g = self.g;
         let snap = self.pin();
         let l = match self.slab[idx].as_mut() {
             Some(l) => l,
@@ -840,7 +865,7 @@ impl Worker {
                 /* Removed already: hand a job back unwritten. */
                 let job = conn.job.swap(0, Ordering::AcqRel);
                 if job != 0 {
-                    (global().cbs.write_job.expect("write_job"))(job as *mut c_void, conn.fd, 0);
+                    (self.g.cbs.write_job.expect("write_job"))(job as *mut c_void, conn.fd, 0);
                     self.done.push(job);
                 }
                 return;
@@ -850,7 +875,7 @@ impl Worker {
             self.remove(idx);
             return;
         }
-        if conn.read_paused.load(Ordering::Acquire) && global().adm.may_resume(conn.ncmds.load(Ordering::Acquire)) {
+        if conn.read_paused.load(Ordering::Acquire) && self.g.adm.may_resume(conn.ncmds.load(Ordering::Acquire)) {
             conn.read_paused.store(false, Ordering::Release);
         }
         self.flush(idx);
@@ -920,13 +945,13 @@ impl Worker {
 
     /// Thread 0 only: add or remove the listener from the epoll set.
     fn listen_interest(&self, on: bool) {
-        sys::epoll_mod(self.me().epfd, global().listen_fd, if on { sys::EPOLLIN } else { 0 }, TOK_LISTEN);
+        sys::epoll_mod(self.me().epfd, self.g.listen_fd, if on { sys::EPOLLIN } else { 0 }, TOK_LISTEN);
     }
 
     /// Stop polling the listener while the engine is NEW_HIGH connections
     /// behind. Returns true when paused.
     fn accept_backoff(&self) -> bool {
-        let adm = &global().adm;
+        let adm = &self.g.adm;
         if !adm.should_pause() {
             return false;
         }
@@ -940,7 +965,7 @@ impl Worker {
     }
 
     fn accept_all(&mut self) {
-        let g = global();
+        let g = self.g;
         loop {
             if self.accept_backoff() {
                 return;
@@ -961,7 +986,7 @@ impl Worker {
             if target == self.idx {
                 self.add_conn(fd);
             } else {
-                g.threads[target].post(|q| q.push(Msg::NewFd(fd)));
+                g.threads[target].post(g, |q| q.push(Msg::NewFd(fd)));
             }
         }
     }
@@ -978,7 +1003,7 @@ impl Worker {
                         self.listen_interest(true);
                         self.accept_all();
                     }
-                    Msg::FreeArgv(argv, argc) => (global().cbs.free_argv)(argv as *mut *mut c_void, argc),
+                    Msg::FreeArgv(argv, argc) => (self.g.cbs.free_argv)(argv as *mut *mut c_void, argc),
                 }
             }
         }
@@ -1027,8 +1052,9 @@ impl Worker {
  * ------------------------------------------------------------------------- */
 
 /// Bind the listener and start the IO threads (vio_start). Returns the
-/// engine's eventfd, or an errno value.
-fn start(bind: Option<String>, port: c_int, threads: c_int, cbs: VioCallbacks, limits: EngineLimits) -> Result<RawFd, i32> {
+/// runtime and the engine's eventfd, or an errno value. Call on the engine
+/// thread: it becomes the runtime's main thread.
+fn start(bind: Option<String>, port: c_int, threads: c_int, cbs: VioCallbacks, limits: EngineLimits) -> Result<(&'static Runtime, RawFd), i32> {
     let addr = match bind {
         None => "0.0.0.0".to_string(),
         Some(s) => {
@@ -1043,6 +1069,7 @@ fn start(bind: Option<String>, port: c_int, threads: c_int, cbs: VioCallbacks, l
     if let Err(e) = listener.set_nonblocking(true) {
         return Err(e.raw_os_error().unwrap_or(libc::EINVAL));
     }
+    let bound_port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
     let listen_fd = listener.into_raw_fd();
     let nthreads = threads.max(1) as usize;
     let mut threads = Vec::with_capacity(nthreads);
@@ -1060,23 +1087,22 @@ fn start(bind: Option<String>, port: c_int, threads: c_int, cbs: VioCallbacks, l
     if main_efd < 0 {
         return Err(sys::errno());
     }
-    let g = Global {
+    let handoff_disable = std::env::var("VIO_HANDOFF_DISABLE").ok().and_then(|v| v.parse().ok()).unwrap_or(HD_IO_AWAKE);
+    let g: &'static Global = Box::leak(Box::new(Global {
         cbs,
         limits,
         threads,
         ready: handoff::Mailbox::new(main_efd, true),
         listen_fd,
+        port: bound_port,
         adm: admission::Admission::new(),
-    };
-    if GLOBAL.set(g).is_err() {
-        return Err(libc::EALREADY);
-    }
-    IS_MAIN.with(|m| m.set(true));
-    if let Some(v) = std::env::var("VIO_HANDOFF_DISABLE").ok().and_then(|v| v.parse().ok()) {
-        HANDOFF_DISABLE.store(v, Ordering::Relaxed);
-    }
+        default_auth_required: AtomicBool::new(false),
+        handoff_disable,
+    }));
+    let rt: &'static Runtime = Box::leak(Box::new(Runtime { g, main: RefCell::new(MainState::default()), main_thread: sys::thread_self() }));
     for idx in 0..nthreads {
         let w = Worker {
+            g,
             idx,
             slab: Vec::new(),
             free: Vec::new(),
@@ -1094,34 +1120,26 @@ fn start(bind: Option<String>, port: c_int, threads: c_int, cbs: VioCallbacks, l
             .spawn(move || w.run())
             .expect("spawn rust-io thread");
     }
-    Ok(main_efd)
+    Ok((rt, main_efd))
 }
 
 /* ---------------------------------------------------------------------------
  * Main thread state (exports in ffi/exports.rs)
  * ------------------------------------------------------------------------- */
 
-thread_local! {
-    static MAIN_READY: RefCell<VecDeque<Arc<Conn>>> = const { RefCell::new(VecDeque::new()) };
-    /// Completed write jobs taken with the current batch.
-    static MAIN_DONE: RefCell<VecDeque<usize>> = const { RefCell::new(VecDeque::new()) };
-    /// Swapped with the ready mailbox (handoff::Mailbox::swap).
-    static MAIN_SWAP: RefCell<Ready> = RefCell::new(Ready::default());
-}
 
 
 /// Take connections that became ready while the main thread was awake (no
 /// eventfd was written for them). Returns 1 when there was pending work.
-fn take_ready(g: &Global) -> c_int {
-    MAIN_SWAP.with(|b| {
-        let mut b = b.borrow_mut();
-        if !g.ready.swap(&mut b) {
-            return 0;
-        }
-        MAIN_READY.with(|r| r.borrow_mut().extend(b.conns.drain(..)));
-        MAIN_DONE.with(|d| d.borrow_mut().extend(b.done.drain(..)));
-        1
-    })
+fn take_ready(rt: &Runtime) -> c_int {
+    let mut m = rt.main.borrow_mut();
+    let m = &mut *m;
+    if !rt.g.ready.swap(&mut m.swap) {
+        return 0;
+    }
+    m.ready.extend(m.swap.conns.drain(..));
+    m.done.extend(m.swap.done.drain(..));
+    1
 }
 
 
@@ -1145,3 +1163,64 @@ fn take_ready(g: &Global) -> c_int {
 
 
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    extern "C" fn t_create(_p: *const *const u8, _l: *const usize, _c: *mut VioCmd, _n: usize) {}
+    extern "C" fn t_free(_a: *mut *mut c_void, _c: c_int) {}
+
+    fn cbs() -> VioCallbacks {
+        VioCallbacks { create_argvs: t_create, free_argv: t_free, write_job: None, precheck_begin: None, precheck_end: None, precheck_batch: None }
+    }
+
+    /// Wait until `rt` has a ready connection; false after 5 s.
+    fn wait_ready(rt: &Runtime) -> bool {
+        let t = Instant::now();
+        while t.elapsed() < Duration::from_secs(5) {
+            take_ready(rt);
+            if !rt.main.borrow().ready.is_empty() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        false
+    }
+
+    /// Two runtimes in one process: each has its own listener, IO threads,
+    /// ready queue and engine-thread state, and a connection to one shows
+    /// up only in that one.
+    #[test]
+    #[cfg_attr(miri, ignore)] // sockets and epoll
+    fn two_runtimes() {
+        let (a, _) = start(Some("127.0.0.1".into()), 0, 2, cbs(), EngineLimits::new(512 << 20, 1 << 30)).unwrap();
+        let (b, _) = start(Some("127.0.0.1".into()), 0, 1, cbs(), EngineLimits::new(512 << 20, 1 << 30)).unwrap();
+        assert!(!std::ptr::eq(a.g, b.g));
+        assert_ne!(a.g.port, b.g.port);
+        assert_eq!((a.g.threads.len(), b.g.threads.len()), (2, 1));
+        a.g.default_auth_required.store(true, Ordering::Relaxed);
+
+        let _ca = std::net::TcpStream::connect(("127.0.0.1", a.g.port)).unwrap();
+        assert!(wait_ready(a));
+        take_ready(b);
+        assert!(b.main.borrow().ready.is_empty());
+        let conn = a.main.borrow_mut().ready.pop_front().unwrap();
+        assert!(std::ptr::eq(conn.g, a.g));
+        assert!(conn.auth_required.load(Ordering::Relaxed));
+
+        let _cb = std::net::TcpStream::connect(("127.0.0.1", b.g.port)).unwrap();
+        assert!(wait_ready(b));
+        let conn = b.main.borrow_mut().ready.pop_front().unwrap();
+        assert!(std::ptr::eq(conn.g, b.g));
+        assert!(!conn.auth_required.load(Ordering::Relaxed));
+        take_ready(a);
+        assert!(a.main.borrow().ready.is_empty());
+
+        /* Engine-thread state is per runtime: the kick batches in b's. */
+        kick(b, &conn);
+        assert_eq!(b.main.borrow().kicks.iter().map(|k| k.len()).sum::<usize>(), 1);
+        assert_eq!(a.main.borrow().kicks.iter().map(|k| k.len()).sum::<usize>(), 0);
+    }
+}

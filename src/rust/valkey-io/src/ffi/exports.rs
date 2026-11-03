@@ -5,14 +5,16 @@ use std::ffi::{c_int, c_longlong, c_void, CStr};
 use std::sync::atomic::Ordering;
 use super::{ConnHandle, ConnRef};
 
-/// Bind the listener and start the IO threads. Returns the eventfd the
-/// engine must poll for readability (then call vio_main_begin_drain), or
-/// -1 with errno set.
+/// Bind the listener and start the IO threads. Returns the runtime every
+/// other export takes, and stores in `*efd` the eventfd the engine must
+/// poll for readability (then call vio_main_begin_drain); NULL with errno
+/// set on failure. The calling thread is the runtime's engine thread.
 ///
 /// # Safety
-/// `cfg` must point at a valid VioConfig. Call once, on the engine thread.
+/// `cfg` must point at a valid VioConfig and `efd` be writable. Call on the
+/// engine thread.
 #[no_mangle]
-pub unsafe extern "C" fn vio_start(cfg: *const VioConfig) -> c_int {
+pub unsafe extern "C" fn vio_start(cfg: *const VioConfig, efd: *mut c_int) -> Option<&'static Runtime> {
     // SAFETY: caller contract.
     let cfg = unsafe { &*cfg };
     let bind = if cfg.bindaddr.is_null() {
@@ -23,10 +25,14 @@ pub unsafe extern "C" fn vio_start(cfg: *const VioConfig) -> c_int {
     };
     let limits = EngineLimits::new(cfg.proto_max_bulk_len, cfg.client_max_querybuf_len);
     match start(bind, cfg.port, cfg.threads, cfg.cbs, limits) {
-        Ok(fd) => fd,
+        Ok((rt, fd)) => {
+            // SAFETY: caller contract.
+            unsafe { efd.write(fd) };
+            Some(rt)
+        }
         Err(e) => {
             sys::set_errno(e);
-            -1
+            None
         }
     }
 }
@@ -36,8 +42,9 @@ pub unsafe extern "C" fn vio_start(cfg: *const VioConfig) -> c_int {
 /// # Safety
 /// None beyond the FFI ABI; any thread, after vio_start().
 #[no_mangle]
-pub unsafe extern "C" fn vio_set_limits(proto_max_bulk_len: c_longlong, client_max_querybuf_len: usize) {
-    if let Some(g) = GLOBAL.get() {
+pub unsafe extern "C" fn vio_set_limits(rt: &Runtime, proto_max_bulk_len: c_longlong, client_max_querybuf_len: usize) {
+    {
+        let g = rt.g;
         g.limits.set(proto_max_bulk_len, client_max_querybuf_len);
     }
 }
@@ -49,24 +56,19 @@ pub unsafe extern "C" fn vio_set_limits(proto_max_bulk_len: c_longlong, client_m
 /// # Safety
 /// Engine thread only (the thread that called vio_start()).
 #[no_mangle]
-pub unsafe extern "C" fn vio_main_flush_kicks() {
-    let Some(g) = GLOBAL.get() else {
-        return;
-    };
+pub unsafe extern "C" fn vio_main_flush_kicks(rt: &Runtime) {
+    let g = rt.g;
     g.adm.flush_popped();
-    MAIN_KICKS.with(|k| {
-        MAIN_ARGV.with(|a| {
-            let mut k = k.borrow_mut();
-            let mut a = a.borrow_mut();
-            let n = k.len().max(a.len());
-            if k.len() < n {
-                k.resize_with(n, Vec::new);
-            }
-            for (idx, list) in k.iter_mut().enumerate() {
-                flush_thread(idx, list, a.get_mut(idx));
-            }
-        })
-    });
+    let mut m = rt.main.borrow_mut();
+    let m = &mut *m;
+    let (k, a) = (&mut m.kicks, &mut m.argv);
+    let n = k.len().max(a.len());
+    if k.len() < n {
+        k.resize_with(n, Vec::new);
+    }
+    for (idx, list) in k.iter_mut().enumerate() {
+        flush_thread(g, idx, list, a.get_mut(idx));
+    }
 }
 
 /// Consume the main eventfd and take the current batch of ready
@@ -75,12 +77,12 @@ pub unsafe extern "C" fn vio_main_flush_kicks() {
 /// # Safety
 /// Engine thread only (the thread that called vio_start()).
 #[no_mangle]
-pub unsafe extern "C" fn vio_main_begin_drain() {
-    let g = global();
+pub unsafe extern "C" fn vio_main_begin_drain(rt: &Runtime) {
+    let g = rt.g;
     /* Drain, then clear, then take the list. Clearing first loses a wakeup
      * when a producer signals between the clear and the drain. */
     g.ready.waker.drain();
-    take_ready(g);
+    take_ready(rt);
 }
 
 /// Last call before the main thread polls. Returns 1 when work arrived that
@@ -89,8 +91,8 @@ pub unsafe extern "C" fn vio_main_begin_drain() {
 /// # Safety
 /// Engine thread only (the thread that called vio_start()).
 #[no_mangle]
-pub unsafe extern "C" fn vio_main_before_poll() -> c_int {
-    let g = global();
+pub unsafe extern "C" fn vio_main_before_poll(rt: &Runtime) -> c_int {
+    let g = rt.g;
     g.ready.waker.prepare_sleep() as c_int
 }
 
@@ -102,13 +104,13 @@ pub unsafe extern "C" fn vio_main_before_poll() -> c_int {
 /// # Safety
 /// Engine thread only (the thread that called vio_start()).
 #[no_mangle]
-pub unsafe extern "C" fn vio_main_after_poll() -> c_int {
-    let g = global();
+pub unsafe extern "C" fn vio_main_after_poll(rt: &Runtime) -> c_int {
+    let g = rt.g;
     g.ready.waker.awake();
     if g.ready.waker.signaled() {
         return 0;
     }
-    take_ready(g)
+    take_ready(rt)
 }
 
 /// Next ready connection from the current batch, or NULL. The caller owns
@@ -117,8 +119,8 @@ pub unsafe extern "C" fn vio_main_after_poll() -> c_int {
 /// # Safety
 /// Engine thread only (the thread that called vio_start()).
 #[no_mangle]
-pub unsafe extern "C" fn vio_main_next_ready() -> Option<ConnHandle> {
-    MAIN_READY.with(|r| r.borrow_mut().pop_front()).map(|c| {
+pub unsafe extern "C" fn vio_main_next_ready(rt: &Runtime) -> Option<ConnHandle> {
+    rt.main.borrow_mut().ready.pop_front().map(|c| {
         c.in_ready.store(false, Ordering::Release);
         ConnHandle::new(c)
     })
@@ -129,8 +131,8 @@ pub unsafe extern "C" fn vio_main_next_ready() -> Option<ConnHandle> {
 /// # Safety
 /// Engine thread only (the thread that called vio_start()).
 #[no_mangle]
-pub unsafe extern "C" fn vio_main_next_done() -> *mut c_void {
-    MAIN_DONE.with(|d| d.borrow_mut().pop_front()).unwrap_or(0) as *mut c_void
+pub unsafe extern "C" fn vio_main_next_done(rt: &Runtime) -> *mut c_void {
+    rt.main.borrow_mut().done.pop_front().unwrap_or(0) as *mut c_void
 }
 
 /// Whether the current batch still holds connections. True inside a long
@@ -141,8 +143,9 @@ pub unsafe extern "C" fn vio_main_next_done() -> *mut c_void {
 /// # Safety
 /// Engine thread only (the thread that called vio_start()).
 #[no_mangle]
-pub unsafe extern "C" fn vio_main_has_ready() -> c_int {
-    (MAIN_READY.with(|r| !r.borrow().is_empty()) || MAIN_DONE.with(|d| !d.borrow().is_empty())) as c_int
+pub unsafe extern "C" fn vio_main_has_ready(rt: &Runtime) -> c_int {
+    let m = rt.main.borrow();
+    (!m.ready.is_empty() || !m.done.is_empty()) as c_int
 }
 
 /// A new strong reference to `h`.
@@ -150,24 +153,25 @@ pub unsafe extern "C" fn vio_main_has_ready() -> c_int {
 /// # Safety
 /// `h` must be a live handle.
 #[no_mangle]
-pub unsafe extern "C" fn vio_conn_retain(h: ConnRef<'_>) -> ConnHandle {
+pub unsafe extern "C" fn vio_conn_retain(_rt: &Runtime, h: ConnRef<'_>) -> ConnHandle {
     h.retain()
 }
 
 /// # Safety
 /// `h` must be a live handle; the caller gives up this reference.
 #[no_mangle]
-pub unsafe extern "C" fn vio_conn_release(h: ConnHandle) {
+pub unsafe extern "C" fn vio_conn_release(_rt: &Runtime, h: ConnHandle) {
     drop(h);
 }
 
 /// # Safety
 /// `h` must be a live handle.
 #[no_mangle]
-pub unsafe extern "C" fn vio_conn_take_events(h: ConnRef<'_>) -> u32 {
+pub unsafe extern "C" fn vio_conn_take_events(rt: &Runtime, h: ConnRef<'_>) -> u32 {
     let ev = h.events.swap(0, Ordering::AcqRel);
-    if ev & VIO_EV_NEW != 0 && global().adm.adopted() {
-        global().threads[0].post(|q| q.push(Msg::ResumeAccept));
+    let g = rt.g;
+    if ev & VIO_EV_NEW != 0 && g.adm.adopted() {
+        g.threads[0].post(g, |q| q.push(Msg::ResumeAccept));
     }
     ev
 }
@@ -177,8 +181,9 @@ pub unsafe extern "C" fn vio_conn_take_events(h: ConnRef<'_>) -> u32 {
 /// # Safety
 /// None beyond the FFI ABI; any thread.
 #[no_mangle]
-pub unsafe extern "C" fn vio_set_maxclients(n: usize) {
-    if let Some(g) = GLOBAL.get() {
+pub unsafe extern "C" fn vio_set_maxclients(rt: &Runtime, n: usize) {
+    {
+        let g = rt.g;
         g.adm.set_maxclients(n);
     }
 }
@@ -188,28 +193,28 @@ pub unsafe extern "C" fn vio_set_maxclients(n: usize) {
 /// # Safety
 /// None beyond the FFI ABI; any thread.
 #[no_mangle]
-pub unsafe extern "C" fn vio_take_rejected() -> usize {
-    GLOBAL.get().map_or(0, |g| g.adm.take_rejected())
+pub unsafe extern "C" fn vio_take_rejected(rt: &Runtime) -> usize {
+    rt.g.adm.take_rejected()
 }
 
 /// # Safety
 /// `h` must be a live handle.
 #[no_mangle]
-pub unsafe extern "C" fn vio_conn_udata(h: ConnRef<'_>) -> *mut c_void {
+pub unsafe extern "C" fn vio_conn_udata(_rt: &Runtime, h: ConnRef<'_>) -> *mut c_void {
     h.udata.load(Ordering::Relaxed)
 }
 
 /// # Safety
 /// `h` must be a live handle. Rust stores `p` and never dereferences it.
 #[no_mangle]
-pub unsafe extern "C" fn vio_conn_set_udata(h: ConnRef<'_>, p: *mut c_void) {
+pub unsafe extern "C" fn vio_conn_set_udata(_rt: &Runtime, h: ConnRef<'_>, p: *mut c_void) {
     h.udata.store(p, Ordering::Relaxed)
 }
 
 /// # Safety
 /// `h` must be a live handle.
 #[no_mangle]
-pub unsafe extern "C" fn vio_conn_fd(h: ConnRef<'_>) -> c_int {
+pub unsafe extern "C" fn vio_conn_fd(_rt: &Runtime, h: ConnRef<'_>) -> c_int {
     h.fd
 }
 
@@ -219,7 +224,7 @@ pub unsafe extern "C" fn vio_conn_fd(h: ConnRef<'_>) -> c_int {
 /// # Safety
 /// `h` must be a live handle and `out` valid for `max` writes.
 #[no_mangle]
-pub unsafe extern "C" fn vio_conn_pop_cmds(h: ConnRef<'_>, out: *mut VioCmd, max: usize) -> usize {
+pub unsafe extern "C" fn vio_conn_pop_cmds(rt: &Runtime, h: ConnRef<'_>, out: *mut VioCmd, max: usize) -> usize {
     let conn = h.arc();
     let (n, left) = {
         let mut sh = conn.shared.lock().unwrap();
@@ -231,9 +236,9 @@ pub unsafe extern "C" fn vio_conn_pop_cmds(h: ConnRef<'_>, out: *mut VioCmd, max
         conn.ncmds.store(sh.cmds.len(), Ordering::Release);
         (n, sh.cmds.len())
     };
-    global().adm.popped(n);
+    rt.g.adm.popped(n);
     if n > 0 && left < CMDS_LOW && conn.read_paused.load(Ordering::Acquire) {
-        kick(&conn);
+        kick(rt, &conn);
     }
     n
 }
@@ -241,7 +246,7 @@ pub unsafe extern "C" fn vio_conn_pop_cmds(h: ConnRef<'_>, out: *mut VioCmd, max
 /// # Safety
 /// `h` must be a live handle.
 #[no_mangle]
-pub unsafe extern "C" fn vio_conn_pending_cmds(h: ConnRef<'_>) -> usize {
+pub unsafe extern "C" fn vio_conn_pending_cmds(_rt: &Runtime, h: ConnRef<'_>) -> usize {
     h.ncmds.load(Ordering::Acquire)
 }
 
@@ -250,7 +255,7 @@ pub unsafe extern "C" fn vio_conn_pending_cmds(h: ConnRef<'_>) -> usize {
 /// # Safety
 /// `h` must be a live handle.
 #[no_mangle]
-pub unsafe extern "C" fn vio_conn_pending_out(h: ConnRef<'_>) -> usize {
+pub unsafe extern "C" fn vio_conn_pending_out(_rt: &Runtime, h: ConnRef<'_>) -> usize {
     h.out_bytes.load(Ordering::Acquire)
 }
 
@@ -262,7 +267,7 @@ pub unsafe extern "C" fn vio_conn_pending_out(h: ConnRef<'_>) -> usize {
 /// `h` must be a live handle and `iov[0..iovcnt]` valid iovecs, each
 /// pointing at `iov_len` readable bytes, for the duration of the call.
 #[no_mangle]
-pub unsafe extern "C" fn vio_conn_writev(h: ConnRef<'_>, iov: *const libc::iovec, iovcnt: c_int) -> isize {
+pub unsafe extern "C" fn vio_conn_writev(rt: &Runtime, h: ConnRef<'_>, iov: *const libc::iovec, iovcnt: c_int) -> isize {
     let conn = h.arc();
     if conn.peer_closed.load(Ordering::Acquire) {
         sys::set_errno(libc::EPIPE);
@@ -303,7 +308,7 @@ pub unsafe extern "C" fn vio_conn_writev(h: ConnRef<'_>, iov: *const libc::iovec
     }
     if written > 0 {
         conn.out_bytes.fetch_add(written, Ordering::AcqRel);
-        kick(&conn);
+        kick(rt, &conn);
     }
     written as isize
 }
@@ -318,7 +323,7 @@ pub unsafe extern "C" fn vio_conn_writev(h: ConnRef<'_>, iov: *const libc::iovec
 /// `h` must be a live handle with no job in flight; `job` stays valid until
 /// it is returned.
 #[no_mangle]
-pub unsafe extern "C" fn vio_conn_submit_write(h: ConnRef<'_>, job: *mut c_void, release_offset: u64) {
+pub unsafe extern "C" fn vio_conn_submit_write(rt: &Runtime, h: ConnRef<'_>, job: *mut c_void, release_offset: u64) {
     assert_eq!(release_offset, 0, "durability fences are not implemented");
     #[cfg(feature = "timing")]
     {
@@ -329,7 +334,7 @@ pub unsafe extern "C" fn vio_conn_submit_write(h: ConnRef<'_>, job: *mut c_void,
     }
     let prev = h.job.swap(job as usize, Ordering::AcqRel);
     assert_eq!(prev, 0, "one write job per connection");
-    kick(&h.arc());
+    kick(rt, &h.arc());
 }
 
 /// Return an executed argv to the IO thread that built it, to be freed
@@ -338,8 +343,8 @@ pub unsafe extern "C" fn vio_conn_submit_write(h: ConnRef<'_>, job: *mut c_void,
 /// # Safety
 /// `h` must be a live handle; ownership of `argv[0..argc]` moves to Rust.
 #[no_mangle]
-pub unsafe extern "C" fn vio_conn_return_argv(h: ConnRef<'_>, argv: *mut *mut c_void, argc: c_int) {
-    return_argv(h.thread, argv as usize, argc);
+pub unsafe extern "C" fn vio_conn_return_argv(rt: &Runtime, h: ConnRef<'_>, argv: *mut *mut c_void, argc: c_int) {
+    return_argv(rt, h.thread, argv as usize, argc);
 }
 
 /// The engine wants VIO_EV_WRITABLE once outbound bytes drop below the low
@@ -348,11 +353,11 @@ pub unsafe extern "C" fn vio_conn_return_argv(h: ConnRef<'_>, argv: *mut *mut c_
 /// # Safety
 /// `h` must be a live handle.
 #[no_mangle]
-pub unsafe extern "C" fn vio_conn_want_writable(h: ConnRef<'_>, on: c_int) {
+pub unsafe extern "C" fn vio_conn_want_writable(rt: &Runtime, h: ConnRef<'_>, on: c_int) {
     let conn = h.arc();
     conn.want_writable.store(on != 0, Ordering::Release);
     if on != 0 {
-        kick(&conn);
+        kick(rt, &conn);
     }
 }
 
@@ -364,22 +369,22 @@ pub unsafe extern "C" fn vio_conn_want_writable(h: ConnRef<'_>, on: c_int) {
 /// # Safety
 /// `h` must be a live handle.
 #[no_mangle]
-pub unsafe extern "C" fn vio_conn_publish(h: ConnRef<'_>, consumed: u64, auth_required: c_int) {
+pub unsafe extern "C" fn vio_conn_publish(rt: &Runtime, h: ConnRef<'_>, consumed: u64, auth_required: c_int) {
     let conn = h.arc();
     conn.session.set_consumed(consumed);
     conn.auth_required.store(auth_required != 0, Ordering::Release);
     /* Store, then check: the IO thread sets parse_held before the engine
      * can see the command it stopped after, so this cannot miss it. */
     if conn.parse_held.load(Ordering::Acquire) {
-        kick(&conn);
+        kick(rt, &conn);
     }
 }
 
 /// # Safety
 /// None beyond the FFI ABI; any thread.
 #[no_mangle]
-pub unsafe extern "C" fn vio_set_default_auth_required(on: c_int) {
-    DEFAULT_AUTH_REQUIRED.store(on != 0, Ordering::Relaxed);
+pub unsafe extern "C" fn vio_set_default_auth_required(rt: &Runtime, on: c_int) {
+    rt.g.default_auth_required.store(on != 0, Ordering::Relaxed);
 }
 
 /// Publish the session fields the precheck reads (cut point 2), when one
@@ -388,7 +393,7 @@ pub unsafe extern "C" fn vio_set_default_auth_required(on: c_int) {
 /// # Safety
 /// `h` must be a live handle and `s` a valid VioSession for the call.
 #[no_mangle]
-pub unsafe extern "C" fn vio_conn_set_session(h: ConnRef<'_>, s: *const precheck::VioSession) {
+pub unsafe extern "C" fn vio_conn_set_session(_rt: &Runtime, h: ConnRef<'_>, s: *const precheck::VioSession) {
     // SAFETY: caller contract; the session is copied into the view.
     h.session.set(unsafe { &*s });
 }
@@ -399,7 +404,7 @@ pub unsafe extern "C" fn vio_conn_set_session(h: ConnRef<'_>, s: *const precheck
 /// # Safety
 /// `h` must be a live handle.
 #[no_mangle]
-pub unsafe extern "C" fn vio_conn_close(h: ConnRef<'_>) {
+pub unsafe extern "C" fn vio_conn_close(rt: &Runtime, h: ConnRef<'_>) {
     let conn = h.arc();
     /* Commands the engine will never pop: free them now instead of when
      * the output drains, so they stop counting against the queued budget. */
@@ -408,26 +413,26 @@ pub unsafe extern "C" fn vio_conn_close(h: ConnRef<'_>) {
         conn.ncmds.store(0, Ordering::Release);
         sh.cmds.drain(..).collect()
     };
-    global().adm.popped(dropped.len());
+    rt.g.adm.popped(dropped.len());
     for cmd in dropped {
         if !cmd.argv.is_null() {
-            (global().cbs.free_argv)(cmd.argv, cmd.argc);
+            (rt.g.cbs.free_argv)(cmd.argv, cmd.argc);
         }
     }
     conn.udata.store(std::ptr::null_mut(), Ordering::Relaxed);
     conn.want_writable.store(false, Ordering::Release);
     conn.c_closed.store(true, Ordering::Release);
-    kick(&conn);
+    kick(rt, &conn);
 }
 
 /// # Safety
 /// `h` must be a live handle.
 #[no_mangle]
-pub unsafe extern "C" fn vio_conn_shutdown(h: ConnRef<'_>) {
+pub unsafe extern "C" fn vio_conn_shutdown(rt: &Runtime, h: ConnRef<'_>) {
     /* Not shutdown(2) here: the IO thread may not have written the reply
      * the engine just handed over (CLIENT KILL during BGSAVE lost it). */
     h.half_close.store(true, Ordering::Release);
-    kick(&h.arc());
+    kick(rt, &h.arc());
 }
 
 /* ---------------------------------------------------------------------------

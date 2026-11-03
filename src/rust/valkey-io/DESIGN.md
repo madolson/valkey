@@ -1162,6 +1162,13 @@ shutdown are current (below).
   either changed), `set_session` (precheck session view, only when a field
   changed), `close`, `shutdown` (deferred until the output drains).
 - 29 exports plus 7 under `RUST_IO_TIMING`.
+- Iteration 3a (step 4): `vio_start(cfg, &efd)` returns a `VioRuntime *`
+  (NULL with errno on failure) and every other non-timing export takes it
+  as its first argument. The runtime owns what were statics and
+  engine-thread thread-locals (`Global`, the default auth flag, the
+  handoff switch, the kick/argv/ready/done queues); rust_io.c keeps it in
+  `rust_rt`. Two runtimes can run in one process (cargo test
+  `tests::two_runtimes`). A runtime is never freed.
 
 ## Engine callbacks Rust calls on IO threads (`VioCallbacks`)
 

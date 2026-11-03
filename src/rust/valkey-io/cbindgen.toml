@@ -19,6 +19,7 @@ exclude = ["Option_ConnHandle", "PROTO_INLINE_MAX_SIZE", "ST_READ", "ST_PARSED",
 
 [export.rename]
 "Conn" = "VioConn"
+"Runtime" = "VioRuntime"
 "ConnRef" = "VioConnRef"
 "ConnHandle" = "VioConnHandle"
 "Option_ConnHandle" = "VioConnHandle"

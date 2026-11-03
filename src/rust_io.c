@@ -77,6 +77,7 @@ typedef struct rustConnection {
 
 static list *rust_stalled; /* client ids */
 static int rust_started = 0;
+static const VioRuntime *rust_rt; /* vio_start() */
 /* bind list at startup, joined, for rustIoListenerUnchanged(). */
 static sds rust_bind_at_start = NULL;
 
@@ -142,7 +143,7 @@ int rustIoTryOffloadFreeArgv(client *c, int argc, robj **argv) {
         }
     }
     if (keep)
-        vio_conn_return_argv(rc->h, (void **)argv, argc);
+        vio_conn_return_argv(rust_rt, rc->h, (void **)argv, argc);
     else
         zfree(argv);
     return C_OK;
@@ -167,7 +168,7 @@ static int rustIoPull(rustConnection *rc, client *c) {
     while (rc->pending_err == 0 && engineCmdQueuePending(c) < RUST_IO_CMD_QUEUE_MAX) {
         size_t want = RUST_IO_CMD_QUEUE_MAX - engineCmdQueuePending(c);
         if (want > RUST_IO_POP_BATCH) want = RUST_IO_POP_BATCH;
-        size_t n = vio_conn_pop_cmds(rc->h, cmds, want);
+        size_t n = vio_conn_pop_cmds(rust_rt, rc->h, cmds, want);
         if (n == 0) break;
         pulled += engineSubmit(c, (const engineCmd *)cmds, n, &rc->pending_err, &rc->pending_err_byte, &bytes);
         /* Fewer than asked: the queue was empty. Asking again only takes the
@@ -194,7 +195,7 @@ static void rustIoPublish(rustConnection *rc, client *c) {
     if (!rc->h) return;
     /* Counted in io mode too: a delivery that popped commands is what
      * resumes a connection whose parse Rust held after one unauthenticated
-     * command (vio_conn_publish() kicks it). */
+     * command (vio_conn_publish(rust_rt) kicks it). */
     unsigned long long consumed = rc->pulled - engineCmdQueuePending(c);
     if (rust_io_precheck_active) {
         VioSession *s = &rc->sess;
@@ -205,14 +206,14 @@ static void rustIoPublish(rustConnection *rc, client *c) {
             s->flags = flags;
             s->dbid = dbid;
             s->gen++;
-            vio_conn_set_session(rc->h, s);
+            vio_conn_set_session(rust_rt, rc->h, s);
         }
     }
     int auth = authRequired(c);
     if (consumed != rc->consumed_pub || auth != rc->auth_pub) {
         rc->consumed_pub = consumed;
         rc->auth_pub = auth;
-        vio_conn_publish(rc->h, consumed, auth);
+        vio_conn_publish(rust_rt, rc->h, consumed, auth);
     }
 }
 
@@ -245,7 +246,7 @@ static void rustIoProtocolError(client *c, int err, int byte) {
 static bool rustIoCanProgress(rustConnection *rc, client *c) {
     if (!rc->h || !rc->c.read_handler) return false;
     if (c->flag.close_asap || c->flag.close_after_reply) return false;
-    if (rc->pending_err == 0 && engineCmdQueuePending(c) < RUST_IO_CMD_QUEUE_MAX && vio_conn_pending_cmds(rc->h) > 0)
+    if (rc->pending_err == 0 && engineCmdQueuePending(c) < RUST_IO_CMD_QUEUE_MAX && vio_conn_pending_cmds(rust_rt, rc->h) > 0)
         return true;
     if (!c->flag.blocked && canParseCommand(c) && (engineCmdQueuePending(c) > 0 || rc->pending_err > 0)) return true;
     return false;
@@ -271,12 +272,12 @@ static client *rustIoDeliverPull(rustConnection *rc) {
     if (c->flag.close_asap || c->flag.close_after_reply) return NULL;
     /* protectClient() removes the read handler: hold input in Rust. */
     if (!rc->c.read_handler) {
-        if (vio_conn_pending_cmds(h)) rustIoStall(rc, c);
+        if (vio_conn_pending_cmds(rust_rt, h)) rustIoStall(rc, c);
         return NULL;
     }
 
     rustIoPull(rc, c);
-    if (rc->pending_err > 0 || vio_conn_pending_cmds(h)) rustIoStall(rc, c);
+    if (rc->pending_err > 0 || vio_conn_pending_cmds(rust_rt, h)) rustIoStall(rc, c);
 
     if (c->flag.blocked) return NULL; /* resumed by processUnblockedClients() */
     return c;
@@ -392,7 +393,7 @@ int rustIoTrySendWrite(client *c) {
     rust_writes_submitted++;
     rc->job_reply_bytes = c->reply_bytes;
     server.io_inflight_reply_bytes += rc->job_reply_bytes;
-    vio_conn_submit_write(rc->h, c, 0);
+    vio_conn_submit_write(rust_rt, rc->h, c, 0);
     return C_OK;
 }
 
@@ -423,7 +424,7 @@ static int rustIoWriteJob(void *job, int fd, int can_write) {
 /* Engine thread: release what the IO thread wrote. */
 static void rustIoDrainDone(void) {
     void *job;
-    while ((job = vio_main_next_done()) != NULL) {
+    while ((job = vio_main_next_done(rust_rt)) != NULL) {
         client *c = job;
         rust_writes_outstanding--;
         serverAssert(rust_writes_outstanding >= 0 && c->io_write_state == CLIENT_COMPLETED_IO);
@@ -436,11 +437,11 @@ static void rustIoDrainDone(void) {
 
 /* CONFIG SET proto-max-bulk-len / client-query-buffer-limit. */
 void rustIoPublishLimits(void) {
-    if (rust_started) vio_set_limits(server.proto_max_bulk_len, server.client_max_querybuf_len);
+    if (rust_started) vio_set_limits(rust_rt, server.proto_max_bulk_len, server.client_max_querybuf_len);
 }
 
 void rustIoFlushKicks(void) {
-    if (rust_started) vio_main_flush_kicks();
+    if (rust_started) vio_main_flush_kicks(rust_rt);
 }
 
 sds rustIoCatInfo(sds info) {
@@ -456,9 +457,9 @@ sds rustIoCatInfo(sds info) {
  * ------------------------------------------------------------------------- */
 
 static void rustIoAccept(VioConn *h) {
-    rustConnection *rc = (rustConnection *)connCreateExternal(sizeof(rustConnection), vio_conn_fd(h));
-    rc->h = vio_conn_retain(h);
-    vio_conn_set_udata(h, rc);
+    rustConnection *rc = (rustConnection *)connCreateExternal(sizeof(rustConnection), vio_conn_fd(rust_rt, h));
+    rc->h = vio_conn_retain(rust_rt, h);
+    vio_conn_set_udata(rust_rt, h, rc);
     rc->auth_pub = -1;
 
     struct ClientFlags flags = {0};
@@ -469,7 +470,7 @@ static void rustIoAccept(VioConn *h) {
     if (server.tcpkeepalive) anetKeepAlive(NULL, rc->c.fd, server.tcpkeepalive);
     acceptCommonHandler(&rc->c, flags, cip);
 
-    rc = vio_conn_udata(h);
+    rc = vio_conn_udata(rust_rt, h);
     if (rc && connGetPrivateData(&rc->c)) {
         rustIoPublish(rc, connGetPrivateData(&rc->c));
     }
@@ -478,10 +479,10 @@ static void rustIoAccept(VioConn *h) {
 /* Returns 1 when the client's commands went into the prefetch batch. */
 static int rustIoHandleReady(VioConn *h, uint64_t *id) {
     int batched = 0;
-    uint32_t ev = vio_conn_take_events(h);
+    uint32_t ev = vio_conn_take_events(rust_rt, h);
     if (ev & VIO_EV_NEW) rustIoAccept(h);
 
-    rustConnection *rc = vio_conn_udata(h);
+    rustConnection *rc = vio_conn_udata(rust_rt, h);
     if (!rc) return 0;
     if ((ev & VIO_EV_WRITABLE) && rc->c.write_handler) {
         if (!callHandler(&rc->c, rc->c.write_handler)) return 0;
@@ -493,7 +494,7 @@ static int rustIoHandleReady(VioConn *h, uint64_t *id) {
         batched = rustIoDeliverBatched(rc, id);
 
     if (ev & VIO_EV_QBLIMIT) {
-        rc = vio_conn_udata(h);
+        rc = vio_conn_udata(rust_rt, h);
         if (!rc) return batched;
         client *c = connGetPrivateData(&rc->c);
         if (c) {
@@ -508,7 +509,7 @@ static int rustIoHandleReady(VioConn *h, uint64_t *id) {
     }
 
     if (ev & VIO_EV_CLOSED) {
-        rc = vio_conn_udata(h);
+        rc = vio_conn_udata(rust_rt, h);
         if (!rc) return batched;
         rc->c.state = CONN_STATE_CLOSED;
         client *c = connGetPrivateData(&rc->c);
@@ -529,10 +530,10 @@ static int rustIoDrainReady(void) {
     /* Nested in processEventsWhileBlocked(): run what is left of the outer
      * call's batch first, as processClientIOReadsDone() does. */
     if (ProcessingEventsWhileBlocked) processClientsCommandsBatch();
-    while ((h = vio_main_next_ready()) != NULL) {
+    while ((h = vio_main_next_ready(rust_rt)) != NULL) {
         uint64_t id;
         if (rustIoHandleReady(h, &id)) ids[nids++] = id;
-        vio_conn_release(h);
+        vio_conn_release(rust_rt, h);
         n++;
         if (nids == RUST_IO_DRAIN_BATCH) {
             rustIoFlushBatch(ids, nids);
@@ -548,7 +549,7 @@ static void rustIoEventHandler(aeEventLoop *el, int fd, void *privdata, int mask
     UNUSED(fd);
     UNUSED(privdata);
     UNUSED(mask);
-    vio_main_begin_drain();
+    vio_main_begin_drain(rust_rt);
     rustIoDrainReady();
 }
 
@@ -558,10 +559,10 @@ static void rustIoEventHandler(aeEventLoop *el, int fd, void *privdata, int mask
  * (cmd_queue full, blocked, protected). Called from beforeSleep() through
  * connTypeProcessPendingData(). */
 static int connRustProcessPendingData(void) {
-    vio_set_default_auth_required(!(DefaultUser->flags & USER_FLAG_NOPASS) || (DefaultUser->flags & USER_FLAG_DISABLED));
+    vio_set_default_auth_required(rust_rt, !(DefaultUser->flags & USER_FLAG_NOPASS) || (DefaultUser->flags & USER_FLAG_DISABLED));
     /* Admission control: the IO threads refuse past maxclients + slack. */
-    vio_set_maxclients(server.maxclients);
-    server.stat_rejected_conn += vio_take_rejected();
+    vio_set_maxclients(rust_rt, server.maxclients);
+    server.stat_rejected_conn += vio_take_rejected(rust_rt);
     rustPrecheckPublish();
     /* A long command started from rustIoEventHandler() leaves the rest of
      * its batch in Rust's main-thread list, behind an eventfd that was
@@ -587,7 +588,7 @@ static int connRustProcessPendingData(void) {
         if (rustIoCanProgress(rc, c)) {
             rustIoDeliver(rc);
             processed++;
-        } else if (vio_conn_pending_cmds(rc->h) || rc->pending_err > 0) {
+        } else if (vio_conn_pending_cmds(rust_rt, rc->h) || rc->pending_err > 0) {
             rustIoStall(rc, c);
         }
     }
@@ -596,7 +597,7 @@ static int connRustProcessPendingData(void) {
 }
 
 static int connRustHasPendingData(void) {
-    if (rust_started && vio_main_has_ready()) return 1;
+    if (rust_started && vio_main_has_ready(rust_rt)) return 1;
     if (!rust_stalled || listLength(rust_stalled) == 0) return 0;
     listIter li;
     listNode *ln;
@@ -621,33 +622,33 @@ static ssize_t rustExtWritev(connection *conn, const struct iovec *iov, int iovc
         return -1;
     }
     RUST_IO_TIMING_WRITEV(conn);
-    return vio_conn_writev(rc->h, iov, iovcnt);
+    return vio_conn_writev(rust_rt, rc->h, iov, iovcnt);
 }
 
 static void rustExtClose(connection *conn) {
     rustConnection *rc = (rustConnection *)conn;
     if (!rc->h) return;
     /* Rust flushes what we already handed over, then closes the fd. */
-    vio_conn_close(rc->h);
-    vio_conn_release(rc->h);
+    vio_conn_close(rust_rt, rc->h);
+    vio_conn_release(rust_rt, rc->h);
     rc->h = NULL;
 }
 
 static void rustExtShutdown(connection *conn) {
     rustConnection *rc = (rustConnection *)conn;
-    if (rc->h) vio_conn_shutdown(rc->h);
+    if (rc->h) vio_conn_shutdown(rust_rt, rc->h);
 }
 
 static void rustExtWantWritable(connection *conn, int on) {
     rustConnection *rc = (rustConnection *)conn;
-    if (rc->h) vio_conn_want_writable(rc->h, on);
+    if (rc->h) vio_conn_want_writable(rust_rt, rc->h, on);
 }
 
 /* unprotectClient(): input held in Rust can flow again. */
 static void rustExtReadResumed(connection *conn) {
     rustConnection *rc = (rustConnection *)conn;
     client *c = connGetPrivateData(conn);
-    if (c && rc->h && vio_conn_pending_cmds(rc->h)) rustIoStall(rc, c);
+    if (c && rc->h && vio_conn_pending_cmds(rust_rt, rc->h)) rustIoStall(rc, c);
 }
 
 static const externalConnOps rust_ext_ops = {
@@ -689,10 +690,11 @@ int rustIoInitListeners(void) {
         cfg.cbs.precheck_end = rustPrecheckEnd;
         cfg.cbs.precheck_batch = rustPrecheckBatch;
     }
-    int efd = vio_start(&cfg);
-    if (efd != -1)
-        vio_set_default_auth_required(!(DefaultUser->flags & USER_FLAG_NOPASS) || (DefaultUser->flags & USER_FLAG_DISABLED));
-    if (efd == -1) {
+    int efd = -1;
+    rust_rt = vio_start(&cfg, &efd);
+    if (rust_rt)
+        vio_set_default_auth_required(rust_rt, !(DefaultUser->flags & USER_FLAG_NOPASS) || (DefaultUser->flags & USER_FLAG_DISABLED));
+    if (!rust_rt) {
         serverLog(LL_WARNING, "Failed listening on rust-io port %d: %s, aborting.", port, strerror(errno));
         exit(1);
     }
@@ -716,8 +718,8 @@ int rustIoInitListeners(void) {
  * skipped the eventfd for it. */
 int rustIoBeforePoll(int sleeping) {
     if (!rust_started) return 0;
-    vio_main_flush_kicks();
-    return sleeping ? vio_main_before_poll() : 0;
+    vio_main_flush_kicks(rust_rt);
+    return sleeping ? vio_main_before_poll(rust_rt) : 0;
 }
 
 /* End of afterSleep(), where rustIoEventHandler() would run next: take the
@@ -727,7 +729,7 @@ int rustIoBeforePoll(int sleeping) {
  * waits for those. */
 void rustIoAfterPoll(void) {
     if (!rust_started) return;
-    if (vio_main_after_poll()) rustIoDrainReady();
+    if (vio_main_after_poll(rust_rt)) rustIoDrainReady();
 }
 
 /* Shutdown: flushReplicasOutputBuffers() only hands replica output to Rust,
@@ -736,7 +738,7 @@ void rustIoAfterPoll(void) {
  * replicas as they would from a socket write. */
 void rustIoFlushReplicas(long long timeout_ms) {
     if (!rust_started) return;
-    vio_main_flush_kicks(); /* kick batching may still hold the replica kicks */
+    vio_main_flush_kicks(rust_rt); /* kick batching may still hold the replica kicks */
     long long deadline = mstime() + timeout_ms;
     while (mstime() < deadline) {
         size_t pending = 0;
@@ -747,7 +749,7 @@ void rustIoFlushReplicas(long long timeout_ms) {
             client *r = listNodeValue(ln);
             if (!r->conn || !connIsExternal(r->conn)) continue;
             rustConnection *rc = (rustConnection *)r->conn;
-            if (rc->h) pending += vio_conn_pending_out(rc->h);
+            if (rc->h) pending += vio_conn_pending_out(rust_rt, rc->h);
         }
         if (pending == 0) return;
         usleep(1000);

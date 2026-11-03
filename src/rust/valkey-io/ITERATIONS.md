@@ -457,3 +457,44 @@ default-build tests unchanged: unit/info 33/0 with the new test,
 unit/memefficiency 36/0, unit/lazyfree 4/0, unit/other 56/0,
 unit/expire 85/0, unit/acl 127/0, unit/introspection 123/1 with the same
 failure on unmodified d80033654). The precheck SET -5% is open.
+
+## Step 4: runtime handle instead of statics (API plan step 8)
+
+Change: `GLOBAL`, `DEFAULT_AUTH_REQUIRED` and `HANDOFF_DISABLE` become
+fields of `Global`; the engine-thread thread-locals (`IS_MAIN`,
+`MAIN_KICKS`, `MAIN_ARGV`, `MAIN_READY`, `MAIN_DONE`, `MAIN_SWAP`) become a
+`MainState` in a `RefCell` of `Runtime` (`VioRuntime` in C), which
+`vio_start()` returns and every export takes. The engine-thread check that
+`IS_MAIN` did is a `pthread_self()` compare. A runtime is leaked on
+purpose (there is no `vio_stop`), so the IO threads and connections hold
+a `&'static Global` and nothing pays a refcount. `BARRIER_FLAGS` is a
+test fixture in `precheck.rs`'s tests and stays; the four `timing.rs`
+statics are the measurement build's and stay.
+
+Prediction: neutral. A thread-local access (`__tls_get_addr`-free in a
+static binary, one `%fs` load) becomes a load through the runtime pointer
+the engine passes; the RefCell borrow flag replaces the thread-local
+RefCell's. Main ns/request within +-1% (2-4 ns) at T=4 and T=8, GET and
+SET -P 16 and -P 1.
+
+Result (`tools/alt.sh`, fresh server per rep, s3 vs s4 alternated, 3
+rounds):
+
+| T | test | P | RPS s3 -> s4 | main ns/req s3 -> s4 | spreads |
+|---|---|---|---|---|---|
+| 4 | GET | 1 | 222,032 -> 222,291 (+0.1%) | 826 -> 792 (-4.2%) | 1.1% / 0.7% |
+| 4 | GET | 16 | 2,599,703 -> 2,636,462 (+1.4%) | 349 -> 335 (-3.9%) | 20.0% / 5.4% |
+| 4 | SET | 1 | 219,441 -> 221,202 (+0.8%) | 1033 -> 1041 (+0.9%) | 0.8% / 1.5% |
+| 4 | SET | 16 | 1,722,932 -> 1,784,806 (+3.6%) | 580 -> 560 (-3.4%) | 0.1% / 0.9% |
+| 8 | GET | 1 | 504,743 -> 517,355 (+2.5%) | 946 -> 926 (-2.2%) | 2.9% / 2.2% |
+| 8 | GET | 16 | 2,671,402 -> 2,835,891 (+6.2%) | 374 -> 353 (-5.6%) | 1.0% / 2.3% |
+| 8 | SET | 1 | 500,158 -> 508,121 (+1.6%) | 1156 -> 1145 (-0.9%) | 3.2% / 2.8% |
+| 8 | SET | 16 | 1,690,929 -> 1,754,812 (+3.8%) | 591 -> 570 (-3.6%) | 0.5% / 4.4% |
+
+Predicted neutral; no cell got slower beyond 1%, and the -P 16 cells got
+faster by 1.4% to 6.2%. SET -P 16 is back at s2's level (s2 1.78M at T=4),
+which fits step 3's reading that its SET drop was code placement; I do not
+claim the gain for this step. Gates (`gates/s4/summary.txt`): the same as
+s2 line for line, plus the new cargo test (19 passed); miri 18 passed and
+1 ignored (`two_runtimes` uses sockets). `make check-rust-header` passes
+with the regenerated header. Verdict: KEEP.
