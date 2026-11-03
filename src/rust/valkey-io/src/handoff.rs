@@ -88,6 +88,11 @@ impl Waker {
         self.signaled.load(Ordering::SeqCst)
     }
 
+    /// Consumer: whether work is pending, without taking it (the spin).
+    pub(crate) fn is_pending(&self) -> bool {
+        self.pending.load(Ordering::SeqCst)
+    }
+
     /// Consumer: whether work was published since the last take.
     pub(crate) fn take_pending(&self) -> bool {
         self.pending.swap(false, Ordering::SeqCst)
