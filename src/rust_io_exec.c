@@ -378,7 +378,11 @@ static int rtcMayYield(struct serverCommand *cmd) {
     if (!cmd) return 0;
     serverCommandProc *p = cmd->proc;
     return p == evalCommand || p == evalRoCommand || p == evalShaCommand || p == evalShaRoCommand ||
-           p == fcallCommand || p == fcallroCommand || p == debugCommand || (cmd->flags & CMD_MODULE);
+           p == fcallCommand || p == fcallroCommand || p == debugCommand || (cmd->flags & CMD_MODULE) ||
+           /* Exits after rustIoFlushReplicas(), which waits for the IO
+            * threads to write the replicas' output: the IO thread running
+            * it could not write its own connections. */
+           p == shutdownCommand;
 }
 
 /* On a Rust IO thread in exec-rtc: whether this client's queued commands
