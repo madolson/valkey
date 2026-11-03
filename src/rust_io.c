@@ -494,6 +494,9 @@ static void rustIoEventHandler(aeEventLoop *el, int fd, void *privdata, int mask
  * connTypeProcessPendingData(). */
 static int connRustProcessPendingData(void) {
     vio_set_default_auth_required(!(DefaultUser->flags & USER_FLAG_NOPASS) || (DefaultUser->flags & USER_FLAG_DISABLED));
+    /* Admission control: the IO threads refuse past maxclients + slack. */
+    vio_set_maxclients(server.maxclients);
+    server.stat_rejected_conn += vio_take_rejected();
     rustPrecheckPublish();
     /* A long command started from rustIoEventHandler() leaves the rest of
      * its batch in Rust's main-thread list, behind an eventfd that was

@@ -8,6 +8,7 @@
 
 #![deny(unsafe_code, unsafe_op_in_unsafe_fn)]
 
+mod admission;
 mod ffi;
 pub mod precheck;
 pub mod sys;
@@ -93,8 +94,8 @@ pub const VIO_EV_WRITABLE: u32 = 1 << 2;
 pub const VIO_EV_QBLIMIT: u32 = 1 << 3;
 
 /* Backpressure thresholds. */
-const CMDS_HIGH: usize = 1024; /* stop reading when this many commands are queued */
-const CMDS_LOW: usize = 256; /* resume below this */
+pub(crate) const CMDS_HIGH: usize = 1024; /* stop reading when this many commands are queued */
+pub(crate) const CMDS_LOW: usize = 256; /* resume below this */
 const OUT_HIGH: usize = 1 << 20; /* refuse engine writes past this many pending bytes */
 const OUT_LOW: usize = 256 << 10; /* fire the engine write handler below this */
 const READ_CHUNK: usize = 16 * 1024;
@@ -144,6 +145,8 @@ impl Drop for Conn {
     fn drop(&mut self) {
         let g = global();
         let sh = self.shared.get_mut().unwrap();
+        g.adm.queued_sub(sh.cmds.len());
+        g.adm.closed();
         for cmd in sh.cmds.drain(..) {
             if !cmd.argv.is_null() {
                 (g.cbs.free_argv)(cmd.argv, cmd.argc);
@@ -163,6 +166,9 @@ enum Msg {
     /// Executed argv the engine returned, to free on the thread that built
     /// them: (argv, argc) pairs.
     FreeArgv(Vec<(usize, c_int)>),
+    /// To thread 0: unadopted connections fell below NEW_LOW, poll the
+    /// listener again.
+    ResumeAccept,
 }
 
 struct IoThread {
@@ -226,6 +232,7 @@ struct Global {
     main_pending: AtomicBool,
     ready: Mutex<Ready>,
     listen_fd: RawFd,
+    adm: admission::Admission,
 }
 
 
@@ -716,6 +723,7 @@ impl Worker {
         }
 
         if !batch.is_empty() {
+            let n = batch.len();
             let queued = {
                 let mut sh = conn.shared.lock().unwrap();
                 #[cfg(feature = "timing")]
@@ -725,7 +733,8 @@ impl Worker {
                 sh.cmds.extend(batch);
                 sh.cmds.len()
             };
-            if queued >= CMDS_HIGH {
+            g.adm.queued_add(n);
+            if !g.adm.may_read(queued) {
                 conn.read_paused.store(true, Ordering::Release);
             }
             self.notify(&conn, 0);
@@ -822,7 +831,7 @@ impl Worker {
             self.remove(idx);
             return;
         }
-        if conn.read_paused.load(Ordering::Acquire) && conn.shared.lock().unwrap().cmds.len() < CMDS_LOW {
+        if conn.read_paused.load(Ordering::Acquire) && global().adm.may_resume(conn.shared.lock().unwrap().cmds.len()) {
             conn.read_paused.store(false, Ordering::Release);
         }
         self.flush(idx);
@@ -890,13 +899,44 @@ impl Worker {
         }
     }
 
+    /// Thread 0 only: add or remove the listener from the epoll set.
+    fn listen_interest(&self, on: bool) {
+        sys::epoll_mod(self.me().epfd, global().listen_fd, if on { sys::EPOLLIN } else { 0 }, TOK_LISTEN);
+    }
+
+    /// Stop polling the listener while the engine is NEW_HIGH connections
+    /// behind. Returns true when paused.
+    fn accept_backoff(&self) -> bool {
+        let adm = &global().adm;
+        if !adm.should_pause() {
+            return false;
+        }
+        adm.set_paused();
+        self.listen_interest(false);
+        if adm.undo_pause() {
+            self.listen_interest(true);
+            return false;
+        }
+        true
+    }
+
     fn accept_all(&mut self) {
         let g = global();
         loop {
+            if self.accept_backoff() {
+                return;
+            }
             let fd = match sys::accept_nodelay(g.listen_fd) {
                 Some(fd) => fd,
                 None => return,
             };
+            if !g.adm.admit() {
+                /* What acceptCommonHandler() does at maxclients: best-effort
+                 * error, then close. */
+                sys::write(fd, admission::MAXCLIENTS_ERR);
+                sys::close(fd);
+                continue;
+            }
             let target = self.rr % g.threads.len();
             self.rr = self.rr.wrapping_add(1);
             if target == self.idx {
@@ -917,6 +957,10 @@ impl Worker {
                 match m {
                     Msg::NewFd(fd) => self.add_conn(fd),
                     Msg::Kick(c) => self.on_kick(c),
+                    Msg::ResumeAccept => {
+                        self.listen_interest(true);
+                        self.accept_all();
+                    }
                     Msg::FreeArgv(v) => {
                         let free = global().cbs.free_argv;
                         for (argv, argc) in v {
@@ -1026,6 +1070,7 @@ fn start(bind: Option<String>, port: c_int, threads: c_int, cbs: VioCallbacks, l
         main_pending: AtomicBool::new(false),
         ready: Mutex::new(Ready::default()),
         listen_fd,
+        adm: admission::Admission::new(),
     };
     if GLOBAL.set(g).is_err() {
         return Err(libc::EALREADY);

@@ -166,7 +166,33 @@ pub unsafe extern "C" fn vio_conn_release(h: ConnHandle) {
 /// `h` must be a live handle.
 #[no_mangle]
 pub unsafe extern "C" fn vio_conn_take_events(h: ConnRef<'_>) -> u32 {
-    h.events.swap(0, Ordering::AcqRel)
+    let ev = h.events.swap(0, Ordering::AcqRel);
+    if ev & VIO_EV_NEW != 0 && global().adm.adopted() {
+        let t = &global().threads[0];
+        t.inbox.lock().unwrap().push(Msg::ResumeAccept);
+        wake_thread(t);
+    }
+    ev
+}
+
+/// Publish the engine's maxclients (admission control).
+///
+/// # Safety
+/// None beyond the FFI ABI; any thread.
+#[no_mangle]
+pub unsafe extern "C" fn vio_set_maxclients(n: usize) {
+    if let Some(g) = GLOBAL.get() {
+        g.adm.set_maxclients(n);
+    }
+}
+
+/// Connections refused at maxclients since the last call.
+///
+/// # Safety
+/// None beyond the FFI ABI; any thread.
+#[no_mangle]
+pub unsafe extern "C" fn vio_take_rejected() -> usize {
+    GLOBAL.get().map_or(0, |g| g.adm.take_rejected())
 }
 
 /// # Safety
@@ -207,6 +233,7 @@ pub unsafe extern "C" fn vio_conn_pop_cmds(h: ConnRef<'_>, out: *mut VioCmd, max
         }
         (n, sh.cmds.len())
     };
+    global().adm.queued_sub(n);
     if n > 0 && left < CMDS_LOW && conn.read_paused.load(Ordering::Acquire) {
         kick(&conn);
     }
@@ -373,6 +400,15 @@ pub unsafe extern "C" fn vio_conn_set_session(h: ConnRef<'_>, s: *const precheck
 #[no_mangle]
 pub unsafe extern "C" fn vio_conn_close(h: ConnRef<'_>) {
     let conn = h.arc();
+    /* Commands the engine will never pop: free them now instead of when
+     * the output drains, so they stop counting against the queued budget. */
+    let dropped: Vec<VioCmd> = conn.shared.lock().unwrap().cmds.drain(..).collect();
+    global().adm.queued_sub(dropped.len());
+    for cmd in dropped {
+        if !cmd.argv.is_null() {
+            (global().cbs.free_argv)(cmd.argv, cmd.argc);
+        }
+    }
     conn.udata.store(std::ptr::null_mut(), Ordering::Relaxed);
     conn.want_writable.store(false, Ordering::Release);
     conn.c_closed.store(true, Ordering::Release);

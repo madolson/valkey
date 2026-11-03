@@ -309,6 +309,22 @@ void vio_conn_release(VioConnHandle h);
 uint32_t vio_conn_take_events(VioConnRef h);
 
 /*
+ Publish the engine's maxclients (admission control).
+
+ # Safety
+ None beyond the FFI ABI; any thread.
+ */
+void vio_set_maxclients(size_t n);
+
+/*
+ Connections refused at maxclients since the last call.
+
+ # Safety
+ None beyond the FFI ABI; any thread.
+ */
+size_t vio_take_rejected(void);
+
+/*
  # Safety
  `h` must be a live handle.
  */
