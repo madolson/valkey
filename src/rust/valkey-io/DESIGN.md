@@ -577,13 +577,16 @@ accept and read no matter how far behind the main thread is. Three bounds
   after setting `ACCEPT_PAUSED` (both SeqCst).
 - **Open connections.** `LIVE` counts Rust connections from accept until
   the fd closes, including closed connections still draining output. At
-  maxclients (published by `rustIoPublishGlobals()` through
-  `vio_set_maxclients`), the IO thread writes
-  `-ERR max number of clients reached` and closes, as
-  `acceptCommonHandler()` does. `rejected_connections` includes these
-  (`vio_take_rejected`). The engine's own check still runs at adoption.
-  This bound counts real fds, so it is stricter than C's client count by
-  the connections still draining output.
+  maxclients + `MAXCLIENTS_SLACK` (16; maxclients is published by
+  `rustIoPublishGlobals()` through `vio_set_maxclients`), the IO thread
+  writes `-ERR max number of clients reached` and closes.
+  `rejected_connections` includes these (`vio_take_rejected`). Below that
+  the engine decides at adoption, with its exact rules
+  (`hasMaxClientsLimitReached()`: maxclients-reserved, priority subnets,
+  cluster links, `rejected_priority_connections`). The first version
+  refused at maxclients and broke unit/qos. The slack stays under the 32
+  fds the engine reserves above maxclients, so accept does not hit
+  EMFILE first.
 - **Queued commands, global.** `QUEUED` counts parsed commands in Rust
   across all connections. Above `QUEUED_HIGH` (4096), a connection stops
   reading once it holds `FAIR_SHARE` (32) commands (`may_read`). The usual

@@ -85,8 +85,11 @@ const READ_CHUNK: usize = 16 * 1024;
  * - accepted connections the engine has not adopted yet (VIO_EV_NEW not
  *   taken): stop accepting at NEW_HIGH, resume below NEW_LOW. The kernel
  *   backlog holds the rest, as for the C listener.
- * - open connections: at maxclients, refuse on the IO thread with the
- *   engine's error, without involving the main thread.
+ * - open connections: MAXCLIENTS_SLACK past maxclients, refuse on the IO
+ *   thread with the engine's error, without involving the main thread.
+ *   Below that the engine decides at adoption (acceptCommonHandler():
+ *   maxclients-reserved, priority subnets, cluster links, its stats); this
+ *   is only the fd backstop for when it is behind.
  * - parsed commands not taken by the engine, across all connections: above
  *   QUEUED_HIGH a connection stops reading once it holds FAIR_SHARE
  *   commands, so a busy pipeline cannot starve a fresh connection. It is
@@ -95,6 +98,9 @@ const NEW_HIGH: usize = 128;
 const NEW_LOW: usize = 64;
 const QUEUED_HIGH: usize = 4096;
 const FAIR_SHARE: usize = 32;
+/// Below CONFIG_MIN_RESERVED_FDS (32), which the engine adds to maxclients
+/// for its fd limit.
+const MAXCLIENTS_SLACK: usize = 16;
 const MAXCLIENTS_ERR: &[u8] = b"-ERR max number of clients reached\r\n";
 
 /// Accepted connections whose VIO_EV_NEW the engine has not taken.
@@ -817,7 +823,7 @@ impl Worker {
             if fd < 0 {
                 return;
             }
-            if LIVE.load(Ordering::Relaxed) >= MAXCLIENTS.load(Ordering::Relaxed) {
+            if LIVE.load(Ordering::Relaxed) >= MAXCLIENTS.load(Ordering::Relaxed).saturating_add(MAXCLIENTS_SLACK) {
                 /* What acceptCommonHandler() does at maxclients: best-effort
                  * error, then close. */
                 unsafe {
