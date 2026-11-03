@@ -7,6 +7,37 @@
 
 #define COMMAND_QUEUE_MIN_CAPACITY 16
 
+/* A replicated client (a slot import link) is fed by the IO layer, which
+ * keeps no raw input. commandProcessed() derives reploff from c->querybuf
+ * and proxies the applied part of it, so append each command there in
+ * canonical RESP, the form the source sends, keep qb_pos at the end (it is
+ * already parsed), and return the length, which becomes the command's
+ * input bytes. */
+static size_t engineAppendReplicated(client *c, robj **argv, int argc) {
+    if (!c->querybuf) c->querybuf = sdsempty();
+    size_t before = sdslen(c->querybuf);
+    c->querybuf = sdscatfmt(c->querybuf, "*%i\r\n", argc);
+    for (int j = 0; j < argc; j++) {
+        serverAssert(sdsEncodedObject(argv[j]));
+        size_t len = sdslen(objectGetVal(argv[j]));
+        c->querybuf = sdscatfmt(c->querybuf, "$%U\r\n", (unsigned long long)len);
+        c->querybuf = sdscatlen(c->querybuf, objectGetVal(argv[j]), len);
+        c->querybuf = sdscatlen(c->querybuf, "\r\n", 2);
+    }
+    size_t added = sdslen(c->querybuf) - before;
+    c->qb_pos = sdslen(c->querybuf);
+    c->repl_data->read_reploff += added;
+    return added;
+}
+
+void engineReplicatedBackfill(client *c) {
+    cmdQueue *q = &c->cmd_queue;
+    for (int i = q->off; i < q->len; i++) {
+        parsedCommand *p = &q->cmds[i];
+        p->input_bytes = engineAppendReplicated(c, p->argv, p->argc);
+    }
+}
+
 int engineCmdQueuePending(client *c) {
     return c->cmd_queue.len - c->cmd_queue.off;
 }
@@ -14,6 +45,7 @@ int engineCmdQueuePending(client *c) {
 size_t engineSubmit(client *c, const engineCmd *cmds, size_t n, int *err, int *err_byte, unsigned long long *bytes) {
     cmdQueue *q = &c->cmd_queue;
     size_t appended = 0;
+    int replicated = c->repl_data && isReplicatedClient(c);
     if (q->off > 0) {
         memmove(q->cmds, q->cmds + q->off, (q->len - q->off) * sizeof(parsedCommand));
         q->len -= q->off;
@@ -55,6 +87,7 @@ size_t engineSubmit(client *c, const engineCmd *cmds, size_t n, int *err, int *e
             prepareCommandGeneric(p->argv, p->argc, &p->read_flags, &p->cmd, &p->slot);
         }
         *bytes += e->input_bytes;
+        if (replicated) p->input_bytes = engineAppendReplicated(c, p->argv, p->argc);
         appended++;
     }
     return appended;

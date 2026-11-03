@@ -11,6 +11,9 @@
 #include "functions.h"
 #include "sds.h"
 #include "server.h"
+#ifdef USE_RUST_IO
+#include "engine_io.h"
+#endif
 
 #include <sys/wait.h>
 #include <fcntl.h>
@@ -561,17 +564,6 @@ void clusterCommandSyncSlotsEstablish(client *c) {
         return;
     }
 
-#ifdef USE_RUST_IO
-    /* An import job turns this client into a replicated client, whose
-     * offsets are computed from c->querybuf. Rust connections have no query
-     * buffer (commands arrive parsed), so the first applied command fails
-     * the reploff assertion in commandProcessed(). Fail the migration. */
-    if (c->conn && connIsExternal(c->conn)) {
-        addReplyError(c, "CLUSTER SYNCSLOTS ESTABLISH is not supported on a rust-io connection");
-        return;
-    }
-#endif
-
     if (!mustObeyClient(c) && validateSlotMigrationCanStartOrReply(c) == C_ERR) {
         return;
     }
@@ -890,6 +882,11 @@ slotMigrationJob *createSlotImportJob(client *c,
     }
     job->client->repl_data->read_reploff = sdslen(job->client->querybuf);
     job->client->repl_data->repl_applied_dbid = job->client->db->id;
+#ifdef USE_RUST_IO
+    /* Commands from an external IO layer arrive parsed; engine_io.c keeps
+     * the stream in querybuf from here on. */
+    if (job->client->conn && connIsExternal(job->client->conn)) engineReplicatedBackfill(job->client);
+#endif
 
     return job;
 }
