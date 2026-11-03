@@ -763,8 +763,7 @@ impl Worker {
             }
         }
         if mask & ((libc::EPOLLIN | libc::EPOLLHUP | libc::EPOLLERR) as u32) != 0 {
-            if self.slab[idx].is_some() {
-                let l = self.slab[idx].as_ref().unwrap();
+            if let Some(l) = self.slab[idx].as_ref() {
                 if l.interest & (libc::EPOLLIN as u32) != 0 {
                     self.on_readable(idx);
                 } else if mask & ((libc::EPOLLHUP | libc::EPOLLERR) as u32) != 0 {
@@ -911,9 +910,9 @@ impl Worker {
             }
             let n = unsafe { libc::epoll_wait(me.epfd, events.as_mut_ptr(), events.len() as c_int, timeout) };
             me.sleeping.store(false, Ordering::SeqCst);
-            for i in 0..n.max(0) as usize {
-                let tok = events[i].u64;
-                let mask = events[i].events;
+            for ev in events.iter().take(n.max(0) as usize) {
+                let tok = ev.u64;
+                let mask = ev.events;
                 if tok == TOK_WAKE {
                     /* Drain before clearing: a producer that sees the flag
                      * set skips the eventfd write, so the flag must not be
@@ -951,8 +950,14 @@ impl Worker {
 /// Bind the listener and start the IO threads. Returns the eventfd the
 /// engine must poll for readability (then call vio_main_begin_drain), or
 /// -1 with errno set.
+///
+/// # Safety
+///
+/// `cfg` must point to a valid `VioConfig`. `bindaddr` is NULL or a NUL-terminated
+/// string; `proto_max_bulk_len` and `client_max_querybuf_len` must stay valid
+/// for the life of the process (IO threads read them).
 #[no_mangle]
-pub extern "C" fn vio_start(cfg: *const VioConfig) -> c_int {
+pub unsafe extern "C" fn vio_start(cfg: *const VioConfig) -> c_int {
     let cfg = unsafe { &*cfg };
     let addr = if cfg.bindaddr.is_null() {
         "0.0.0.0".to_string()
@@ -1032,7 +1037,7 @@ pub extern "C" fn vio_start(cfg: *const VioConfig) -> c_int {
  * ------------------------------------------------------------------------- */
 
 thread_local! {
-    static MAIN_READY: RefCell<VecDeque<Arc<Conn>>> = RefCell::new(VecDeque::new());
+    static MAIN_READY: RefCell<VecDeque<Arc<Conn>>> = const { RefCell::new(VecDeque::new()) };
 }
 
 /// Consume the main eventfd and take the current batch of ready
@@ -1119,13 +1124,21 @@ fn conn_arc(h: *const Conn) -> std::mem::ManuallyDrop<Arc<Conn>> {
     std::mem::ManuallyDrop::new(unsafe { Arc::from_raw(h) })
 }
 
+///
+/// # Safety
+///
+/// `h` must be a live handle the caller holds a reference to.
 #[no_mangle]
-pub extern "C" fn vio_conn_retain(h: *const Conn) {
+pub unsafe extern "C" fn vio_conn_retain(h: *const Conn) {
     unsafe { Arc::increment_strong_count(h) };
 }
 
+///
+/// # Safety
+///
+/// `h` must be a live handle; the caller gives up one reference it holds.
 #[no_mangle]
-pub extern "C" fn vio_conn_release(h: *const Conn) {
+pub unsafe extern "C" fn vio_conn_release(h: *const Conn) {
     unsafe { Arc::decrement_strong_count(h) };
 }
 
@@ -1168,8 +1181,12 @@ pub extern "C" fn vio_conn_fd(h: *const Conn) -> c_int {
 }
 
 /// Move up to `max` parsed commands into `out`, in order.
+///
+/// # Safety
+///
+/// `h` must be a live handle and `out` must have room for `max` `VioCmd`s.
 #[no_mangle]
-pub extern "C" fn vio_conn_pop_cmds(h: *const Conn, out: *mut VioCmd, max: usize) -> usize {
+pub unsafe extern "C" fn vio_conn_pop_cmds(h: *const Conn, out: *mut VioCmd, max: usize) -> usize {
     let conn = conn_arc(h);
     let (n, left) = {
         let mut sh = conn.shared.lock().unwrap();
@@ -1200,8 +1217,12 @@ pub extern "C" fn vio_conn_pending_out(h: *const Conn) -> usize {
 /// Copy engine output into the connection's outbound buffer and wake its
 /// IO thread. Returns bytes accepted, or -1 with errno EAGAIN (buffer full,
 /// engine keeps the rest and installs its write handler) or EPIPE.
+///
+/// # Safety
+///
+/// `h` must be a live handle and `iov` must point to `iovcnt` valid iovecs.
 #[no_mangle]
-pub extern "C" fn vio_conn_writev(h: *const Conn, iov: *const libc::iovec, iovcnt: c_int) -> isize {
+pub unsafe extern "C" fn vio_conn_writev(h: *const Conn, iov: *const libc::iovec, iovcnt: c_int) -> isize {
     let conn = conn_arc(h);
     if conn.peer_closed.load(Ordering::Acquire) {
         set_errno(libc::EPIPE);
@@ -1266,8 +1287,13 @@ pub extern "C" fn vio_set_default_auth_required(on: c_int) {
 
 /// Publish the session fields the precheck reads (cut point 2). Read by
 /// the IO thread once per parsed batch.
+///
+/// # Safety
+///
+/// `h` must be a live handle and `s` must point to a valid `VioSession`
+/// (copied before return).
 #[no_mangle]
-pub extern "C" fn vio_conn_set_session(h: *const Conn, s: *const precheck::VioSession) {
+pub unsafe extern "C" fn vio_conn_set_session(h: *const Conn, s: *const precheck::VioSession) {
     conn_ref(h).session.set(unsafe { &*s });
 }
 

@@ -115,8 +115,12 @@ unsafe impl Send for Exec {}
 static EXEC: OnceLock<Exec> = OnceLock::new();
 
 /// Configure exec mode. Must be called before vio_start(). Returns 0.
+///
+/// # Safety
+///
+/// `cfg` must point to a valid `VioExecConfig`.
 #[no_mangle]
-pub extern "C" fn vio_exec_configure(cfg: *const VioExecConfig) -> c_int {
+pub unsafe extern "C" fn vio_exec_configure(cfg: *const VioExecConfig) -> c_int {
     let cfg = unsafe { &*cfg };
     let e = Exec { ops: cfg.ops, rtc: if cfg.rtc != 0 { Some(cfg.rtc_ops) } else { None } };
     if EXEC.set(e).is_err() {
@@ -129,6 +133,8 @@ pub(crate) fn rtc_ops() -> Option<&'static VioRtcOps> {
     EXEC.get().and_then(|e| e.rtc.as_ref())
 }
 
+/* time_t and c_long are i64 only on some targets: keep the casts. */
+#[allow(clippy::unnecessary_cast)]
 fn now_us(clock: libc::clockid_t) -> i64 {
     let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     unsafe { libc::clock_gettime(clock, &mut ts) };
@@ -261,6 +267,8 @@ pub struct RtcStats {
 }
 
 impl RtcStats {
+    /* The array-repeat initializer for atomics needs a const item. */
+    #[allow(clippy::declare_interior_mutable_const)]
     const fn new() -> Self {
         const Z: AtomicU64 = AtomicU64::new(0);
         RtcStats {
@@ -276,6 +284,7 @@ impl RtcStats {
 }
 
 pub static RTC_STATS: [RtcStats; MAX_THREADS] = {
+    #[allow(clippy::declare_interior_mutable_const)]
     const S: RtcStats = RtcStats::new();
     [S; MAX_THREADS]
 };
@@ -300,8 +309,12 @@ pub(crate) fn rtc_record(t: usize, wait_ns: u64, hold_ns: u64, uncontended: bool
 
 /// Format the lock statistics as INFO fields into buf (NUL terminated).
 /// Returns the length written. Bucket i counts samples in [2^(i-1), 2^i) ns.
+///
+/// # Safety
+///
+/// `buf` must be writable for `len` bytes.
 #[no_mangle]
-pub extern "C" fn vio_rtc_stats(buf: *mut u8, len: usize) -> usize {
+pub unsafe extern "C" fn vio_rtc_stats(buf: *mut u8, len: usize) -> usize {
     use std::fmt::Write;
     let mut s = String::new();
     let mut wait = [0u64; BUCKETS];
@@ -351,7 +364,7 @@ mod tests {
     fn stats_format() {
         rtc_record(0, 100, 3000, true, 2);
         let mut buf = vec![0u8; 4096];
-        let n = vio_rtc_stats(buf.as_mut_ptr(), buf.len());
+        let n = unsafe { vio_rtc_stats(buf.as_mut_ptr(), buf.len()) };
         let s = std::str::from_utf8(&buf[..n]).unwrap();
         assert!(s.contains("rtc_batches:1\r\n"));
         assert!(s.contains("rtc_uncontended:1\r\n"));
