@@ -45,6 +45,7 @@ int rustIoTrySendWrite(struct client *c);
 int rustIoTryOffloadFreeArgv(struct client *c, int argc, struct serverObject **argv);
 /* waitForClientIO(): hand batched kicks to the IO threads first. */
 void rustIoFlushKicks(void);
+void rustIoPublishLimits(void);
 sds rustIoCatInfo(sds info);
 /* Wait up to timeout_ms for Rust to write what replicas were handed. */
 void rustIoFlushReplicas(long long timeout_ms);

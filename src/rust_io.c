@@ -377,6 +377,11 @@ static void rustIoDrainDone(void) {
     }
 }
 
+/* CONFIG SET proto-max-bulk-len / client-query-buffer-limit. */
+void rustIoPublishLimits(void) {
+    if (rust_started) vio_set_limits(server.proto_max_bulk_len, server.client_max_querybuf_len);
+}
+
 void rustIoFlushKicks(void) {
     if (rust_started) vio_main_flush_kicks();
 }
@@ -595,8 +600,8 @@ int rustIoInitListeners(void) {
         .bindaddr = server.bindaddr_count ? server.bindaddr[0] : NULL,
         .port = port,
         .threads = rust_io_config.threads,
-        .proto_max_bulk_len = &server.proto_max_bulk_len,
-        .client_max_querybuf_len = &server.client_max_querybuf_len,
+        .proto_max_bulk_len = server.proto_max_bulk_len,
+        .client_max_querybuf_len = server.client_max_querybuf_len,
         .cbs = {.create_argv = rustIoCreateArgv, .free_argv = rustIoFreeArgv, .write_job = rustIoWriteJob},
     };
     rust_io_precheck_active = rust_io_config.mode == RUST_IO_MODE_PRECHECK;

@@ -21,7 +21,6 @@ use resp::{Arg, Limits, Outcome, Parser};
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::ffi::{c_char, c_int, c_void};
-use ffi::LimitPtrs;
 use std::os::unix::io::{IntoRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -59,8 +58,10 @@ pub struct VioConfig {
     pub bindaddr: *const c_char,
     pub port: c_int,
     pub threads: c_int,
-    pub proto_max_bulk_len: *const std::ffi::c_longlong,
-    pub client_max_querybuf_len: *const usize,
+    /// proto-max-bulk-len and client-query-buffer-limit at start;
+    /// vio_set_limits() publishes later changes.
+    pub proto_max_bulk_len: std::ffi::c_longlong,
+    pub client_max_querybuf_len: usize,
     pub cbs: VioCallbacks,
 }
 
@@ -184,9 +185,36 @@ struct Ready {
     done: Vec<usize>,
 }
 
+/// Engine config the parser applies, pushed by value by the engine
+/// (vio_start, vio_set_limits). Read with Relaxed: a CONFIG SET only has to
+/// apply to reads that start after it.
+pub(crate) struct EngineLimits {
+    max_bulk_len: std::sync::atomic::AtomicI64,
+    max_querybuf_len: AtomicUsize,
+}
+
+impl EngineLimits {
+    pub(crate) fn new(max_bulk_len: i64, max_querybuf_len: usize) -> Self {
+        EngineLimits {
+            max_bulk_len: std::sync::atomic::AtomicI64::new(max_bulk_len),
+            max_querybuf_len: AtomicUsize::new(max_querybuf_len),
+        }
+    }
+    pub(crate) fn set(&self, max_bulk_len: i64, max_querybuf_len: usize) {
+        self.max_bulk_len.store(max_bulk_len, Ordering::Relaxed);
+        self.max_querybuf_len.store(max_querybuf_len, Ordering::Relaxed);
+    }
+    fn max_bulk_len(&self) -> i64 {
+        self.max_bulk_len.load(Ordering::Relaxed)
+    }
+    fn max_querybuf_len(&self) -> usize {
+        self.max_querybuf_len.load(Ordering::Relaxed)
+    }
+}
+
 struct Global {
     cbs: VioCallbacks,
-    limits: LimitPtrs,
+    limits: EngineLimits,
     threads: Vec<IoThread>,
     main_efd: RawFd,
     main_signaled: AtomicBool,
@@ -949,7 +977,7 @@ impl Worker {
 
 /// Bind the listener and start the IO threads (vio_start). Returns the
 /// engine's eventfd, or an errno value.
-fn start(bind: Option<String>, port: c_int, threads: c_int, cbs: VioCallbacks, limits: LimitPtrs) -> Result<RawFd, i32> {
+fn start(bind: Option<String>, port: c_int, threads: c_int, cbs: VioCallbacks, limits: EngineLimits) -> Result<RawFd, i32> {
     let addr = match bind {
         None => "0.0.0.0".to_string(),
         Some(s) => {

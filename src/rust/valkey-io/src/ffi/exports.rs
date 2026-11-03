@@ -1,7 +1,7 @@
 //! `#[no_mangle]` exports. Thin shims over the crate internals.
 use crate::precheck;
 use crate::*;
-use std::ffi::{c_int, c_void, CStr};
+use std::ffi::{c_int, c_longlong, c_void, CStr};
 use std::sync::atomic::Ordering;
 use super::{ConnHandle, ConnRef};
 
@@ -10,8 +10,7 @@ use super::{ConnHandle, ConnRef};
 /// -1 with errno set.
 ///
 /// # Safety
-/// `cfg` must point at a valid VioConfig; its two limit pointers must stay
-/// valid for the life of the process. Call once, on the engine thread.
+/// `cfg` must point at a valid VioConfig. Call once, on the engine thread.
 #[no_mangle]
 pub unsafe extern "C" fn vio_start(cfg: *const VioConfig) -> c_int {
     // SAFETY: caller contract.
@@ -22,13 +21,24 @@ pub unsafe extern "C" fn vio_start(cfg: *const VioConfig) -> c_int {
         // SAFETY: a non-NULL bindaddr is a NUL-terminated string.
         Some(unsafe { CStr::from_ptr(cfg.bindaddr) }.to_string_lossy().into_owned())
     };
-    let limits = LimitPtrs { max_bulk_len: cfg.proto_max_bulk_len, max_querybuf_len: cfg.client_max_querybuf_len };
+    let limits = EngineLimits::new(cfg.proto_max_bulk_len, cfg.client_max_querybuf_len);
     match start(bind, cfg.port, cfg.threads, cfg.cbs, limits) {
         Ok(fd) => fd,
         Err(e) => {
             sys::set_errno(e);
             -1
         }
+    }
+}
+
+/// The engine changed proto-max-bulk-len or client-query-buffer-limit.
+///
+/// # Safety
+/// None beyond the FFI ABI; any thread, after vio_start().
+#[no_mangle]
+pub unsafe extern "C" fn vio_set_limits(proto_max_bulk_len: c_longlong, client_max_querybuf_len: usize) {
+    if let Some(g) = GLOBAL.get() {
+        g.limits.set(proto_max_bulk_len, client_max_querybuf_len);
     }
 }
 

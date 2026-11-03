@@ -170,8 +170,12 @@ typedef struct {
   const char *bindaddr;
   int port;
   int threads;
-  const long long *proto_max_bulk_len;
-  const size_t *client_max_querybuf_len;
+  /*
+   proto-max-bulk-len and client-query-buffer-limit at start;
+   vio_set_limits() publishes later changes.
+   */
+  long long proto_max_bulk_len;
+  size_t client_max_querybuf_len;
   VioCallbacks cbs;
 } VioConfig;
 
@@ -205,10 +209,17 @@ typedef struct {
  -1 with errno set.
 
  # Safety
- `cfg` must point at a valid VioConfig; its two limit pointers must stay
- valid for the life of the process. Call once, on the engine thread.
+ `cfg` must point at a valid VioConfig. Call once, on the engine thread.
  */
 int vio_start(const VioConfig *cfg);
+
+/*
+ The engine changed proto-max-bulk-len or client-query-buffer-limit.
+
+ # Safety
+ None beyond the FFI ABI; any thread, after vio_start().
+ */
+void vio_set_limits(long long proto_max_bulk_len, size_t client_max_querybuf_len);
 
 /*
  Hand the kicks collected on the main thread to their IO threads. Called
