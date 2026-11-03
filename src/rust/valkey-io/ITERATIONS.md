@@ -198,3 +198,20 @@ structs 4, unsafe 42, statics 11, ifdef 7, bridge 1474.
 | C3 (plan 20) | dc0537dad, fixup 3a26b934c | adaptive 2-20 us spin on IO threads, awake check on by default | | | | | first version live-locked (rust-io-0 at 100%, a -P 1 benchmark hung: the spin returned for an inbox whose eventfd write only TOK_WAKE drains), fixed in 3a26b934c. Then, predicted t1 -P 16 RPS within 3% and -P 1 main -11% to -16%: quick io/precheck-t1 -P 16 RPS -30% to -38%\*; sweep on 8 server cores (GET) t1 -28%, t2 -22%, t3 -11%, t6 +0.7% RPS at -P 16; -P 1 main ns -8% to -18% as predicted but p99 +11% to +16%. cs.sh t1 -P 16: rust-io-0 and main both block 814 times per 3 s with `VIO_SPIN_US` 0, 20 and 200 alike | | REVERTED (8da21ddac) |
 | C4 (plan 21) | c7d34a90f | ready connections' commands go through the memory_prefetch batch (the C IO threads' scheme), tails run by client id after the batch; resumable from a nested drain | 29 | 7 | 13 | 1186 | bound first (C io4, `-r 10000000`, prefetch on vs `prefetch-batch-max-size 0`): -P 1 main ns -0.8%/-1.1%, so no prefetch gain at -P 1 for C; -P 16 +44%/+28% without it. Rust, 8 server cores: -P 1 main ns -4.5% to -11.8% (t3, t6, r1M and r10M); -P 16 GET RPS -3.7% to -8.8%\* | all pass incl. scriptkill io/precheck | FIXED (next row) |
 | C4 fixup | 43538efc4 | only queues of <= 2 commands go into the batch (a pipelined queue is prefetched per client by processInputBuffer()) | 29 | 7 | 13 | ~1190 | vs C2 fixup, r1M: -P 1 main ns -10.3% (t3 GET and SET), -7.5%/-7.4% (t6); -P 16 within noise except precheck-t3 SET RPS -2.7%\* (threshold 2.5%) | final gates (below) | KEEP |
+
+## Final verification (stage 6d, on 93010a6b5)
+
+Stage 6c was killed before its phase D; stage 6d ran it. Full numbers and
+citations: `~/rust-io/iter2/report.md`; data `~/rust-io/iter2fin/`.
+
+- Gates: all pass, line-for-line the same as the C4 gate
+  (`gates/head/summary.txt`); `cargo +nightly miri test` 17 passed.
+- Full Tcl suite (6c's runs plus a rerun of `integration/replication-psync`,
+  which 6c's SIGKILL interrupted): 0 RUST-IO-BUG, 0 FLAKY in io and precheck.
+- ASAN soak, precheck, 600 s, zero-copy off and at 2048: both clean.
+- Stage 5b scaling method, precheck vs integrate in the same session:
+  GET -P 16 +9.6% RPS (T=4), +10.4% (T=8); -P 1 main ns/req -13% to -17%.
+  T=4 Q4 main thread 427 -> 390 ns/req (free argv 36 -> 1 ns, handoff/drain
+  20 -> 39 ns).
+- Zero-copy (T=4, -P 16, GET): main ns/req 2200 -> 371 (16 KB) and
+  20284 -> 511 (200 KB); RPS +2% / +10%, IO-thread bound.
