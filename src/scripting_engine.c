@@ -642,6 +642,11 @@ void scriptingEngineDebuggerFlushLogs(void) {
 int scriptingEngineDebuggerStartSession(client *c) {
     ds.forked = !c->flag.lua_debug_sync;
     if (ds.forked) {
+#ifdef USE_RUST_IO
+        /* The child takes the connection over: the IO layer in the parent
+         * must stop reading it first (the parent only closes it). */
+        if (connIsExternal(c->conn)) connExternalDetach(c->conn);
+#endif
         pid_t cp = serverFork(CHILD_TYPE_LDB);
         if (cp == -1) {
             addReplyErrorFormat(c, "Fork() failed: can't run EVAL in debugging mode: %s", strerror(errno));

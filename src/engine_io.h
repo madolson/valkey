@@ -38,6 +38,11 @@ int engineCmdQueuePending(struct client *c);
  * commands appended. */
 size_t engineSubmit(struct client *c, const engineCmd *cmds, size_t n, int *err, int *err_byte, unsigned long long *bytes);
 
+/* A client that just became replicated (slot import): its querybuf is the
+ * replication stream. Append the commands still in its cmd_queue, which
+ * were submitted before, as engineSubmit() does for later ones. */
+void engineReplicatedBackfill(struct client *c);
+
 /* After a submit that appended commands: the read accounting
  * handleReadResult() does for a socket read. */
 void engineAccountRead(struct client *c, unsigned long long bytes);

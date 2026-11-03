@@ -10,6 +10,7 @@ pub const EPOLLIN: u32 = libc::EPOLLIN as u32;
 pub const EPOLLOUT: u32 = libc::EPOLLOUT as u32;
 pub const EPOLLHUP: u32 = libc::EPOLLHUP as u32;
 pub const EPOLLERR: u32 = libc::EPOLLERR as u32;
+pub const EPOLLRDHUP: u32 = libc::EPOLLRDHUP as u32;
 
 pub fn errno() -> i32 {
     std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
@@ -23,6 +24,13 @@ pub fn set_errno(e: i32) {
 pub fn close(fd: RawFd) {
     // SAFETY: plain syscall; the caller owns fd.
     unsafe { libc::close(fd) };
+}
+
+/// Wait up to `ms` for `fd` to become writable. False on timeout or error.
+pub fn poll_writable(fd: RawFd, ms: c_int) -> bool {
+    let mut p = libc::pollfd { fd, events: libc::POLLOUT, revents: 0 };
+    // SAFETY: `p` is live for the call.
+    unsafe { libc::poll(&mut p, 1, ms) > 0 }
 }
 
 pub fn shutdown(fd: RawFd) {

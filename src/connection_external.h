@@ -31,6 +31,14 @@ typedef struct externalConnOps {
     /* The engine installed a read handler: input held in the IO layer may
      * flow again (unprotectClient()). */
     void (*read_resumed)(struct connection *conn);
+    /* Start of a direct-IO window (connBlock(), a fork child will use the
+     * fd): write what was accepted, then leave the fd alone. Blocks.
+     * Returns 0, or -1 if the pending output could not be written. */
+    int (*detach)(struct connection *conn);
+    /* End of the window (connNonBlock()): resume IO on the fd. */
+    void (*attach)(struct connection *conn);
+    /* connSetPriority(): serve this connection ahead of the others. */
+    void (*set_priority)(struct connection *conn, int on);
     /* beforeSleep() hooks, see ConnectionType. */
     int (*has_pending_data)(void);
     int (*process_pending_data)(void);
@@ -43,5 +51,16 @@ int connExternalAttach(const externalConnOps *ops);
  * layer's socket, used for addresses only. */
 struct connection *connCreateExternal(size_t size, int fd);
 int connIsExternal(struct connection *conn);
+/* connBlock()/connNonBlock() of an external connection. While blocked
+ * (detached), the engine does IO on the fd itself, as a socket connection
+ * would: in the parent (synchronous Lua debugger, the dual-channel RDB
+ * channel's handoff) and in a fork child, which has no IO layer threads. */
+int connExternalBlock(struct connection *conn);
+/* connSetPriority() of an external connection (it has no ae event). */
+void connExternalSetPriority(struct connection *conn, int on);
+int connExternalNonBlock(struct connection *conn);
+/* Stop the IO layer's IO on the fd without changing its blocking mode: a
+ * fork child is about to take the connection over. */
+void connExternalDetach(struct connection *conn);
 
 #endif /* CONNECTION_EXTERNAL_H */

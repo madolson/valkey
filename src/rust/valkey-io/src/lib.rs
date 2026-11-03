@@ -26,8 +26,9 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::ffi::{c_char, c_int, c_void};
 use std::os::unix::io::{IntoRawFd, RawFd};
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /* ---------------------------------------------------------------------------
  * FFI types (keep in sync with include/valkey_io.h)
@@ -100,6 +101,9 @@ pub const VIO_EV_NEW: u32 = 1 << 0;
 pub const VIO_EV_CLOSED: u32 = 1 << 1;
 pub const VIO_EV_WRITABLE: u32 = 1 << 2;
 pub const VIO_EV_QBLIMIT: u32 = 1 << 3;
+/// The input this layer holds for the connection grew (client memory
+/// accounting: the engine re-reads vio_conn_mem() on delivery).
+pub const VIO_EV_MEM: u32 = 1 << 4;
 
 /* Backpressure thresholds. */
 pub(crate) const CMDS_HIGH: usize = 1024; /* stop reading when this many commands are queued */
@@ -108,13 +112,63 @@ const OUT_HIGH: usize = 1 << 20; /* refuse engine writes past this many pending 
 const OUT_LOW: usize = 256 << 10; /* fire the engine write handler below this */
 const READ_CHUNK: usize = 16 * 1024;
 
+/* Conn.detach states. */
+pub(crate) const DET_NONE: u8 = 0;
+pub(crate) const DET_WANTED: u8 = 1;
+pub(crate) const DET_DONE: u8 = 2;
+pub(crate) const DET_FAILED: u8 = 3;
+/// Read-buffer sweep period (clientsCron visits a client about this often
+/// at the default hz with few clients).
+const SWEEP_EVERY: Duration = Duration::from_millis(100);
+/// How long the IO thread waits for the socket to take the output pending
+/// at detach time.
+const DETACH_FLUSH_MS: u64 = 5000;
+
 /* ---------------------------------------------------------------------------
  * Connection shared between one IO thread and the main thread
  * ------------------------------------------------------------------------- */
 
 struct Shared {
     cmds: VecDeque<VioCmd>,
+    /// For vio_conn_mem(): input bytes and argv bytes (argv_len_sum plus
+    /// the pointer array) of `cmds`.
+    cmds_input: usize,
+    cmds_argv: usize,
+    /// Protocol error: a sample of the input at the error and its length,
+    /// for the engine's "Query buffer: ..." log line (vio_conn_err_sample).
+    err_sample: Vec<u8>,
+    err_input_len: usize,
     out: Vec<u8>,
+}
+
+/// setProtocolError()'s PROTO_DUMP_LEN.
+const PROTO_DUMP_LEN: usize = 128;
+
+/// What setProtocolError() logs of the query buffer: all of it below
+/// PROTO_DUMP_LEN bytes, else the first and last PROTO_DUMP_LEN / 2.
+fn err_sample(input: &[u8]) -> Vec<u8> {
+    if input.len() < PROTO_DUMP_LEN {
+        input.to_vec()
+    } else {
+        let h = PROTO_DUMP_LEN / 2;
+        [&input[..h], &input[input.len() - h..]].concat()
+    }
+}
+
+/// argv bytes of a parsed command, as getClientMemoryUsage() counts argv.
+fn cmd_argv_bytes(c: &VioCmd) -> usize {
+    c.argv_len_sum + c.argc.max(0) as usize * std::mem::size_of::<*mut c_void>()
+}
+
+/// Engine thread: mark a connection high priority (or not).
+fn set_priority(conn: &Conn, on: bool) {
+    if conn.priority.swap(on, Ordering::Relaxed) != on {
+        if on {
+            conn.g.prio_conns.fetch_add(1, Ordering::Relaxed);
+        } else {
+            conn.g.prio_conns.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
 }
 
 pub struct Conn {
@@ -141,6 +195,18 @@ pub struct Conn {
     /// harmless: commands queued after the engine's last pop announce
     /// themselves with a new readiness (in_ready was cleared before the pop).
     ncmds: AtomicUsize,
+    /// Input bytes the parser has not consumed (CLIENT LIST qbuf) and
+    /// private read-buffer capacity, written by
+    /// the IO thread when they change, read by vio_conn_mem().
+    in_len: AtomicUsize,
+    in_cap: AtomicUsize,
+    /// High-priority connection (connSetPriority()): the engine drains it
+    /// ahead of the others in a ready batch.
+    priority: AtomicBool,
+    /// Fork-child IO window (DESIGN.md "Detached connections"): DET_*.
+    /// While DET_DONE the engine does IO on the fd itself and this layer
+    /// neither reads nor writes it.
+    pub(crate) detach: AtomicU8,
     /// Zero-copy write job in flight (engine pointer), 0 if none. Set by
     /// the engine thread, taken by the IO thread. At most one.
     job: AtomicUsize,
@@ -154,6 +220,7 @@ pub struct Conn {
 
 impl Drop for Conn {
     fn drop(&mut self) {
+        set_priority(self, false);
         let g = self.g;
         let sh = self.shared.get_mut().unwrap();
         g.adm.queued_sub(sh.cmds.len());
@@ -181,6 +248,10 @@ enum Msg {
     /// To thread 0: unadopted connections fell below NEW_LOW, poll the
     /// listener again.
     ResumeAccept,
+    /// Write what is pending, then stop all IO on the fd (vio_conn_detach).
+    Detach(Arc<Conn>),
+    /// Resume IO on a detached fd (vio_conn_attach).
+    Attach(Arc<Conn>),
 }
 
 struct IoThread {
@@ -255,6 +326,11 @@ struct Global {
     /// again; with one IO thread at -P 16 that cost 16% throughput
     /// (DESIGN.md "Handoff v2").
     handoff_disable: u32,
+    /// Capacity of every connection's private read buffer, all threads: the
+    /// engine adds it to used memory for maxmemory (vio_held_input_total()).
+    rbuf_total: AtomicUsize,
+    /// Connections with `priority` set; take_ready() reorders only when > 0.
+    prio_conns: AtomicUsize,
 }
 
 impl Global {
@@ -300,6 +376,41 @@ fn kick(rt: &Runtime, conn: &Arc<Conn>) {
     if conn.state.apply(Event::Kick) & FX_POST_KICK != 0 {
         post_kick(rt, conn);
     }
+}
+
+/// Engine thread: hand the fd to the engine (fork-child IO window). Waits
+/// until the IO thread has written the pending output and stopped all IO
+/// on the fd. False if the output did not drain in time.
+fn detach(conn: &Arc<Conn>) -> bool {
+    match conn.detach.load(Ordering::Acquire) {
+        DET_DONE => return true,
+        DET_NONE | DET_FAILED => {}
+        _ => unreachable!("detach in progress on the engine thread"),
+    }
+    conn.detach.store(DET_WANTED, Ordering::Release);
+    let g = conn.g;
+    g.threads[conn.thread].post(g, |q| q.push(Msg::Detach(conn.clone())));
+    let deadline = Instant::now() + Duration::from_millis(DETACH_FLUSH_MS + 1000);
+    loop {
+        match conn.detach.load(Ordering::Acquire) {
+            DET_DONE => return true,
+            DET_FAILED => return false,
+            _ => {}
+        }
+        if Instant::now() > deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_micros(50));
+    }
+}
+
+/// Engine thread: give the fd back to the IO thread.
+fn attach(conn: &Arc<Conn>) {
+    if conn.detach.load(Ordering::Acquire) == DET_NONE {
+        return;
+    }
+    let g = conn.g;
+    g.threads[conn.thread].post(g, |q| q.push(Msg::Attach(conn.clone())));
 }
 
 /// vio_conn_close(): released by the IO thread once the output is written
@@ -411,6 +522,14 @@ struct Local {
     sock_blocked: bool,
     registered: bool,
     interest: u32,
+    /// `rbuf` is the worker's shared read buffer, lent for one read.
+    rbuf_shared: bool,
+    /// in_len/in_cap last published, and peak use since the last sweep
+    /// (querybuf_peak).
+    len_pub: usize,
+    cap_pub: usize,
+    peak: usize,
+    last_read: Instant,
 }
 
 struct Worker {
@@ -433,6 +552,15 @@ struct Worker {
     held: Vec<Vec<Arg>>,
     /// Swapped with the inbox (handoff::Mailbox::swap).
     inbox_buf: Vec<Msg>,
+    /// Shared read buffer (thread_shared_qb): a connection reads into it
+    /// unless it holds a partial command, and keeps it only if input is
+    /// left unparsed. Idle connections then hold no read buffer.
+    shared_rbuf: Vec<u8>,
+    /// Connections holding a private read buffer (cap_pub != 0).
+    private_bufs: usize,
+    /// Time after the last epoll_wait, and of the last buffer sweep.
+    now: Instant,
+    last_sweep: Instant,
 }
 
 impl Worker {
@@ -523,9 +651,20 @@ impl Worker {
             auth_required: AtomicBool::new(self.g.default_auth_required.load(Ordering::Relaxed)),
             parse_held: AtomicBool::new(false),
             ncmds: AtomicUsize::new(0),
+            priority: AtomicBool::new(false),
+            detach: AtomicU8::new(DET_NONE),
+            in_len: AtomicUsize::new(0),
+            in_cap: AtomicUsize::new(0),
             out_bytes: AtomicUsize::new(0),
             job: AtomicUsize::new(0),
-            shared: Mutex::new(Shared { cmds: VecDeque::new(), out: Vec::new() }),
+            shared: Mutex::new(Shared {
+                cmds: VecDeque::new(),
+                cmds_input: 0,
+                cmds_argv: 0,
+                err_sample: Vec::new(),
+                err_input_len: 0,
+                out: Vec::new(),
+            }),
             session: precheck::SessionView::new(),
             #[cfg(feature = "timing")]
             trace: AtomicU32::new(0),
@@ -551,12 +690,21 @@ impl Worker {
             sock_blocked: false,
             registered: true,
             interest: libc::EPOLLIN as u32,
+            rbuf_shared: false,
+            len_pub: 0,
+            cap_pub: 0,
+            peak: 0,
+            last_read: self.now,
         });
         self.notify(&conn, VIO_EV_NEW);
     }
 
     fn remove(&mut self, idx: usize) {
         if let Some(l) = self.slab[idx].take() {
+            self.g.rbuf_total.fetch_sub(l.cap_pub, Ordering::Relaxed);
+            if l.cap_pub != 0 {
+                self.private_bufs -= 1;
+            }
             if l.registered {
                 sys::epoll_del(self.me().epfd, l.conn.fd);
             }
@@ -575,7 +723,10 @@ impl Worker {
         }
         let c = &l.conn;
         let mut want = 0u32;
-        if !c.read_paused.load(Ordering::Acquire) && !c.state.has(C_CLOSED) && !l.proto_err {
+        if c.detach.load(Ordering::Acquire) == DET_DONE {
+            /* Only watch for the peer going away. */
+            want = sys::EPOLLRDHUP;
+        } else if !c.read_paused.load(Ordering::Acquire) && !c.state.has(C_CLOSED) && !l.proto_err {
             want |= libc::EPOLLIN as u32;
         }
         if l.woff < l.wbuf.len() || l.sock_blocked {
@@ -610,6 +761,107 @@ impl Worker {
     }
 
     fn on_readable(&mut self, idx: usize) {
+        let now = self.now;
+        if let Some(l) = self.slab[idx].as_mut() {
+            l.last_read = now;
+            if l.rbuf.capacity() == 0 {
+                std::mem::swap(&mut l.rbuf, &mut self.shared_rbuf);
+                l.rbuf_shared = true;
+            }
+        }
+        self.read_and_parse(idx);
+        self.settle_rbuf(idx);
+    }
+
+    /// After a read or a parse: return a lent shared buffer that holds no
+    /// unparsed input (otherwise the connection keeps it, as C hands a
+    /// client the shared query buffer), and publish what is held.
+    fn settle_rbuf(&mut self, idx: usize) {
+        let l = match self.slab[idx].as_mut() {
+            Some(l) => l,
+            None => return,
+        };
+        if l.rbuf_shared {
+            l.rbuf_shared = false;
+            if l.rpos == l.rbuf.len() {
+                l.rbuf.clear();
+                l.rpos = 0;
+                if l.rbuf.capacity() <= 4 * READ_CHUNK {
+                    std::mem::swap(&mut l.rbuf, &mut self.shared_rbuf);
+                } else {
+                    l.rbuf = Vec::new();
+                }
+            }
+        }
+        let len = (l.rbuf.len() - l.rpos).saturating_sub(l.parser.frame_consumed());
+        if len != l.len_pub {
+            l.len_pub = len;
+            l.conn.in_len.store(len, Ordering::Relaxed);
+        }
+        let cap = l.rbuf.capacity();
+        if cap != l.cap_pub {
+            let grew = cap > l.cap_pub;
+            if l.cap_pub == 0 {
+                self.private_bufs += 1;
+            } else if cap == 0 {
+                self.private_bufs -= 1;
+            }
+            if grew {
+                self.g.rbuf_total.fetch_add(cap - l.cap_pub, Ordering::Relaxed);
+            } else {
+                self.g.rbuf_total.fetch_sub(l.cap_pub - cap, Ordering::Relaxed);
+            }
+            l.cap_pub = cap;
+            l.conn.in_cap.store(cap, Ordering::Relaxed);
+            if grew {
+                let c = l.conn.clone();
+                self.notify(&c, VIO_EV_MEM);
+            }
+        }
+    }
+
+    /// Every SWEEP_EVERY: clientsCronResizeQueryBuffer() for the private read
+    /// buffers. Free an idle connection's empty buffer, shrink an idle one
+    /// holding a partial command to fit, and trim a buffer that is twice
+    /// its recent peak.
+    fn sweep(&mut self) {
+        let now = self.now;
+        self.last_sweep = now;
+        for idx in 0..self.slab.len() {
+            let l = match self.slab[idx].as_mut() {
+                Some(l) => l,
+                None => continue,
+            };
+            let cap = l.rbuf.capacity();
+            if cap == 0 {
+                l.peak = 0;
+                continue;
+            }
+            let unparsed = l.rbuf.len() - l.rpos;
+            let needed = l.parser.needed();
+            if cap - l.rbuf.len() > 4096 {
+                if now.duration_since(l.last_read) > Duration::from_secs(2) {
+                    if unparsed == 0 {
+                        l.rbuf = Vec::new();
+                        l.rpos = 0;
+                    } else {
+                        l.rbuf.drain(..l.rpos);
+                        l.rpos = 0;
+                        l.rbuf.shrink_to_fit();
+                    }
+                } else if cap > 32 * 1024 && cap / 2 > l.peak {
+                    l.rbuf.drain(..l.rpos);
+                    l.rpos = 0;
+                    let keep = l.rbuf.len().max(l.peak).max(needed);
+                    l.rbuf.shrink_to(keep);
+                }
+            }
+            l.peak = (l.rbuf.len() - l.rpos).max(needed);
+            self.settle_rbuf(idx);
+        }
+    }
+
+    fn read_and_parse(&mut self, idx: usize) {
         let g = self.g;
         let l = match self.slab[idx].as_mut() {
             Some(l) => l,
@@ -622,7 +874,9 @@ impl Worker {
 
         /* Size the read for a large pending bulk so it lands in one buffer. */
         let have = l.rbuf.len() - l.rpos;
-        let want = l.parser.needed().saturating_sub(have).max(READ_CHUNK);
+        let rem = l.parser.needed().saturating_sub(have);
+        let want = if l.parser.big_bulk() && rem > 0 { rem } else { rem.max(READ_CHUNK) };
+        l.peak = l.peak.max(have + want);
         let n = sys::read_append(conn.fd, &mut l.rbuf, want);
         if n == 0 {
             self.peer_gone(idx);
@@ -685,6 +939,7 @@ impl Worker {
         ptrs.clear();
         lens.clear();
         let mut ncmds = 0usize;
+        let mut sample: Option<(Vec<u8>, usize)> = None;
         loop {
             let frame = &l.rbuf[l.rpos..];
             match l.parser.parse(frame, &lim) {
@@ -732,6 +987,9 @@ impl Worker {
                 Outcome::Empty { consumed } => l.rpos += consumed,
                 Outcome::Incomplete => break,
                 Outcome::Error(e, b) => {
+                    /* C's qb_pos is past the parts already parsed. */
+                    let at = &frame[l.parser.frame_consumed().min(frame.len())..];
+                    sample = Some((err_sample(at), at.len()));
                     batch.push(VioCmd {
                         argv: std::ptr::null_mut(),
                         argc: 0,
@@ -773,14 +1031,17 @@ impl Worker {
             l.rbuf.drain(..l.rpos);
             l.rpos = 0;
         }
-        if l.rbuf.is_empty() && l.rbuf.capacity() > 4 * READ_CHUNK {
-            l.rbuf = Vec::new();
-        }
-
         if !batch.is_empty() {
             let n = batch.len();
+            let (input, argv) = batch.iter().fold((0, 0), |(i, a), c| (i + c.input_bytes as usize, a + cmd_argv_bytes(c)));
             let queued = {
                 let mut sh = conn.shared.lock().unwrap();
+                sh.cmds_input += input;
+                sh.cmds_argv += argv;
+                if let Some((v, n)) = sample.take() {
+                    sh.err_sample = v;
+                    sh.err_input_len = n;
+                }
                 #[cfg(feature = "timing")]
                 for c in batch.iter().filter(|c| c.trace != 0) {
                     timing::stamp(c.trace, timing::ST_ENQUEUED);
@@ -808,6 +1069,9 @@ impl Worker {
         let conn = l.conn.clone();
         if conn.state.has(PEER_CLOSED) {
             self.run_job(idx);
+            return;
+        }
+        if conn.detach.load(Ordering::Acquire) == DET_DONE {
             return;
         }
         let mut failed = false;
@@ -887,6 +1151,12 @@ impl Worker {
             self.remove(idx);
             return;
         }
+        if conn.detach.load(Ordering::Acquire) == DET_DONE {
+            /* Nothing pending here (the detach flushed it), so a close or a
+             * shutdown takes effect at once. */
+            self.after_flush(idx);
+            return;
+        }
         if conn.read_paused.load(Ordering::Acquire) && self.g.adm.may_resume(conn.ncmds.load(Ordering::Acquire)) {
             conn.read_paused.store(false, Ordering::Release);
         }
@@ -896,6 +1166,7 @@ impl Worker {
         }
         if conn.parse_held.swap(false, Ordering::AcqRel) {
             self.parse_buffered(idx);
+            self.settle_rbuf(idx);
         }
         self.update_interest(idx);
     }
@@ -927,6 +1198,14 @@ impl Worker {
     }
 
     fn on_event(&mut self, idx: usize, mask: u32) {
+        if let Some(l) = self.slab[idx].as_ref() {
+            if l.conn.detach.load(Ordering::Acquire) == DET_DONE {
+                if mask & (sys::EPOLLRDHUP | sys::EPOLLHUP | sys::EPOLLERR) != 0 {
+                    self.peer_gone(idx);
+                }
+                return;
+            }
+        }
         if mask & (libc::EPOLLOUT as u32) != 0 {
             if let Some(l) = self.slab[idx].as_mut() {
                 l.sock_blocked = false;
@@ -943,6 +1222,57 @@ impl Worker {
             } else if mask & ((libc::EPOLLHUP | libc::EPOLLERR) as u32) != 0 {
                 self.peer_gone(idx);
             }
+        }
+    }
+
+    /// Msg::Detach: put everything accepted so far on the socket (the fd
+    /// is still non-blocking), then leave it to the engine. Reading stops
+    /// here too, so input not yet read stays in the socket for the engine.
+    fn on_detach(&mut self, conn: Arc<Conn>) {
+        let idx = conn.token.load(Ordering::Relaxed);
+        let live = matches!(self.slab.get(idx), Some(Some(l)) if Arc::ptr_eq(&l.conn, &conn));
+        if !live {
+            conn.detach.store(DET_DONE, Ordering::Release);
+            return;
+        }
+        let deadline = Instant::now() + Duration::from_millis(DETACH_FLUSH_MS);
+        let mut ok = true;
+        loop {
+            self.flush(idx);
+            let l = match self.slab[idx].as_ref() {
+                Some(l) => l,
+                None => break,
+            };
+            let pending = l.woff < l.wbuf.len() || conn.out_bytes.load(Ordering::Acquire) > 0;
+            if !pending || conn.state.has(PEER_CLOSED) {
+                break;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                ok = false;
+                break;
+            }
+            sys::poll_writable(conn.fd, (deadline - now).as_millis().max(1) as c_int);
+        }
+        conn.detach.store(if ok { DET_DONE } else { DET_FAILED }, Ordering::Release);
+        if ok {
+            self.update_interest(idx);
+        }
+    }
+
+    /// Msg::Attach: the engine is done with the fd (and made it
+    /// non-blocking again). Resume reading, and parse what was buffered.
+    fn on_attach(&mut self, conn: Arc<Conn>) {
+        conn.detach.store(DET_NONE, Ordering::Release);
+        let idx = conn.token.load(Ordering::Relaxed);
+        if !matches!(self.slab.get(idx), Some(Some(l)) if Arc::ptr_eq(&l.conn, &conn)) {
+            return;
+        }
+        self.update_interest(idx);
+        self.flush(idx);
+        if !conn.parse_held.load(Ordering::Acquire) {
+            self.parse_buffered(idx);
+            self.settle_rbuf(idx);
         }
     }
 
@@ -1006,6 +1336,8 @@ impl Worker {
                         self.listen_interest(true);
                         self.accept_all();
                     }
+                    Msg::Detach(c) => self.on_detach(c),
+                    Msg::Attach(c) => self.on_attach(c),
                     Msg::FreeArgv(argv, argc) => (self.g.cbs.free_argv)(argv as *mut *mut c_void, argc),
                 }
             }
@@ -1023,6 +1355,7 @@ impl Worker {
             }
             let n = sys::epoll_wait(me.epfd, &mut events, timeout);
             me.inbox.waker.awake();
+            self.now = Instant::now();
             for ev in events.iter().take(n) {
                 let tok = ev.u64;
                 let mask = ev.events;
@@ -1043,7 +1376,11 @@ impl Worker {
             if !me.inbox.waker.signaled() {
                 self.take_inbox();
             }
-            timeout = -1;
+            if self.now.duration_since(self.last_sweep) >= SWEEP_EVERY {
+                self.sweep();
+            }
+            /* Wake up for the sweep while private read buffers exist. */
+            timeout = if self.private_bufs > 0 { SWEEP_EVERY.as_millis() as c_int } else { -1 };
             self.unpin();
             self.flush_notify();
         }
@@ -1101,6 +1438,8 @@ fn start(bind: Option<String>, port: c_int, threads: c_int, cbs: VioCallbacks, l
         adm: admission::Admission::new(),
         default_auth_required: AtomicBool::new(false),
         handoff_disable,
+        rbuf_total: AtomicUsize::new(0),
+        prio_conns: AtomicUsize::new(0),
     }));
     let rt: &'static Runtime = Box::leak(Box::new(Runtime { g, main: RefCell::new(MainState::default()), main_thread: sys::thread_self() }));
     for idx in 0..nthreads {
@@ -1117,6 +1456,10 @@ fn start(bind: Option<String>, port: c_int, threads: c_int, cbs: VioCallbacks, l
             lens: Vec::new(),
             held: Vec::new(),
             inbox_buf: Vec::new(),
+            shared_rbuf: Vec::new(),
+            private_bufs: 0,
+            now: Instant::now(),
+            last_sweep: Instant::now(),
         };
         std::thread::Builder::new()
             .name(format!("rust-io-{}", idx))
@@ -1140,7 +1483,23 @@ fn take_ready(rt: &Runtime) -> c_int {
     if !rt.g.ready.swap(&mut m.swap) {
         return 0;
     }
-    m.ready.extend(m.swap.conns.drain(..));
+    if rt.g.prio_conns.load(Ordering::Relaxed) == 0 {
+        m.ready.extend(m.swap.conns.drain(..));
+    } else {
+        /* High-priority connections first, in arrival order (the QoS event
+         * loop drains its priority set before the normal one). */
+        let mut prio = Vec::new();
+        for c in m.swap.conns.drain(..) {
+            if c.priority.load(Ordering::Relaxed) {
+                prio.push(c);
+            } else {
+                m.ready.push_back(c);
+            }
+        }
+        for c in prio.into_iter().rev() {
+            m.ready.push_front(c);
+        }
+    }
     m.done.extend(m.swap.done.drain(..));
     1
 }

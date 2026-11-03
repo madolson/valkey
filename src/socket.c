@@ -509,11 +509,17 @@ static ConnectionType CT_Socket = {
 
 int connBlock(connection *conn) {
     if (conn->fd == -1) return C_ERR;
+#ifdef USE_RUST_IO
+    if (connIsExternal(conn)) return connExternalBlock(conn);
+#endif
     return anetBlock(NULL, conn->fd);
 }
 
 int connNonBlock(connection *conn) {
     if (conn->fd == -1) return C_ERR;
+#ifdef USE_RUST_IO
+    if (connIsExternal(conn)) return connExternalNonBlock(conn);
+#endif
     return anetNonBlock(NULL, conn->fd);
 }
 

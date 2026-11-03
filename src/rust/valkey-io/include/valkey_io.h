@@ -18,6 +18,12 @@
 #define VIO_EV_QBLIMIT (1 << 3)
 
 /*
+ The input this layer holds for the connection grew (client memory
+ accounting: the engine re-reads vio_conn_mem() on delivery).
+ */
+#define VIO_EV_MEM (1 << 4)
+
+/*
  Protocol error codes in VioCmd.err (resp::ProtoError; mirrors READ_FLAGS_ERROR_*).
  */
 #define VIO_ERR_NONE 0
@@ -57,6 +63,8 @@
  Replica, primary, slot migration, no user.
  */
 #define VIO_SESS_SPECIAL (1 << 3)
+
+
 
 
 
@@ -207,6 +215,31 @@ typedef VioConn *VioConnHandle;
  for it for at least the duration of the call.
  */
 typedef VioConn *VioConnRef;
+
+/*
+ Memory this layer holds for one connection (client memory accounting).
+ */
+typedef struct {
+  /*
+   Input read and not parsed yet.
+   */
+  size_t in_unparsed;
+  /*
+   Capacity of the connection's private read buffer (0 when it reads
+   into the thread's shared buffer).
+   */
+  size_t in_alloc;
+  /*
+   Parsed commands not yet taken by the engine: their input bytes and
+   their argv bytes (argv_len_sum plus the pointer array).
+   */
+  size_t queued_input;
+  size_t queued_argv;
+  /*
+   Output accepted and not yet written (copy path).
+   */
+  size_t out_pending;
+} VioConnMem;
 
 #if defined(RUST_IO_TIMING)
 typedef struct {
@@ -377,6 +410,37 @@ size_t vio_conn_pop_cmds(const VioRuntime *rt, VioConnRef h, VioCmd *out, size_t
 size_t vio_conn_pending_cmds(const VioRuntime *_rt, VioConnRef h);
 
 /*
+ # Safety
+ `h` must be a live handle, `out` writable.
+ */
+void vio_conn_mem(const VioRuntime *_rt, VioConnRef h, VioConnMem *out);
+
+/*
+ After a protocol error (VioCmd.err): copy up to `cap` bytes of the
+ input sample (the whole input from the error on if shorter than 128
+ bytes, else its first and last 64) to `buf`, and store the input's
+ length in `total`. Returns the bytes copied.
+
+ # Safety
+ `h` must be a live handle, `buf` writable for `cap` bytes, `total`
+ writable.
+ */
+size_t vio_conn_err_sample(const VioRuntime *_rt,
+                           VioConnRef h,
+                           uint8_t *buf,
+                           size_t cap,
+                           size_t *total);
+
+/*
+ Sum of in_alloc over every connection: read buffers live in the system
+ allocator, so the engine adds this to used memory for maxmemory.
+
+ # Safety
+ None beyond the FFI ABI.
+ */
+size_t vio_held_input_total(const VioRuntime *rt);
+
+/*
  Bytes accepted from the engine and not yet written to the socket.
 
  # Safety
@@ -460,6 +524,37 @@ void vio_conn_set_session(const VioRuntime *_rt, VioConnRef h, const VioSession 
  `h` must be a live handle.
  */
 void vio_conn_close(const VioRuntime *rt, VioConnRef h);
+
+/*
+ connSetPriority(): a high-priority connection is returned by
+ vio_main_next_ready() ahead of the others in its batch.
+
+ # Safety
+ `h` must be a live handle. Engine thread only.
+ */
+void vio_conn_set_priority(const VioRuntime *_rt, VioConnRef h, int on);
+
+/*
+ Hand the socket to the engine for direct IO (a fork child or a
+ synchronous session will use the fd): the IO thread writes everything
+ accepted so far, then stops reading and writing the fd until
+ vio_conn_attach(). It still reports VIO_EV_CLOSED when the peer goes
+ away. Blocks until done; returns 0, or -1 if the pending output did not
+ drain within 5 s (the engine then treats the connection as broken).
+
+ # Safety
+ `h` must be a live handle. Engine thread only, never in a fork child.
+ */
+int vio_conn_detach(const VioRuntime *_rt, VioConnRef h);
+
+/*
+ End of the direct-IO window: the IO thread polls the fd again (the
+ engine has made it non-blocking).
+
+ # Safety
+ `h` must be a live handle. Engine thread only.
+ */
+void vio_conn_attach(const VioRuntime *_rt, VioConnRef h);
 
 /*
  # Safety

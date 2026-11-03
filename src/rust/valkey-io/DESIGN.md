@@ -1235,3 +1235,135 @@ in `Global` instead of six statics. One change: the engine thread no longer
 does a shared atomic RMW per pop; it counts pops in a counter only it writes
 and subtracts them in `vio_main_flush_kicks()` (that RMW cost about 4%
 main-thread ns/request at -P 1).
+
+# Iteration 3b (stage 7b): engine features over external connections
+
+Five engine features that assumed a socket connection now work on the
+external connection type. Commits on `rust-io/iter3b`, one per feature,
+plus one fix. Numbers and test results: ITERATIONS.md, "Iteration 3b".
+The "Known gaps" items this supersedes: `CLIENT LIST qbuf` is no longer
+0, Rust read buffers are in client memory and in the maxmemory count,
+replication (including dual-channel) and slot imports over the Rust port
+work.
+
+## Slot import (replicated client) over cmd_queue (af6e1e199, 1ca6807e7)
+
+`commandProcessed()` derives a replicated client's `reploff` from
+`c->querybuf` (`read_reploff - sdslen(querybuf) + qb_applied`) and proxies
+`querybuf + repl_applied` to replicas. An import link is the only
+replicated client that can arrive through Rust (a primary link is an
+outbound C connection). `engineSubmit()` (`engine_io.c`) appends each
+command of a replicated client to its `querybuf` in canonical RESP and
+makes that length the command's `input_bytes`, so `consumeCommandQueue()`
+advances `qb_applied` exactly as for C. `qb_pos` stays at the end (the
+bytes are already parsed). `createSlotImportJob()` calls
+`engineReplicatedBackfill()` for commands queued before the client became
+replicated.
+
+Decision: re-serialize argv rather than keep Rust's raw bytes. The source
+sends canonical multibulk, for which Rust's `input_bytes` equals the
+re-serialized length; keeping raw bytes would need Rust to know, at parse
+time, that a connection is replicated, which it cannot for commands parsed
+before ESTABLISH ran. The cost is one copy per replicated command, only
+for import links.
+
+Memory: the unapplied stream now exists twice (argv in `cmd_queue`, RESP
+in `querybuf`). `rustIoPull()` takes a replicated client's commands 16 at
+a time until `PROTO_IOBUF_LEN` of stream is pending, and `rustIoDeliver()`
+runs up to 64 pull and execute rounds, trimming in between. Pulling 1024 at
+once grew `querybuf` to 230 KB for a 100 KB burst and made
+"Evictions on a full import target are replicated" fail with OOM.
+
+## Detached connections: fork-child and synchronous IO (30d70cbda)
+
+Paths that hand a client connection to blocking IO: the dual-channel RDB
+channel (`rdbSaveToReplicasSockets()`: `sendCurrentOffsetToReplica()`,
+`connBlock()`, fork; the child writes through `rioInitWithConnset()`), and
+the Lua debugger (`scriptingEngineDebuggerStartSession()`: forked child, or
+synchronous session in the parent, `connBlock()` then `connRead`/
+`connWrite`, `connNonBlock()` at the end). C hands the fd over and the
+parent stops touching it: the RDB channel parent "no longer requires these
+RDB connections" and later only shuts down and closes it
+(`freeClient()`: `shutdown(fd)` for `repl_rdb_channel`), the forked
+debugger parent only closes it (`freeClientAsync()`).
+
+- `connBlock()`/`connNonBlock()` (`socket.c`) call
+  `connExternalBlock()`/`connExternalNonBlock()` for external connections.
+  Block detaches: `vio_conn_detach()` posts `Msg::Detach`; the IO thread
+  writes everything accepted so far (non-blocking writes plus `poll()`, up
+  to 5 s), sets `Conn.detach = DET_DONE` and watches the fd for
+  `EPOLLRDHUP` only. The engine thread waits for that, then makes the fd
+  blocking. Unblock makes it non-blocking, then `vio_conn_attach()`
+  (`Msg::Attach`) re-arms `EPOLLIN` and parses anything buffered.
+- While detached (`CONN_FLAG_EXT_DETACHED`), and always in a fork child
+  (`server.in_fork_child`; the child has no IO threads and must not call
+  into Rust), the connection's `read`, `write`, `writev` and `sync_*` ops
+  use the fd directly, with `connSocket*`'s error and EOF handling and
+  `syncio.c` for the sync variants.
+- Bytes are not lost either way: output handed to Rust before the detach
+  is on the socket before the engine or the child writes; input Rust
+  already read stays in Rust (as it would stay in a C client's querybuf)
+  and input not yet read stays in the socket for the direct reader.
+- The forked debugger calls `connExternalDetach()` before `serverFork()`,
+  so the parent's IO thread cannot read the child's debugger commands
+  between the fork and the parent's close.
+- A detached connection's close and shutdown take effect at once in
+  `on_kick` (nothing is pending). A peer close while detached reports
+  `VIO_EV_CLOSED` as usual.
+
+## Client memory and query buffer (466bdba26)
+
+- Read buffer: the IO thread reads into a per-thread shared buffer and a
+  connection keeps it only when input is left unparsed, as C hands a
+  client `thread_shared_qb` (`Worker.shared_rbuf`, `settle_rbuf()`). Idle
+  connections hold no read buffer. Every 100 ms (`SWEEP_EVERY`, the IO
+  thread polls with that timeout while any private buffer exists) the
+  `clientsCronResizeQueryBuffer()` policy runs on private buffers: idle
+  more than 2 s and empty: free; idle with a partial command: shrink to
+  fit; otherwise larger than 32 KB and more than twice the peak since the
+  last sweep: shrink to the peak. Both only when more than 4 KB is free.
+  A bulk of 32 KB or more is read exactly to its end (`Parser::big_bulk`),
+  like `readToQueryBuf()`, so the buffer is not doubled past it.
+- `vio_conn_mem()`: unparsed bytes past the parser's position (C's
+  `qb_pos` is past parsed parts), private buffer capacity, queued
+  commands' input and argv bytes (`Shared.cmds_input/cmds_argv`, under
+  the lock that already guards the queue), pending output. The IO thread
+  stores the first two only when they change. `VIO_EV_MEM` (buffer grew)
+  makes the engine deliver, so `beforeNextClient()` re-buckets the client
+  as after a C read.
+- Engine: `getClientMemoryUsage()` adds buffer + queued argv + pending
+  output; `CLIENT LIST qbuf` adds unparsed + queued input + `cmd_queue`
+  input; `getMaxmemoryState()` adds `vio_held_input_total()` (sum of
+  private buffers, system allocator). `INFO rust_io`
+  `rust_io_held_input_bytes` reports that sum.
+- For stage 7a: `evictClients()` is untouched; it sees the new
+  inputs through `getClientMemoryUsage()`. `getClientOutputBufferMemoryUsage()`
+  (COB limits, `omem`) is unchanged; Rust-held output counts only in
+  `tot-mem` and client eviction. `INFO used_memory` does not include the
+  Rust buffers (only the maxmemory check does).
+
+## Protocol error log (9c739c136)
+
+On a parse error the IO thread saves what `setProtocolError()` would dump
+(input from the parser's position: whole if under 128 bytes, else first
+and last 64 plus the length) with the error item;
+`vio_conn_err_sample()` returns it and `rustIoLogProtocolError()` logs the
+C line at `LL_VERBOSE`, redacted under `hide-user-data-from-log`.
+
+## Priority connections (2f0840970)
+
+`connSetPriority()` of an external connection sets `is_priority` and
+`vio_conn_set_priority()`. When any connection has it (`PRIO_CONNS`),
+`take_ready()` moves priority connections to the front of the engine's
+ready list. `rustIoDrainReady()` runs them immediately (not through the
+prefetch batch) and reports the span as one cycle to the event loop's QoS
+stats callback, as `aeProcessQoSEvents()` does for priority sockets.
+
+## FFI added
+
+Exports: `vio_conn_detach`, `vio_conn_attach`, `vio_conn_mem`,
+`vio_held_input_total`, `vio_conn_err_sample`, `vio_conn_set_priority`
+(35 with the 29 of iteration 2). `externalConnOps`: `detach`, `attach`,
+`set_priority` (10 entries). Event bit `VIO_EV_MEM`. `include/valkey_io.h`
+was edited by hand in cbindgen's format (cbindgen is not installed on the
+stage 7b host); `make -C src check-rust-header` should be run where it is.

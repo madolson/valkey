@@ -20,6 +20,8 @@
 #include "memory_prefetch.h"
 #include "io_threads.h"
 
+#include <ctype.h>
+
 #ifdef USE_RUST_IO
 
 #include "rust/valkey-io/include/valkey_io.h"
@@ -159,15 +161,25 @@ static void rustIoStall(rustConnection *rc, client *c) {
     listAddNodeTail(rust_stalled, (void *)(uintptr_t)c->id);
 }
 
+/* A replicated client (slot import) keeps the commands it has not applied
+ * in its querybuf as well (engine_io.c). Pull them a little at a time, as
+ * C reads PROTO_IOBUF_LEN at a time, so that copy stays small. */
+#define RUST_IO_REPL_POP_BATCH 16
+
 /* Move parsed commands from Rust into c->cmd_queue (engineSubmit()). */
 static int rustIoPull(rustConnection *rc, client *c) {
     VioCmd cmds[RUST_IO_POP_BATCH];
     unsigned long long bytes = 0;
     int pulled = 0;
+    int replicated = c->repl_data && isReplicatedClient(c);
 
     while (rc->pending_err == 0 && engineCmdQueuePending(c) < RUST_IO_CMD_QUEUE_MAX) {
         size_t want = RUST_IO_CMD_QUEUE_MAX - engineCmdQueuePending(c);
         if (want > RUST_IO_POP_BATCH) want = RUST_IO_POP_BATCH;
+        if (replicated) {
+            if (sdslen(c->querybuf) - c->qb_applied >= PROTO_IOBUF_LEN) break;
+            if (want > RUST_IO_REPL_POP_BATCH) want = RUST_IO_REPL_POP_BATCH;
+        }
         size_t n = vio_conn_pop_cmds(rust_rt, rc->h, cmds, want);
         if (n == 0) break;
         pulled += engineSubmit(c, (const engineCmd *)cmds, n, &rc->pending_err, &rc->pending_err_byte, &bytes);
@@ -217,7 +229,34 @@ static void rustIoPublish(rustConnection *rc, client *c) {
     }
 }
 
-static void rustIoProtocolError(client *c, int err, int byte) {
+/* setProtocolError()'s log line, with the query buffer sample Rust kept
+ * from where the parser stopped. */
+#define RUST_IO_PROTO_DUMP_LEN 128
+static void rustIoLogProtocolError(rustConnection *rc, client *c, const char *errstr) {
+    if (server.verbosity > LL_VERBOSE) return;
+    sds ci = catClientInfoString(sdsempty(), c, server.hide_user_data_from_log);
+    char buf[256];
+    buf[0] = '\0';
+    if (server.hide_user_data_from_log) {
+        snprintf(buf, sizeof(buf), "*redacted*");
+    } else if (rc->h) {
+        unsigned char sample[RUST_IO_PROTO_DUMP_LEN];
+        size_t total = 0;
+        size_t n = vio_conn_err_sample(rust_rt, rc->h, sample, sizeof(sample), &total);
+        if (total < RUST_IO_PROTO_DUMP_LEN) {
+            snprintf(buf, sizeof(buf), "'%.*s'", (int)n, sample);
+        } else if (n == RUST_IO_PROTO_DUMP_LEN) {
+            snprintf(buf, sizeof(buf), "'%.*s' (... more %zu bytes ...) '%.*s'", RUST_IO_PROTO_DUMP_LEN / 2, sample,
+                     total - RUST_IO_PROTO_DUMP_LEN, RUST_IO_PROTO_DUMP_LEN / 2, sample + RUST_IO_PROTO_DUMP_LEN / 2);
+        }
+        for (char *p = buf; *p != '\0'; p++)
+            if (!isprint((unsigned char)*p)) *p = '.';
+    }
+    serverLog(LL_VERBOSE, "Protocol error (%s) from client: %s. Query buffer: %s", errstr, ci, buf);
+    sdsfree(ci);
+}
+
+static void rustIoProtocolError(rustConnection *rc, client *c, int err, int byte) {
     const char *msg = NULL;
     switch (err) {
     case VIO_ERR_BIG_INLINE: msg = "Protocol error: too big inline request"; break;
@@ -233,11 +272,16 @@ static void rustIoProtocolError(client *c, int err, int byte) {
     case VIO_ERR_UNEXPECTED_CHAR: break;
     default: serverPanic("Unknown rust-io protocol error %d", err);
     }
-    if (msg)
+    /* setProtocolError() logs at parse time, before the reply. */
+    if (msg) {
+        rustIoLogProtocolError(rc, c, msg + strlen("Protocol error: "));
         addReplyError(c, msg);
-    else
+    } else {
+        char errstr[32];
+        snprintf(errstr, sizeof(errstr), "expected '$', got '%c'", byte);
+        rustIoLogProtocolError(rc, c, errstr);
         addReplyErrorFormat(c, "Protocol error: expected '$', got '%c'", byte);
-    serverLog(LL_VERBOSE, "Protocol error (%d) from rust-io client id=%llu", err, (unsigned long long)c->id);
+    }
     c->flag.close_after_reply = 1;
     c->flag.protocol_error = 1;
 }
@@ -256,7 +300,7 @@ static bool rustIoCanProgress(rustConnection *rc, client *c) {
  * the queue trim, and what Rust reads about the client. */
 static void rustIoAfterCommands(rustConnection *rc, client *c) {
     if (rc->pending_err > 0 && engineCmdQueuePending(c) == 0 && canParseCommand(c)) {
-        rustIoProtocolError(c, rc->pending_err, rc->pending_err_byte);
+        rustIoProtocolError(rc, c, rc->pending_err, rc->pending_err_byte);
         rc->pending_err = -1;
     }
     trimCommandQueue(c);
@@ -283,15 +327,25 @@ static client *rustIoDeliverPull(rustConnection *rc) {
     return c;
 }
 
+/* Rounds of pull and execute for a replicated client in one delivery
+ * (rustIoPull() takes about PROTO_IOBUF_LEN of its stream per round). */
+#define RUST_IO_REPL_ROUNDS 64
+
 /* Pull and execute what Rust parsed for this connection. Mirrors the tail
  * of readQueryFromClient(). The client may be freed. */
 static void rustIoDeliver(rustConnection *rc) {
-    client *c = rustIoDeliverPull(rc);
-    if (!c) return;
-    if (processInputBuffer(c) == C_ERR) return;
-    rustIoAfterCommands(rc, c);
-    /* May free the client (close_asap). */
-    beforeNextClient(c);
+    for (int round = 0; round < RUST_IO_REPL_ROUNDS; round++) {
+        client *c = rustIoDeliverPull(rc);
+        if (!c) return;
+        uint64_t id = c->id;
+        if (processInputBuffer(c) == C_ERR) return;
+        rustIoAfterCommands(rc, c);
+        int again = isReplicatedClient(c) && rc->h && engineCmdQueuePending(c) == 0 && vio_conn_pending_cmds(rust_rt, rc->h);
+        /* May free the client (close_asap). beforeNextClient() trims the
+         * applied stream from a replicated client's querybuf. */
+        beforeNextClient(c);
+        if (!again || !lookupClientByID(id)) return;
+    }
 }
 
 /* Cross-connection batch (plan step 21), the C IO threads' scheme
@@ -448,8 +502,10 @@ sds rustIoCatInfo(sds info) {
     return sdscatprintf(info,
                         "rust_io_zero_copy_min_bytes:%d\r\n"
                         "rust_io_writes_submitted:%llu\r\n"
-                        "rust_io_writes_outstanding:%lld\r\n",
-                        rust_io_config.zero_copy_min, rust_writes_submitted, rust_writes_outstanding);
+                        "rust_io_writes_outstanding:%lld\r\n"
+                        "rust_io_held_input_bytes:%zu\r\n",
+                        rust_io_config.zero_copy_min, rust_writes_submitted, rust_writes_outstanding,
+                        rustIoHeldMemory());
 }
 
 /* ---------------------------------------------------------------------------
@@ -476,8 +532,9 @@ static void rustIoAccept(VioConn *h) {
     }
 }
 
-/* Returns 1 when the client's commands went into the prefetch batch. */
-static int rustIoHandleReady(VioConn *h, uint64_t *id) {
+/* Returns 1 when the client's commands went into the prefetch batch.
+ * A high-priority connection (connSetPriority()) runs at once. */
+static int rustIoHandleReady(VioConn *h, uint64_t *id, int prio) {
     int batched = 0;
     uint32_t ev = vio_conn_take_events(rust_rt, h);
     if (ev & VIO_EV_NEW) rustIoAccept(h);
@@ -488,7 +545,7 @@ static int rustIoHandleReady(VioConn *h, uint64_t *id) {
         if (!callHandler(&rc->c, rc->c.write_handler)) return 0;
     }
 
-    if (ev & (VIO_EV_QBLIMIT | VIO_EV_CLOSED))
+    if (prio || (ev & (VIO_EV_QBLIMIT | VIO_EV_CLOSED)))
         rustIoDeliver(rc);
     else
         batched = rustIoDeliverBatched(rc, id);
@@ -521,6 +578,11 @@ static int rustIoHandleReady(VioConn *h, uint64_t *id) {
     return batched;
 }
 
+static void rustIoQoSCycle(monotime start) {
+    if (server.el->priority_events_stats_callback)
+        server.el->priority_events_stats_callback(server.el, getMonotonicUs() - start);
+}
+
 static int rustIoDrainReady(void) {
     VioConn *h;
     int n = 0;
@@ -530,9 +592,23 @@ static int rustIoDrainReady(void) {
     /* Nested in processEventsWhileBlocked(): run what is left of the outer
      * call's batch first, as processClientIOReadsDone() does. */
     if (ProcessingEventsWhileBlocked) processClientsCommandsBatch();
+    /* vio_main_next_ready(rust_rt) returns high-priority connections first. Like
+     * aeProcessQoSEvents(), time them as one priority cycle for the QoS
+     * stats (the QoS event loop never sees these connections). */
+    int in_prio = 0;
+    monotime prio_start = 0;
     while ((h = vio_main_next_ready(rust_rt)) != NULL) {
         uint64_t id;
-        if (rustIoHandleReady(h, &id)) ids[nids++] = id;
+        rustConnection *prc = vio_conn_udata(rust_rt, h);
+        int prio = prc && prc->c.is_priority;
+        if (prio && !in_prio) {
+            in_prio = 1;
+            prio_start = getMonotonicUs();
+        } else if (!prio && in_prio) {
+            in_prio = 0;
+            rustIoQoSCycle(prio_start);
+        }
+        if (rustIoHandleReady(h, &id, prio)) ids[nids++] = id;
         vio_conn_release(rust_rt, h);
         n++;
         if (nids == RUST_IO_DRAIN_BATCH) {
@@ -540,6 +616,7 @@ static int rustIoDrainReady(void) {
             nids = 0;
         }
     }
+    if (in_prio) rustIoQoSCycle(prio_start);
     if (nids) rustIoFlushBatch(ids, nids);
     return n;
 }
@@ -651,7 +728,29 @@ static void rustExtReadResumed(connection *conn) {
     if (c && rc->h && vio_conn_pending_cmds(rust_rt, rc->h)) rustIoStall(rc, c);
 }
 
+static int rustExtDetach(connection *conn) {
+    rustConnection *rc = (rustConnection *)conn;
+    if (!rc->h) return 0;
+    /* A kick may still sit in the main thread's batch; the detach writes
+     * Shared.out regardless, but keep the order simple. */
+    vio_main_flush_kicks(rust_rt);
+    return vio_conn_detach(rust_rt, rc->h);
+}
+
+static void rustExtSetPriority(connection *conn, int on) {
+    rustConnection *rc = (rustConnection *)conn;
+    if (rc->h) vio_conn_set_priority(rust_rt, rc->h, on);
+}
+
+static void rustExtAttach(connection *conn) {
+    rustConnection *rc = (rustConnection *)conn;
+    if (rc->h) vio_conn_attach(rust_rt, rc->h);
+}
+
 static const externalConnOps rust_ext_ops = {
+    .detach = rustExtDetach,
+    .attach = rustExtAttach,
+    .set_priority = rustExtSetPriority,
     .writev = rustExtWritev,
     .close = rustExtClose,
     .shutdown = rustExtShutdown,
@@ -754,6 +853,42 @@ void rustIoFlushReplicas(long long timeout_ms) {
         if (pending == 0) return;
         usleep(1000);
     }
+}
+
+/* ---------------------------------------------------------------------------
+ * Client memory held in Rust (DESIGN.md "Client memory")
+ * ------------------------------------------------------------------------- */
+
+/* getClientMemoryUsage(): Rust's private read buffer (sdsAllocSize(querybuf)
+ * for a C client), the argv of commands parsed but not yet pulled, and the
+ * output accepted but not yet written. */
+size_t rustIoClientMem(client *c) {
+    rustConnection *rc = (rustConnection *)c->conn;
+    if (!rc->h) return 0;
+    VioConnMem m;
+    vio_conn_mem(rust_rt, rc->h, &m);
+    return m.in_alloc + m.queued_argv + m.out_pending;
+}
+
+/* CLIENT LIST qbuf/qbuf-free: input bytes not yet executed (unparsed,
+ * parsed in Rust, and pulled into cmd_queue: a C client still has those
+ * in its querybuf), and the read buffer's free space. */
+void rustIoClientQbuf(client *c, size_t *qbuf, size_t *qbuf_free) {
+    rustConnection *rc = (rustConnection *)c->conn;
+    *qbuf = *qbuf_free = 0;
+    if (!rc->h) return;
+    VioConnMem m;
+    vio_conn_mem(rust_rt, rc->h, &m);
+    size_t queued = 0;
+    for (int i = c->cmd_queue.off; i < c->cmd_queue.len; i++) queued += c->cmd_queue.cmds[i].input_bytes;
+    *qbuf = m.in_unparsed + m.queued_input + queued;
+    *qbuf_free = m.in_alloc > m.in_unparsed ? m.in_alloc - m.in_unparsed : 0;
+}
+
+/* getMaxmemoryState(): read buffers are in the system allocator, so they
+ * are not in zmalloc_used_memory(). */
+size_t rustIoHeldMemory(void) {
+    return rust_started ? vio_held_input_total(rust_rt) : 0;
 }
 
 void rustIoLogReady(void) {

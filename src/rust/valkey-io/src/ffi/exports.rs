@@ -230,8 +230,11 @@ pub unsafe extern "C" fn vio_conn_pop_cmds(rt: &Runtime, h: ConnRef<'_>, out: *m
         let mut sh = conn.shared.lock().unwrap();
         let n = max.min(sh.cmds.len());
         for i in 0..n {
+            let c = sh.cmds.pop_front().unwrap();
+            sh.cmds_input -= c.input_bytes as usize;
+            sh.cmds_argv -= cmd_argv_bytes(&c);
             // SAFETY: i < n <= max, and the caller provides max slots.
-            unsafe { out.add(i).write(sh.cmds.pop_front().unwrap()) };
+            unsafe { out.add(i).write(c) };
         }
         conn.ncmds.store(sh.cmds.len(), Ordering::Release);
         (n, sh.cmds.len())
@@ -248,6 +251,72 @@ pub unsafe extern "C" fn vio_conn_pop_cmds(rt: &Runtime, h: ConnRef<'_>, out: *m
 #[no_mangle]
 pub unsafe extern "C" fn vio_conn_pending_cmds(_rt: &Runtime, h: ConnRef<'_>) -> usize {
     h.ncmds.load(Ordering::Acquire)
+}
+
+/// Memory this layer holds for one connection (client memory accounting).
+#[repr(C)]
+pub struct VioConnMem {
+    /// Input read and not parsed yet.
+    pub in_unparsed: usize,
+    /// Capacity of the connection's private read buffer (0 when it reads
+    /// into the thread's shared buffer).
+    pub in_alloc: usize,
+    /// Parsed commands not yet taken by the engine: their input bytes and
+    /// their argv bytes (argv_len_sum plus the pointer array).
+    pub queued_input: usize,
+    pub queued_argv: usize,
+    /// Output accepted and not yet written (copy path).
+    pub out_pending: usize,
+}
+
+/// # Safety
+/// `h` must be a live handle, `out` writable.
+#[no_mangle]
+pub unsafe extern "C" fn vio_conn_mem(_rt: &Runtime, h: ConnRef<'_>, out: *mut VioConnMem) {
+    let (queued_input, queued_argv) = {
+        let sh = h.shared.lock().unwrap();
+        (sh.cmds_input, sh.cmds_argv)
+    };
+    let m = VioConnMem {
+        in_unparsed: h.in_len.load(Ordering::Relaxed),
+        in_alloc: h.in_cap.load(Ordering::Relaxed),
+        queued_input,
+        queued_argv,
+        out_pending: h.out_bytes.load(Ordering::Acquire),
+    };
+    // SAFETY: the caller provides a writable VioConnMem.
+    unsafe { out.write(m) };
+}
+
+/// After a protocol error (VioCmd.err): copy up to `cap` bytes of the
+/// input sample (the whole input from the error on if shorter than 128
+/// bytes, else its first and last 64) to `buf`, and store the input's
+/// length in `total`. Returns the bytes copied.
+///
+/// # Safety
+/// `h` must be a live handle, `buf` writable for `cap` bytes, `total`
+/// writable.
+#[no_mangle]
+pub unsafe extern "C" fn vio_conn_err_sample(_rt: &Runtime, h: ConnRef<'_>, buf: *mut u8, cap: usize, total: *mut usize) -> usize {
+    let sh = h.shared.lock().unwrap();
+    let n = sh.err_sample.len().min(cap);
+    // SAFETY: the caller provides `cap` writable bytes at `buf` and a
+    // writable `total`.
+    unsafe {
+        std::ptr::copy_nonoverlapping(sh.err_sample.as_ptr(), buf, n);
+        total.write(sh.err_input_len);
+    }
+    n
+}
+
+/// Sum of in_alloc over every connection: read buffers live in the system
+/// allocator, so the engine adds this to used memory for maxmemory.
+///
+/// # Safety
+/// None beyond the FFI ABI.
+#[no_mangle]
+pub unsafe extern "C" fn vio_held_input_total(rt: &Runtime) -> usize {
+    rt.g.rbuf_total.load(Ordering::Relaxed)
 }
 
 /// Bytes accepted from the engine and not yet written to the socket.
@@ -411,6 +480,8 @@ pub unsafe extern "C" fn vio_conn_close(rt: &Runtime, h: ConnRef<'_>) {
     let dropped: Vec<VioCmd> = {
         let mut sh = conn.shared.lock().unwrap();
         conn.ncmds.store(0, Ordering::Release);
+        sh.cmds_input = 0;
+        sh.cmds_argv = 0;
         sh.cmds.drain(..).collect()
     };
     rt.g.adm.popped(dropped.len());
@@ -422,6 +493,44 @@ pub unsafe extern "C" fn vio_conn_close(rt: &Runtime, h: ConnRef<'_>) {
     conn.udata.store(std::ptr::null_mut(), Ordering::Relaxed);
     conn.want_writable.store(false, Ordering::Release);
     close_conn(rt, &conn);
+}
+
+/// connSetPriority(): a high-priority connection is returned by
+/// vio_main_next_ready() ahead of the others in its batch.
+///
+/// # Safety
+/// `h` must be a live handle. Engine thread only.
+#[no_mangle]
+pub unsafe extern "C" fn vio_conn_set_priority(_rt: &Runtime, h: ConnRef<'_>, on: c_int) {
+    set_priority(&h, on != 0);
+}
+
+/// Hand the socket to the engine for direct IO (a fork child or a
+/// synchronous session will use the fd): the IO thread writes everything
+/// accepted so far, then stops reading and writing the fd until
+/// vio_conn_attach(). It still reports VIO_EV_CLOSED when the peer goes
+/// away. Blocks until done; returns 0, or -1 if the pending output did not
+/// drain within 5 s (the engine then treats the connection as broken).
+///
+/// # Safety
+/// `h` must be a live handle. Engine thread only, never in a fork child.
+#[no_mangle]
+pub unsafe extern "C" fn vio_conn_detach(_rt: &Runtime, h: ConnRef<'_>) -> c_int {
+    if detach(&h.arc()) {
+        0
+    } else {
+        -1
+    }
+}
+
+/// End of the direct-IO window: the IO thread polls the fd again (the
+/// engine has made it non-blocking).
+///
+/// # Safety
+/// `h` must be a live handle. Engine thread only.
+#[no_mangle]
+pub unsafe extern "C" fn vio_conn_attach(_rt: &Runtime, h: ConnRef<'_>) {
+    attach(&h.arc());
 }
 
 /// # Safety

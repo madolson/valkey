@@ -176,6 +176,12 @@ sds getListensInfoString(sds info) {
 int connSetPriority(connection *conn, bool is_priority) {
     serverAssert(conn != NULL);
     if (conn->is_priority == is_priority) return C_OK;
+#ifdef USE_RUST_IO
+    if (connIsExternal(conn)) {
+        connExternalSetPriority(conn, is_priority);
+        return C_OK;
+    }
+#endif
 
     /* Fast path: if no socket exists yet, update priority field directly */
     if (conn->fd == -1) {
