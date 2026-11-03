@@ -388,7 +388,7 @@ behind a table both sides use, or call() moved wholesale.
 | Op | C | Purpose |
 |---|---|---|
 | `try_lock` | `rtcTryLock` -> `moduleTryAcquireGIL()` | Uncontended fast path (counted). |
-| `lock` | `rtcLock` -> `moduleTimedAcquireGIL(1 ms)` loop | Blocking acquire; returns 1 if the holder is yielding in a long command (see below). |
+| `lock` | `rtcLock` -> `moduleTimedAcquireGIL(1 ms)` loop | Blocking acquire; returns 1 if the holder is yielding in a long command (see below). Both lock paths then run `rtcTakeEngine()`: main-thread identity and `updateCachedTime(0)`. |
 | `unlock` | `rtcUnlock` -> `moduleReleaseGIL()` | Restores `server.main_thread_id` first. |
 | `exec_ready` | `rtcExecReady` -> `rustIoHandleReady()` | The stage 1 per-connection engine work (adopt, pull, `processInputBuffer()`, close). |
 | `after_batch` | `rtcAfterBatch` | `flushAppendOnlyFile(0)`, `handleClientsWithPendingWrites()`, wake main if it has `beforeSleep()` work. |
@@ -448,6 +448,7 @@ the connection's events and commands are read, the same rule as
 | Long commands yield via `processEventsWhileBlocked()` on the executing thread | `scriptInterrupt`, module yield | Yes: "MULTI and script timeout" hung. The script ran on IO thread 1, the test's SCRIPT KILL connection lived on the same IO thread, which cannot poll its sockets while running Lua; other IO threads sat in `pthread_mutex_lock` | Two fixes. (1) `rustIoRtcShouldDefer()`: a connection whose queue holds EVAL*/FCALL*/DEBUG/module commands, or EXEC of a MULTI containing one, is handed to the main thread (`vio_conn_defer_to_main`, the stage 1 ready list). (2) Waiters use a 1 ms timed lock and, if `isInsideYieldingLongCommand()`, route their batch through the ready list, which the holder's `processEventsWhileBlocked()` drains, so they get `-BUSY` and SCRIPT KILL works. |
 | `processEventsWhileBlocked()` on a non-main thread | `src/networking.c`, `ae.c` | Avoided by the deferral above. If a deferred-set gap lets one run on an IO thread, it polls `server.el` concurrently with the main thread's `aeApiPoll` and both write `el->fired`. | Not fixed; the deferral list is the mitigation. |
 | Loading: `-LOADING` replies come from `processEventsWhileBlocked()` | `loadDataFromDisk()` | Yes: "config during loading", "MEMORY commands during loading" fail: commands on Rust connections wait for the GIL until loading ends instead of getting `-LOADING` | Not fixed. Would need the same routing as the yield case, keyed on `server.loading`. |
+| Cached clock `server.unixtime`/`mstime` refreshed by the main loop | `updateCachedTime()` in `afterSleep()`/`serverCron()`; `call()` refreshes only inside an execution unit | Yes: "CLIENT KILL maxAGE will kill old clients" killed 2 instead of 1: a connection adopted on an IO thread after the main thread's DEBUG SLEEP got the pre-sleep `unixtime` as `ctime` | `rtcTakeEngine()` calls `updateCachedTime(0)` on every acquisition. |
 | Event-loop metrics count main-loop work | `eventloop_cycles`, `el_cmd_cnt_max` (`server.c` beforeSleep) | Yes: "stats: eventloop metrics", "stats: debug metrics" (unit/info) see 0 cycles with commands | Not fixed: commands no longer run inside the main event loop. |
 | `server.current_client`/`executing_client`, `in_call`, `execution_nesting`, propagation, `also_propagate` | `server.c` | No failures | Plain globals, safe under the lock; set and restored inside one batch. |
 | Blocking/unblocking | `handleClientsBlockedOnKeys()` (`processCommand` tail), `processUnblockedClients()` (beforeSleep) | No failures (unit/type/list 289/0 with blocked clients on other IO threads) | Unblock-on-key runs on the IO thread inside `processCommand()`; the unblocked client's reply is written in `after_batch`; its remaining pipeline runs from the main thread's `beforeSleep()` (main is woken when `unblocked_clients` is non-empty). |
@@ -528,3 +529,27 @@ the engine lock is the serialization point that sharding removes.
 - io/handoff: defer IO-thread kicks to one pass at the end of
   `beforeSleep()` (stage 1 note still stands; rtc's local-kick shortcut
   shows the gain of skipping the eventfd for the common case).
+
+## Measured (details and raw numbers in the stage 3 report)
+
+- The Rust call() costs ~60-70 ns per command on the main thread: at
+  `-P 16 -c 200` main-thread CPU per 1M SET is 0.62-0.68 s (io) vs
+  0.69-0.74 s (handoff), and handoff peaks at 1.37-1.39M SET/s vs 1.49-1.54M
+  for io. Likely the 29 indirect calls per command that LTO cannot inline
+  across the function-pointer table (inferred, no perf).
+- rtc takes the main thread off the request path entirely (0.0-0.8% CPU vs
+  8-97% for io). At `-P 1` with 4-6 IO threads and a client-bound load
+  (210k RPS) it serves the same RPS with 19-24% less process CPU (318-362%
+  vs 398-457%). Server-bound (8 benchmark threads) it is 5-7% below io
+  (279k vs 293k at t4, 400k vs 428k at t6) while the lock is still mostly
+  uncontended (61-78%). Where it saturates (`-P 16`, t4/t6) it converges on the
+  same single-engine ceiling as io (1.41-1.44M vs 1.49-1.54M SET/s): lock
+  busy 93-95%, uncontended acquisitions ~1%, mean wait 0.8-1.2 ms, with
+  1.6-3.5 threads waiting on average. The lock hold per SET (0.66 us) is
+  about what io's main thread spends per SET including the handoff
+  (0.62 us), so what rtc saves in handoff it pays back in lock transfer
+  and in engine state moving between cores (inferred).
+- rtc with one IO thread loses overlap: parse, execute and write run one
+  after another on the same thread, so `-P 16` drops to 499-571k vs
+  666-799k for io-t1 (process CPU 74-82%: the thread idles waiting for the
+  client).
