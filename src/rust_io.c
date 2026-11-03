@@ -23,14 +23,13 @@
 /* Not exported through server.h. */
 void trimCommandQueue(client *c);
 
-rustIoConfig rust_io_config = {RUST_IO_MODE_OFF, 0, 1, 0, RUST_IO_EXEC_HANDOFF, 1};
+rustIoConfig rust_io_config = {RUST_IO_MODE_OFF, 0, 1, 0};
 int rust_io_precheck_active = 0;
 
 configEnum rust_io_mode_enum[] = {
     {"off", RUST_IO_MODE_OFF},
     {"io", RUST_IO_MODE_IO},
     {"precheck", RUST_IO_MODE_PRECHECK},
-    {"exec", RUST_IO_MODE_EXEC},
     {NULL, 0},
 };
 
@@ -249,11 +248,6 @@ static void rustIoDeliver(rustConnection *rc) {
     if (rc->pending_err > 0 || vio_conn_pending_cmds(h)) rustIoStall(rc, c);
 
     if (c->flag.blocked) return; /* resumed by processUnblockedClients() */
-    /* exec-rtc: commands that may yield run on the main thread. */
-    if (rustIoRtcShouldDefer(c)) {
-        vio_conn_defer_to_main(h);
-        return;
-    }
     if (processInputBuffer(c) == C_ERR) return;
     if (rc->pending_err > 0 && cmdQueuePending(c) == 0 && canParseCommand(c)) {
         rustIoProtocolError(c, rc->pending_err, rc->pending_err_byte);
@@ -295,8 +289,7 @@ static void rustIoAccept(const VioConn *h) {
     }
 }
 
-/* Also the exec-rtc entry point, on a Rust IO thread (rust_io_exec.c). */
-void rustIoHandleReady(const VioConn *h) {
+static void rustIoHandleReady(const VioConn *h) {
     uint32_t ev = vio_conn_take_events(h);
     if (ev & VIO_EV_NEW) rustIoAccept(h);
 
@@ -355,20 +348,14 @@ static void rustIoEventHandler(aeEventLoop *el, int fd, void *privdata, int mask
     rustIoDrainReady();
 }
 
-/* Clients whose input waits in Rust (cmd_queue full, blocked, protected).
- * Called from beforeSleep() through connTypeProcessPendingData(). */
-/* Publish engine-wide state the IO threads read without the engine lock:
- * the default user's auth requirement and the precheck ACL snapshot. Runs on
- * whichever thread holds the engine: the main thread in beforeSleep(), and
- * in exec-rtc also the IO thread at the end of its batch (rtcAfterBatch()),
- * so a mutation made on an IO thread does not wait for the main loop. */
-void rustIoPublishGlobals(void) {
+/* Publish engine-wide state the IO threads read without the engine lock
+ * (the default user's auth requirement and the precheck ACL snapshot), take
+ * the rest of a ready batch, and serve clients whose input waits in Rust
+ * (cmd_queue full, blocked, protected). Called from beforeSleep() through
+ * connTypeProcessPendingData(). */
+static int connRustProcessPendingData(void) {
     vio_set_default_auth_required(!(DefaultUser->flags & USER_FLAG_NOPASS) || (DefaultUser->flags & USER_FLAG_DISABLED));
     rustPrecheckPublish();
-}
-
-static int connRustProcessPendingData(void) {
-    rustIoPublishGlobals();
     /* A long command started from rustIoEventHandler() leaves the rest of
      * its batch in Rust's main-thread list, behind an eventfd that was
      * already drained. processEventsWhileBlocked() reaches it only here
@@ -593,7 +580,6 @@ int rustIoInitListeners(void) {
     if (rust_io_config.mode == RUST_IO_MODE_OFF) return 0;
     int port = rust_io_config.takeover ? server.port : rust_io_config.port;
     if (port == 0) return 0;
-    if (rust_io_config.mode == RUST_IO_MODE_EXEC && rustIoExecInit() != 0) serverPanic("rust-io exec init failed");
 
     VioConfig cfg = {
         .bindaddr = server.bindaddr_count ? server.bindaddr[0] : NULL,
@@ -603,10 +589,7 @@ int rustIoInitListeners(void) {
         .client_max_querybuf_len = &server.client_max_querybuf_len,
         .cbs = {.create_argv = rustIoCreateArgv, .free_argv = rustIoFreeArgv},
     };
-    /* Modes are cumulative: exec runs the precheck fast path too, unless
-     * rust-io-exec-precheck no (debug switch to isolate the two). */
-    rust_io_precheck_active = rust_io_config.mode == RUST_IO_MODE_PRECHECK ||
-                              (rust_io_config.mode == RUST_IO_MODE_EXEC && rust_io_config.exec_precheck);
+    rust_io_precheck_active = rust_io_config.mode == RUST_IO_MODE_PRECHECK;
     if (rust_io_precheck_active) {
         extern int (*rustPrecheckCmdFn)(void *, const VioSession *, int, VioCmd *);
         rustPrecheckInit();
@@ -627,12 +610,8 @@ int rustIoInitListeners(void) {
     rust_stalled = listCreate();
     rust_started = port;
     rust_bind_at_start = rustIoJoinBind();
-    serverLog(LL_NOTICE, "Rust IO layer listening on %s:%d with %d thread(s)%s%s",
-              cfg.bindaddr ? cfg.bindaddr : "*", port, rust_io_config.threads,
-              rust_io_config.mode != RUST_IO_MODE_EXEC                ? ""
-              : rust_io_config.exec_model == RUST_IO_EXEC_RTC ? ", exec-rtc"
-                                                                      : ", exec-handoff",
-              rust_io_precheck_active ? ", precheck" : "");
+    serverLog(LL_NOTICE, "Rust IO layer listening on %s:%d with %d thread(s)%s", cfg.bindaddr ? cfg.bindaddr : "*",
+              port, rust_io_config.threads, rust_io_precheck_active ? ", precheck" : "");
     return 1;
 }
 
@@ -683,10 +662,5 @@ void rustIoFlushReplicas(long long timeout_ms) {
 void rustIoLogReady(void) {
     if (rust_started) serverLog(LL_NOTICE, "Ready to accept connections rust");
 }
-
-/* STAGE 3 HOOK: in exec mode Rust would invoke cmd->proc itself, through a
- * call()-equivalent entry point exported from here, holding the module GIL
- * (moduleAcquireGIL()/moduleReleaseGIL(), src/module.c) the way the main
- * thread releases it around aeApiPoll in beforeSleep()/afterSleep(). */
 
 #endif /* USE_RUST_IO */

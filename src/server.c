@@ -124,14 +124,6 @@ void addReplyCommandInfo(client *c, struct serverCommand *cmd);
 /*============================ Utility functions ============================ */
 
 /* This macro tells if we are in the context of loading an AOF. */
-/* Whether other threads may run engine code while the main thread sleeps:
- * module threads, or Rust IO threads in rust-io exec-rtc mode. */
-#ifdef USE_RUST_IO
-#define engineLockShared() (moduleCount() || rust_io_rtc_active)
-#else
-#define engineLockShared() moduleCount()
-#endif
-
 #define isAOFLoadingContext() ((server.current_client && server.current_client->id == CLIENT_ID_AOF) ? 1 : 0)
 
 /* We use a private localtime implementation which is fork-safe. The logging
@@ -2160,7 +2152,7 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
     /* Before we are going to sleep, let the threads access the dataset by
      * releasing the GIL. The server main thread will not touch anything at this
      * time. */
-    if (engineLockShared()) {
+    if (moduleCount()) {
         atomic_store_explicit(&server.module_gil_acquired, 0, memory_order_relaxed);
         moduleReleaseGIL();
     }
@@ -2179,7 +2171,7 @@ void afterSleep(struct aeEventLoop *eventLoop, int numevents) {
      ***************************** ********************/
     if (!ProcessingEventsWhileBlocked) {
         /* Acquire the modules GIL so that their threads won't touch anything. */
-        if (engineLockShared()) {
+        if (moduleCount()) {
             mstime_t latency;
             latencyStartMonitor(latency);
             atomic_store_explicit(&server.module_gil_acquiring, 1, memory_order_relaxed);
@@ -5087,12 +5079,7 @@ prechecked_resume:;
         addReply(c, shared.queued);
     } else {
         int flags = CMD_CALL_FULL;
-#ifdef USE_RUST_IO
-        if (rust_io_exec_active && connIsRust(c->conn))
-            rustIoExecCall(c, flags);
-        else
-#endif
-            call(c, flags);
+        call(c, flags);
         if (listLength(server.ready_keys) && !isInsideYieldingLongCommand()) handleClientsBlockedOnKeys();
     }
     return C_OK;
@@ -6997,13 +6984,6 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "eventloop_priority_duration_cmd_sum:%llu\r\n", server.duration_stats[EL_DURATION_TYPE_PRIORITY_CMD].sum));
         info = genValkeyInfoStringACLStats(info);
     }
-
-#ifdef USE_RUST_IO
-    if (dictFind(section_dict, "rustio") != NULL) {
-        if (sections++) info = sdscat(info, "\r\n");
-        info = rustIoGenInfo(info);
-    }
-#endif
 
     /* Replication */
     if (all_sections || (dictFind(section_dict, "replication") != NULL)) {

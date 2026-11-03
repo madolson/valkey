@@ -6,7 +6,6 @@
 //! model and the full FFI surface; the C declarations live in
 //! include/valkey_io.h.
 
-pub mod exec;
 pub mod precheck;
 pub mod resp;
 #[cfg(feature = "timing")]
@@ -165,8 +164,7 @@ struct Global {
     /// vio_main_before_poll, cleared by vio_main_after_poll. While it is
     /// clear, producers skip the eventfd write.
     main_sleeping: AtomicBool,
-    /// `ready` has entries, or the main loop has beforeSleep() work
-    /// (vio_wake_main), that the main thread has not taken yet.
+    /// `ready` has entries that the main thread has not taken yet.
     main_pending: AtomicBool,
     ready: Mutex<Vec<Arc<Conn>>>,
     listen_fd: RawFd,
@@ -224,12 +222,6 @@ fn set_errno(e: i32) {
 /// until the IO thread picks it up, one eventfd write per wakeup.
 fn kick(conn: &Arc<Conn>) {
     if conn.kicked.swap(true, Ordering::AcqRel) {
-        return;
-    }
-    /* exec-rtc: the owning IO thread is executing this connection's
-     * commands right now; handle the kick after the batch, no eventfd. */
-    if IO_THREAD.with(|t| t.get()) == conn.thread {
-        LOCAL_KICKS.with(|k| k.borrow_mut().push(conn.clone()));
         return;
     }
     /* Main thread: collect, and hand each IO thread its kicks in one inbox
@@ -309,10 +301,6 @@ fn flush_kicks(idx: usize, list: &mut Vec<Arc<Conn>>) {
  * ------------------------------------------------------------------------- */
 
 thread_local! {
-    /// Index of the IO thread running on this OS thread, usize::MAX elsewhere.
-    static IO_THREAD: Cell<usize> = const { Cell::new(usize::MAX) };
-    /// exec-rtc: kicks for this thread's own connections raised during a batch.
-    static LOCAL_KICKS: RefCell<Vec<Arc<Conn>>> = const { RefCell::new(Vec::new()) };
     /// True on the thread that called vio_start() (the engine main thread).
     static IS_MAIN: Cell<bool> = const { Cell::new(false) };
     /// Main thread: kicks per IO thread, flushed by vio_main_flush_kicks().
@@ -794,45 +782,6 @@ impl Worker {
         }
     }
 
-    /// exec-rtc: execute everything this poll iteration produced, under one
-    /// engine lock acquisition, then flush the replies it generated. Returns
-    /// true when work is left (poll without blocking next time).
-    fn rtc_cycle(&mut self, rtc: &exec::VioRtcOps) -> bool {
-        for _ in 0..16 {
-            if self.to_notify.is_empty() {
-                return false;
-            }
-            let batch = std::mem::take(&mut self.to_notify);
-            let t0 = exec::now_ns();
-            let uncontended = (rtc.try_lock)() == 0;
-            if !uncontended && (rtc.lock)() != 0 {
-                /* The holder is yielding inside a long script/module
-                 * command: give the batch to whoever polls the main
-                 * eventfd (processEventsWhileBlocked() on the holder). */
-                self.to_notify = batch;
-                self.flush_notify();
-                return false;
-            }
-            let t1 = exec::now_ns();
-            let n = batch.len();
-            for conn in batch {
-                /* Same order as vio_main_next_ready(): clear in_ready before
-                 * reading the events and commands it guards. */
-                conn.in_ready.store(false, Ordering::Release);
-                (rtc.exec_ready)(Arc::as_ptr(&conn));
-            }
-            (rtc.after_batch)();
-            let t2 = exec::now_ns();
-            (rtc.unlock)();
-            exec::rtc_record(self.idx, t1 - t0, t2 - t1, uncontended, n);
-            let kicks = LOCAL_KICKS.with(|k| std::mem::take(&mut *k.borrow_mut()));
-            for c in kicks {
-                self.on_kick(c);
-            }
-        }
-        !self.to_notify.is_empty()
-    }
-
     fn take_inbox(&mut self) {
         let me = self.me();
         if me.pending.swap(false, Ordering::SeqCst) {
@@ -848,10 +797,6 @@ impl Worker {
 
     fn run(mut self) {
         let me = self.me();
-        let rtc = exec::rtc_ops();
-        if rtc.is_some() {
-            IO_THREAD.with(|t| t.set(self.idx));
-        }
         let mut timeout: c_int = -1;
         let mut events: Vec<libc::epoll_event> = vec![libc::epoll_event { events: 0, u64: 0 }; 256];
         loop {
@@ -888,10 +833,7 @@ impl Worker {
                 self.take_inbox();
             }
             timeout = -1;
-            match rtc {
-                Some(r) => timeout = if self.rtc_cycle(r) { 0 } else { -1 },
-                None => self.flush_notify(),
-            }
+            self.flush_notify();
         }
     }
 }
@@ -1223,24 +1165,6 @@ pub extern "C" fn vio_conn_close(h: *const Conn) {
     conn.want_writable.store(false, Ordering::Release);
     conn.c_closed.store(true, Ordering::Release);
     kick(&conn);
-}
-
-/// exec-rtc: queue the connection on the main thread's ready list, as the
-/// io mode does, so the main thread pulls and executes its commands.
-#[no_mangle]
-pub extern "C" fn vio_conn_defer_to_main(h: *const Conn) {
-    let conn = conn_arc(h);
-    if !conn.in_ready.swap(true, Ordering::AcqRel) {
-        let g = global();
-        g.ready.lock().unwrap().push((*conn).clone());
-        wake_main(g);
-    }
-}
-
-/// Wake the main thread's event loop (exec-rtc: it has beforeSleep() work).
-#[no_mangle]
-pub extern "C" fn vio_wake_main() {
-    wake_main(global());
 }
 
 #[no_mangle]

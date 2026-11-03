@@ -9583,18 +9583,6 @@ int moduleTryAcquireGIL(void) {
     return pthread_mutex_trylock(&moduleGIL);
 }
 
-#ifdef USE_RUST_IO
-/* rust-io exec-rtc: wait at most usec for the GIL. 0 when acquired. */
-int moduleTimedAcquireGIL(long usec) {
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    ts.tv_nsec += usec * 1000;
-    ts.tv_sec += ts.tv_nsec / 1000000000;
-    ts.tv_nsec %= 1000000000;
-    return pthread_mutex_timedlock(&moduleGIL, &ts);
-}
-#endif
-
 void moduleReleaseGIL(void) {
     pthread_mutex_unlock(&moduleGIL);
 }
