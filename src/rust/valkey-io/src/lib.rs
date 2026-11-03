@@ -9,6 +9,10 @@
 pub mod exec;
 pub mod precheck;
 pub mod resp;
+#[cfg(feature = "timing")]
+pub mod timing;
+#[cfg(feature = "bench")]
+pub mod benchapi;
 
 use resp::{Arg, Limits, Outcome, Parser};
 use std::cell::{Cell, RefCell};
@@ -63,6 +67,9 @@ pub struct VioCmd {
     pub slot: c_int,
     pub read_flags: c_int,
     pub token: u64,
+    /// Sampled stage-timing id, 0 when not sampled.
+    #[cfg(feature = "timing")]
+    pub trace: u32,
 }
 unsafe impl Send for VioCmd {}
 
@@ -108,6 +115,9 @@ pub struct Conn {
     shared: Mutex<Shared>,
     /// Engine session mirror (precheck mode).
     session: precheck::SessionCell,
+    /// Stage-timing id riding on the bytes in `shared.out`.
+    #[cfg(feature = "timing")]
+    trace: AtomicU32,
 }
 
 impl Drop for Conn {
@@ -377,6 +387,8 @@ impl Worker {
             out_bytes: AtomicUsize::new(0),
             shared: Mutex::new(Shared { cmds: VecDeque::new(), out: Vec::new() }),
             session: precheck::SessionCell::new(),
+            #[cfg(feature = "timing")]
+            trace: AtomicU32::new(0),
         });
         let idx = match self.free.pop() {
             Some(i) => i,
@@ -487,6 +499,8 @@ impl Worker {
             return;
         }
         unsafe { l.rbuf.set_len(l.rbuf.len() + n as usize) };
+        #[cfg(feature = "timing")]
+        timing::on_read();
 
         /* client-query-buffer-limit, checked like readToQueryBuf(): on the
          * unparsed bytes, before parsing what this read added. */
@@ -533,6 +547,8 @@ impl Worker {
             let frame = &l.rbuf[l.rpos..];
             match l.parser.parse(frame, &lim) {
                 Outcome::Command { args, consumed, input_bytes } => {
+                    #[cfg(feature = "timing")]
+                    let tr = timing::sample_parsed();
                     ptrs.clear();
                     lens.clear();
                     let mut sum = 0usize;
@@ -557,9 +573,18 @@ impl Worker {
                         slot: -1,
                         read_flags: 0,
                         token: 0,
+                        #[cfg(feature = "timing")]
+                        trace: 0,
                     };
+                    #[cfg(feature = "timing")]
+                    {
+                        timing::stamp(tr, timing::ST_ARGV);
+                        cmd.trace = tr;
+                    }
                     if let Some(pc) = pc.as_ref() {
                         pc.check(&mut l.precheck, &mut cmd);
+                        #[cfg(feature = "timing")]
+                        timing::stamp(tr, timing::ST_PRECHECK);
                     }
                     batch.push(cmd);
                     l.rpos += consumed;
@@ -582,6 +607,8 @@ impl Worker {
                         slot: -1,
                         read_flags: 0,
                         token: 0,
+                        #[cfg(feature = "timing")]
+                        trace: 0,
                     });
                     l.proto_err = true;
                     break;
@@ -603,6 +630,10 @@ impl Worker {
         if !batch.is_empty() {
             let queued = {
                 let mut sh = conn.shared.lock().unwrap();
+                #[cfg(feature = "timing")]
+                for c in batch.iter().filter(|c| c.trace != 0) {
+                    timing::stamp(c.trace, timing::ST_ENQUEUED);
+                }
                 sh.cmds.extend(batch);
                 sh.cmds.len()
             };
@@ -626,12 +657,22 @@ impl Worker {
             return;
         }
         let mut failed = false;
+        #[cfg(feature = "timing")]
+        let mut tr = 0u32;
         loop {
             if l.woff == l.wbuf.len() {
                 l.wbuf.clear();
                 l.woff = 0;
                 let mut sh = conn.shared.lock().unwrap();
                 std::mem::swap(&mut l.wbuf, &mut sh.out);
+                #[cfg(feature = "timing")]
+                {
+                    let t = conn.trace.swap(0, Ordering::Relaxed);
+                    if t != 0 {
+                        timing::complete(tr);
+                        tr = t;
+                    }
+                }
                 drop(sh);
                 if l.wbuf.is_empty() {
                     break;
@@ -652,6 +693,8 @@ impl Worker {
                 break;
             }
         }
+        #[cfg(feature = "timing")]
+        timing::complete(tr);
         if l.wbuf.capacity() > 4 * OUT_HIGH && l.woff == l.wbuf.len() {
             l.wbuf = Vec::new();
             l.woff = 0;
@@ -1100,6 +1143,16 @@ pub extern "C" fn vio_conn_writev(h: *const Conn, iov: *const libc::iovec, iovcn
     let mut written = 0usize;
     {
         let mut sh = conn.shared.lock().unwrap();
+        #[cfg(feature = "timing")]
+        {
+            let t = timing::take_next_write();
+            if t != 0 {
+                /* One trace per flush: keep the older one. */
+                if conn.trace.compare_exchange(0, t, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+                    timing::drop_trace(t);
+                }
+            }
+        }
         for i in 0..iovcnt as usize {
             if room == 0 {
                 break;

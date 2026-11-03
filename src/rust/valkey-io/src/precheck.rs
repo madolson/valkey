@@ -150,6 +150,8 @@ mod tests {
             slot: -1,
             read_flags: 0,
             token: 0,
+            #[cfg(feature = "timing")]
+            trace: 0,
         }
     }
 

@@ -32,6 +32,7 @@
  * SPDX-License-Identifier: BSD-3-Clause
  */
 #include "server.h"
+#include "rust_io_timing.h"
 #include "hotkeys.h"
 #include "ordered_index.h"
 #include "connection.h"
@@ -2950,6 +2951,10 @@ int listenToPort(connListener *sfd) {
 void resetServerStats(void) {
     int j;
 
+#if defined(USE_RUST_IO) && defined(RUST_IO_TIMING)
+    ritReset();
+#endif
+
     server.stat_numcommands = 0;
     server.stat_numconnections = 0;
     server.stat_expiredkeys = 0;
@@ -4193,6 +4198,7 @@ int incrCommandStatsOnError(struct serverCommand *cmd, int flags) {
  */
 void call(client *c, int flags) {
     if (bgIteration_blockClientIfRequired(c)) return;
+    RUST_IO_TIMING_HOOK(c, RIT_CALL);
 
     server.in_call++;
 
@@ -4469,6 +4475,7 @@ void call(client *c, int flags) {
 
     server.executing_client = prev_client;
     server.in_call--;
+    RUST_IO_TIMING_HOOK(c, RIT_CALL_EXIT);
 }
 
 /* Used when a command that is ready for execution needs to be rejected, due to
@@ -4670,6 +4677,7 @@ void unprepareCommand(client *c) {
  * other operations can be performed by the caller. Otherwise
  * if C_ERR is returned the client was destroyed (i.e. after QUIT). */
 int processCommand(client *c) {
+    RUST_IO_TIMING_HOOK(c, RIT_PROCESS);
     serverAssert(!c->flag.blocked && !c->flag.unblocked);
 
     if (!scriptIsTimedOut()) {
@@ -7272,6 +7280,12 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
         if (sections++) info = sdscat(info, "\r\n");
         info = rustPrecheckCatInfo(info);
     }
+#ifdef RUST_IO_TIMING
+    if (dictFind(section_dict, "rust_io_timing") != NULL) {
+        if (sections++) info = sdscat(info, "\r\n");
+        info = ritCatInfo(info);
+    }
+#endif
 #endif
 
     /* Get info from modules.

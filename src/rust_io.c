@@ -14,6 +14,7 @@
 #include "server.h"
 #include "connhelpers.h"
 #include "rust_io.h"
+#include "rust_io_timing.h"
 
 #ifdef USE_RUST_IO
 
@@ -145,6 +146,9 @@ static int rustIoPull(rustConnection *rc, client *c) {
             p->slot = -1;
             p->cmd = NULL;
             p->rust_precheck = cmds[i].token;
+#ifdef RUST_IO_TIMING
+            if (cmds[i].trace) ritDequeued(cmds[i].trace, cmds[i].argv);
+#endif
             if (cmds[i].token && !(cmds[i].read_flags & READ_FLAGS_RUST_PREPARE_ON_MAIN)) {
                 /* Precheck mode: lookup, arity and slot ran on the IO thread. */
                 p->cmd = cmds[i].cmd;
@@ -465,6 +469,7 @@ static int connRustWritev(connection *conn, const struct iovec *iov, int iovcnt)
         errno = EBADF;
         n = -1;
     } else {
+        RUST_IO_TIMING_WRITEV(conn);
         n = vio_conn_writev(rc->h, iov, iovcnt);
     }
     if (n < 0 && errno != EAGAIN) {
