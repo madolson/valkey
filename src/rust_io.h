@@ -41,6 +41,7 @@ void rustIoAfterPoll(void);
 struct client;
 /* Client memory held in the IO layer (DESIGN.md "Client memory"). */
 size_t rustIoClientMem(struct client *c);
+size_t rustIoPendingOut(struct client *c);
 void rustIoClientQbuf(struct client *c, size_t *qbuf, size_t *qbuf_free);
 size_t rustIoHeldMemory(void);
 /* trySendWriteToIOThreads() for external connections. */

@@ -6700,6 +6700,12 @@ size_t getClientOutputBufferMemoryUsage(client *c) {
             repl_buf_size = last->repl_offset + last->size - cur->repl_offset;
             repl_node_num = last->id - cur->id + 1;
         }
+#ifdef USE_RUST_IO
+        /* Stream the Rust IO layer accepted (up to 1 MiB) and has not
+         * written: the replica has not received it, so it counts like the
+         * repl buffer behind the cursor. The limit checks on append see it. */
+        if (c->conn && connIsExternal(c->conn)) repl_buf_size += rustIoPendingOut(c);
+#endif
         /* A compressed batch keeps this cursor pinned until the staged output
          * drains, so repl_buf_size already represents all unsent data. */
         return repl_buf_size + (repl_node_size * repl_node_num);

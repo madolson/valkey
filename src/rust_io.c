@@ -865,7 +865,15 @@ size_t rustIoClientMem(client *c) {
     if (!rc->h) return 0;
     VioConnMem m;
     vio_conn_mem(rust_rt, rc->h, &m);
-    return m.in_alloc + m.queued_argv + m.out_pending;
+    /* A replica's pending output is in its COB (rustIoPendingOut()). */
+    size_t out = getClientType(c) == CLIENT_TYPE_REPLICA ? 0 : m.out_pending;
+    return m.in_alloc + m.queued_argv + out;
+}
+
+/* Output this layer accepted for the client and has not written yet. */
+size_t rustIoPendingOut(client *c) {
+    rustConnection *rc = (rustConnection *)c->conn;
+    return rc->h ? vio_conn_pending_out(rust_rt, rc->h) : 0;
 }
 
 /* CLIENT LIST qbuf/qbuf-free: input bytes not yet executed (unparsed,
