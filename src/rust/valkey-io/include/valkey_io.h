@@ -97,6 +97,8 @@ int vio_start(const VioConfig *cfg);
  * handle from vio_main_next_ready() carries one reference to release. */
 void vio_main_begin_drain(void);
 /* Connections left in the current batch (processEventsWhileBlocked()). */
+/* Hand the kicks collected during this iteration to the IO threads. */
+void vio_main_flush_kicks(void);
 int vio_main_has_ready(void);
 const VioConn *vio_main_next_ready(void);
 

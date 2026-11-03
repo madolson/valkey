@@ -1981,6 +1981,9 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
             processed += last_processed;
         } while (last_processed != 0);
         processed += freeClientsInAsyncFreeQueue();
+#ifdef USE_RUST_IO
+        rustIoBeforePoll();
+#endif
         server.events_processed_while_blocked += processed;
         return;
     }
@@ -2146,6 +2149,9 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
 
     /* Don't sleep at all before the next beforeSleep() if needed (e.g. a
      * connection has pending data) */
+#ifdef USE_RUST_IO
+    rustIoBeforePoll();
+#endif
     aeSetDontWait(server.el, dont_sleep);
 
     IOThreadsBeforeSleep(current_time);

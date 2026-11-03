@@ -195,11 +195,49 @@ fn kick(conn: &Arc<Conn>) {
         LOCAL_KICKS.with(|k| k.borrow_mut().push(conn.clone()));
         return;
     }
+    /* Main thread: collect, and hand each IO thread its kicks in one inbox
+     * append and at most one eventfd write at the end of beforeSleep()
+     * (vio_main_flush_kicks). */
+    if IS_MAIN.with(|m| m.get()) {
+        MAIN_KICKS.with(|k| {
+            let mut k = k.borrow_mut();
+            if k.len() <= conn.thread {
+                k.resize_with(conn.thread + 1, Vec::new);
+            }
+            k[conn.thread].push(conn.clone());
+        });
+        return;
+    }
     let t = &global().threads[conn.thread];
     t.inbox.lock().unwrap().push(Msg::Kick(conn.clone()));
+    wake_thread(t);
+}
+
+fn wake_thread(t: &IoThread) {
     if !t.signaled.swap(true, Ordering::AcqRel) {
         eventfd_signal(t.wakefd);
     }
+}
+
+/// Hand the kicks collected on the main thread to their IO threads. Called
+/// once per event-loop iteration, before the main thread polls, and inside
+/// processEventsWhileBlocked().
+#[no_mangle]
+pub extern "C" fn vio_main_flush_kicks() {
+    let g = match GLOBAL.get() {
+        Some(g) => g,
+        None => return,
+    };
+    MAIN_KICKS.with(|k| {
+        for (idx, list) in k.borrow_mut().iter_mut().enumerate() {
+            if list.is_empty() {
+                continue;
+            }
+            let t = &g.threads[idx];
+            t.inbox.lock().unwrap().extend(list.drain(..).map(Msg::Kick));
+            wake_thread(t);
+        }
+    });
 }
 
 /* ---------------------------------------------------------------------------
@@ -211,6 +249,10 @@ thread_local! {
     static IO_THREAD: Cell<usize> = const { Cell::new(usize::MAX) };
     /// exec-rtc: kicks for this thread's own connections raised during a batch.
     static LOCAL_KICKS: RefCell<Vec<Arc<Conn>>> = const { RefCell::new(Vec::new()) };
+    /// True on the thread that called vio_start() (the engine main thread).
+    static IS_MAIN: Cell<bool> = const { Cell::new(false) };
+    /// Main thread: kicks per IO thread, flushed by vio_main_flush_kicks().
+    static MAIN_KICKS: RefCell<Vec<Vec<Arc<Conn>>>> = const { RefCell::new(Vec::new()) };
 }
 
 const TOK_WAKE: u64 = 0;
@@ -652,9 +694,7 @@ impl Worker {
             } else {
                 let t = &g.threads[target];
                 t.inbox.lock().unwrap().push(Msg::NewFd(fd));
-                if !t.signaled.swap(true, Ordering::AcqRel) {
-                    eventfd_signal(t.wakefd);
-                }
+                wake_thread(t);
             }
         }
     }
@@ -801,6 +841,7 @@ pub extern "C" fn vio_start(cfg: *const VioConfig) -> c_int {
         set_errno(libc::EALREADY);
         return -1;
     }
+    IS_MAIN.with(|m| m.set(true));
     for idx in 0..nthreads {
         let w = Worker { idx, slab: Vec::new(), free: Vec::new(), to_notify: Vec::new(), rr: 0 };
         std::thread::Builder::new()

@@ -611,6 +611,11 @@ int rustIoInitListeners(void) {
     return 1;
 }
 
+/* End of beforeSleep(), also inside processEventsWhileBlocked(). */
+void rustIoBeforePoll(void) {
+    if (rust_started) vio_main_flush_kicks();
+}
+
 void rustIoLogReady(void) {
     if (rust_started) serverLog(LL_NOTICE, "Ready to accept connections rust");
 }
