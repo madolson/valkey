@@ -206,12 +206,12 @@ pub fn complete(id: u32) {
     let t: [u64; NSTAMPS] = std::array::from_fn(|k| slot.t[k].load(Ordering::Acquire));
     let mut prev = t[ST_READ];
     if prev != 0 {
-        for k in 1..NSTAMPS {
-            if t[k] == 0 {
+        for (k, &tk) in t.iter().enumerate().skip(1) {
+            if tk == 0 {
                 continue;
             }
-            record(&s.hist[k], t[k].saturating_sub(prev));
-            prev = t[k];
+            record(&s.hist[k], tk.saturating_sub(prev));
+            prev = tk;
         }
         record(&s.hist[NSTAMPS], t[ST_WRITTEN].saturating_sub(t[ST_READ]));
     }

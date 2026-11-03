@@ -20,7 +20,7 @@ pub mod benchapi;
 use resp::{Arg, Limits, Outcome, Parser};
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
-use std::ffi::{c_char, c_int, c_void, CStr};
+use std::ffi::{c_char, c_int, c_void};
 use ffi::LimitPtrs;
 use std::os::unix::io::{IntoRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
@@ -704,14 +704,12 @@ impl Worker {
                 }
             }
         }
-        if mask & ((libc::EPOLLIN | libc::EPOLLHUP | libc::EPOLLERR) as u32) != 0 {
-            if self.slab[idx].is_some() {
-                let l = self.slab[idx].as_ref().unwrap();
-                if l.interest & (libc::EPOLLIN as u32) != 0 {
-                    self.on_readable(idx);
-                } else if mask & ((libc::EPOLLHUP | libc::EPOLLERR) as u32) != 0 {
-                    self.peer_gone(idx);
-                }
+        if mask & ((libc::EPOLLIN | libc::EPOLLHUP | libc::EPOLLERR) as u32) != 0 && self.slab[idx].is_some() {
+            let l = self.slab[idx].as_ref().unwrap();
+            if l.interest & (libc::EPOLLIN as u32) != 0 {
+                self.on_readable(idx);
+            } else if mask & ((libc::EPOLLHUP | libc::EPOLLERR) as u32) != 0 {
+                self.peer_gone(idx);
             }
         }
     }
@@ -761,9 +759,9 @@ impl Worker {
             }
             let n = sys::epoll_wait(me.epfd, &mut events, timeout);
             me.sleeping.store(false, Ordering::SeqCst);
-            for i in 0..n {
-                let tok = events[i].u64;
-                let mask = events[i].events;
+            for ev in events.iter().take(n) {
+                let tok = ev.u64;
+                let mask = ev.events;
                 if tok == TOK_WAKE {
                     /* Drain before clearing: a producer that sees the flag
                      * set skips the eventfd write, so the flag must not be
@@ -805,7 +803,7 @@ fn start(bind: Option<String>, port: c_int, threads: c_int, cbs: VioCallbacks, l
             if s == "*" { "0.0.0.0".to_string() } else if s == "::*" { "::".to_string() } else { s }
         }
     };
-    let listener = match std::net::TcpListener::bind((addr.as_str(), cfg.port as u16)) {
+    let listener = match std::net::TcpListener::bind((addr.as_str(), port as u16)) {
         Ok(l) => l,
         Err(e) => return Err(e.raw_os_error().unwrap_or(libc::EINVAL)),
     };
@@ -869,7 +867,7 @@ fn start(bind: Option<String>, port: c_int, threads: c_int, cbs: VioCallbacks, l
  * ------------------------------------------------------------------------- */
 
 thread_local! {
-    static MAIN_READY: RefCell<VecDeque<Arc<Conn>>> = RefCell::new(VecDeque::new());
+    static MAIN_READY: RefCell<VecDeque<Arc<Conn>>> = const { RefCell::new(VecDeque::new()) };
 }
 
 

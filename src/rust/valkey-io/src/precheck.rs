@@ -43,6 +43,12 @@ pub type CheckFn =
 /// Per-connection state, shared with the main thread.
 pub struct SessionCell(Mutex<VioSession>);
 
+impl Default for SessionCell {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SessionCell {
     pub fn new() -> Self {
         SessionCell(Mutex::new(VioSession::empty()))

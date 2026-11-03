@@ -4,6 +4,7 @@
 #![allow(unsafe_code)]
 
 mod exports;
+#[allow(unused_imports)]
 pub use exports::*;
 
 use crate::{precheck::VioSession, Conn, Global, VioCmd};

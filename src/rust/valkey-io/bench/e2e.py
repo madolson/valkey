@@ -160,7 +160,7 @@ def run_once(a, srv, test, pipe, est_rps, use_perf=True):
     pid = srv.p.pid
     n = int(est_rps * (a.lead + a.secs) * 1.15) // 1000 * 1000
     cmd = ["taskset", "-c", CLIENT_CPUS, a.bench, "-p", str(a.port), "-t", test, "-P", str(pipe), "-c",
-           str(a.clients), "-n", str(n), "-d", str(a.datasize), "-r", "1000000", "--threads", CLIENT_THREADS, "--csv"]
+           str(a.clients), "-n", str(n), "-d", str(a.datasize), "-r", str(a.keyspace), "--threads", CLIENT_THREADS, "--csv"]
     with open("/proc/loadavg") as f:
         load1 = float(f.read().split()[0])
     bp = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
@@ -216,7 +216,7 @@ def calibrate(a, srv, test, pipe):
     """Warm-up (also fills keys for GET): run open-ended load and return the
     server-side rate over 1 s after 1 s of load."""
     cmd = ["taskset", "-c", CLIENT_CPUS, a.bench, "-p", str(a.port), "-t", test, "-P", str(pipe), "-c",
-           str(a.clients), "-n", "1000000000", "-d", str(a.datasize), "-r", "1000000", "--threads", CLIENT_THREADS,
+           str(a.clients), "-n", "1000000000", "-d", str(a.datasize), "-r", str(a.keyspace), "--threads", CLIENT_THREADS,
            "-q"]
     bp = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     time.sleep(1.0)
@@ -250,6 +250,7 @@ def main():
     ap.add_argument("--pipes", default="1,16")
     ap.add_argument("--clients", type=int, default=200)
     ap.add_argument("--datasize", type=int, default=64)
+    ap.add_argument("--keyspace", type=int, default=1000000, help="valkey-benchmark -r (use a small one for large values)")
     ap.add_argument("--reps", type=int, default=3)
     ap.add_argument("--secs", type=float, default=5.0, help="measurement window per run")
     ap.add_argument("--lead", type=float, default=1.0, help="seconds of load before the window opens")
@@ -288,7 +289,8 @@ def main():
                 # GET cells normally follow SET cells, which create the keys.
                 # Without one, fill the keyspace first so GETs hit.
                 subprocess.run(["taskset", "-c", CLIENT_CPUS, a.bench, "-p", str(a.port), "-t", "set", "-P", "16",
-                                "-c", str(a.clients), "-n", "1000000", "-d", str(a.datasize), "-r", "1000000",
+                                "-c", str(a.clients), "-n", str(min(1000000, 3 * a.keyspace)), "-d", str(a.datasize),
+                                "-r", str(a.keyspace),
                                 "--threads", CLIENT_THREADS, "-q"], capture_output=True)
             for pipe in pipes:
                 for test in tests:

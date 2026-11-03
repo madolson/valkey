@@ -10,14 +10,16 @@ BENCH=${BENCH:-$(dirname "$BIN")/valkey-benchmark}
 CLI=${CLI:-$(dirname "$BIN")/valkey-cli}
 FG=${FG:-$HOME/git/FlameGraph}
 PORT=${PORT:-7931}; SECS=${SECS:-6}; FREQ=${FREQ:-999}
-mkdir -p "$OUT"; NAME=$CFG-$THR-$TEST-P$PIPE
+# DATASIZE/KEYS/CLIENTS: value size, keyspace and clients; EXTRA: more server args; TAG: name suffix.
+D=${DATASIZE:-3}; K=${KEYS:-1000000}; C=${CLIENTS:-200}
+mkdir -p "$OUT"; NAME=$CFG-$THR-$TEST-P$PIPE${TAG:+-$TAG}
 case $CFG in
   c-io*) ARGS="--io-threads ${CFG#c-io}";;
   io-t*) ARGS="--rust-io-takeover yes --rust-io-mode io --rust-io-threads ${CFG#io-t}";;
   precheck-t*) ARGS="--rust-io-takeover yes --rust-io-mode precheck --rust-io-threads ${CFG#precheck-t}";;
   rtc-t*) ARGS="--rust-io-takeover yes --rust-io-mode exec --rust-io-exec-model rtc --rust-io-threads ${CFG#rtc-t}";;
 esac
-taskset -c 0-3 "$BIN" --port $PORT --save "" --appendonly no --dir /tmp --logfile /tmp/rio-prof-$PORT.log $ARGS &
+taskset -c 0-3 "$BIN" --port $PORT --save "" --appendonly no --dir /tmp --logfile /tmp/rio-prof-$PORT.log $ARGS $EXTRA &
 SPID=$!
 trap 'taskset -c 4-7 "$CLI" -p $PORT shutdown nosave >/dev/null 2>&1 || kill $SPID; wait $SPID 2>/dev/null' EXIT
 for i in $(seq 50); do [ "$(taskset -c 4-7 "$CLI" -p $PORT ping 2>/dev/null)" = PONG ] && break; sleep 0.1; done
@@ -26,8 +28,8 @@ if [ "$THR" = main ]; then TID=$SPID; else
 fi
 [ -n "$TID" ] || { echo "no thread $THR"; exit 1; }
 # Warm up (fills keys for GET), then record mid-run.
-taskset -c 4-7 "$BENCH" -p $PORT -t set -P 16 -c 200 -n 3000000 -r 1000000 --threads 4 -q >/dev/null
-taskset -c 4-7 "$BENCH" -p $PORT -t $TEST -P $PIPE -c 200 -n 100000000 -r 1000000 --threads 4 -q >/dev/null &
+taskset -c 4-7 "$BENCH" -p $PORT -t set -P 16 -c $C -n $((K < 1000000 ? 3 * K : 3000000)) -d $D -r $K --threads 4 -q >/dev/null
+taskset -c 4-7 "$BENCH" -p $PORT -t $TEST -P $PIPE -c $C -n 100000000 -d $D -r $K --threads 4 -q >/dev/null &
 BPID=$!
 sleep 1.5
 sudo perf record -F $FREQ -e cpu-clock --call-graph dwarf,16384 -t $TID -o "$OUT/$NAME.data" -- sleep $SECS 2> "$OUT/$NAME.record.log"
