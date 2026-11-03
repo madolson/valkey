@@ -3,10 +3,11 @@
 
   compare.py old.csv new.csv [--noise noise.csv] [--floor 1.0] [--metrics rps,p99_ms,...]
 
-A delta is flagged '*' when |delta %| exceeds the cell's noise threshold:
-the spread_pct that noise.py measured for that cell and metric (default:
-baseline/noise.csv next to this script), never below --floor. Cells without a
-noise entry use --default."""
+A delta is flagged '*' when |delta %| exceeds the noise threshold:
+max(the cell's spread_pct for that metric, the metric's p90 spread_pct over
+all cells, --floor), from noise.py output (default: baseline/noise.csv next to
+this script). Three runs' range underestimates a cell's spread, hence the p90
+term; --cell-only drops it. Cells without a noise entry use --default."""
 import argparse, csv, os
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -26,6 +27,7 @@ def main():
     ap.add_argument("--floor", type=float, default=1.0)
     ap.add_argument("--default", type=float, default=5.0)
     ap.add_argument("--metrics", default=DEFAULT_METRICS)
+    ap.add_argument("--cell-only", action="store_true")
     a = ap.parse_args()
     old, new = load(a.old), load(a.new)
     noise = {}
@@ -33,6 +35,12 @@ def main():
         with open(a.noise) as f:
             for r in csv.DictReader(f):
                 noise[(r["config"], r["test"], r["pipeline"], r["metric"])] = float(r["spread_pct"])
+        if not a.cell_only:
+            by_m = {}
+            for k, v in noise.items():
+                by_m.setdefault(k[3], []).append(v)
+            p90 = {m: sorted(v)[int(0.9 * (len(v) - 1))] for m, v in by_m.items()}
+            noise = {k: max(v, p90[k[3]]) for k, v in noise.items()}
     else:
         print("no noise file at %s; threshold %.1f%%" % (a.noise, a.default))
     metrics = a.metrics.split(",")
