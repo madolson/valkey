@@ -360,6 +360,8 @@ static void rustIoEventHandler(aeEventLoop *el, int fd, void *privdata, int mask
  * so a mutation made on an IO thread does not wait for the main loop. */
 void rustIoPublishGlobals(void) {
     vio_set_default_auth_required(!(DefaultUser->flags & USER_FLAG_NOPASS) || (DefaultUser->flags & USER_FLAG_DISABLED));
+    vio_set_maxclients(server.maxclients);
+    server.stat_rejected_conn += vio_take_rejected();
     rustPrecheckPublish();
 }
 

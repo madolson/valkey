@@ -78,6 +78,48 @@ const OUT_HIGH: usize = 1 << 20; /* refuse engine writes past this many pending 
 const OUT_LOW: usize = 256 << 10; /* fire the engine write handler below this */
 const READ_CHUNK: usize = 16 * 1024;
 
+/* Admission control (DESIGN.md "Admission control"). The C listener throttles
+ * itself because accept runs on the busy main thread; here the IO threads
+ * accept and read regardless of main-thread load, so bound what they hand
+ * over:
+ * - accepted connections the engine has not adopted yet (VIO_EV_NEW not
+ *   taken): stop accepting at NEW_HIGH, resume below NEW_LOW. The kernel
+ *   backlog holds the rest, as for the C listener.
+ * - open connections: at maxclients, refuse on the IO thread with the
+ *   engine's error, without involving the main thread.
+ * - parsed commands not taken by the engine, across all connections: above
+ *   QUEUED_HIGH a connection stops reading once it holds FAIR_SHARE
+ *   commands, so a busy pipeline cannot starve a fresh connection. It is
+ *   resumed by the existing pop -> kick path, since it holds commands. */
+const NEW_HIGH: usize = 128;
+const NEW_LOW: usize = 64;
+const QUEUED_HIGH: usize = 4096;
+const FAIR_SHARE: usize = 32;
+const MAXCLIENTS_ERR: &[u8] = b"-ERR max number of clients reached\r\n";
+
+/// Accepted connections whose VIO_EV_NEW the engine has not taken.
+static UNADOPTED: AtomicUsize = AtomicUsize::new(0);
+/// Open connections (accepted, fd not closed yet).
+static LIVE: AtomicUsize = AtomicUsize::new(0);
+/// Parsed commands queued in Rust, all connections.
+static QUEUED: AtomicUsize = AtomicUsize::new(0);
+/// The engine's maxclients, published by vio_set_maxclients().
+static MAXCLIENTS: AtomicUsize = AtomicUsize::new(usize::MAX);
+/// Connections refused at maxclients, not yet counted by the engine.
+static REJECTED: AtomicUsize = AtomicUsize::new(0);
+/// The listener is out of thread 0's epoll set (UNADOPTED reached NEW_HIGH).
+static ACCEPT_PAUSED: AtomicBool = AtomicBool::new(false);
+
+/// Whether a connection holding `queued` commands may read more.
+fn may_read(queued: usize) -> bool {
+    queued < CMDS_HIGH && (queued < FAIR_SHARE || QUEUED.load(Ordering::Relaxed) < QUEUED_HIGH)
+}
+
+/// Whether a paused connection holding `queued` commands may resume.
+fn may_resume(queued: usize) -> bool {
+    queued < CMDS_LOW && (queued < FAIR_SHARE || QUEUED.load(Ordering::Relaxed) < QUEUED_HIGH)
+}
+
 /* ---------------------------------------------------------------------------
  * Connection shared between one IO thread and the main thread
  * ------------------------------------------------------------------------- */
@@ -114,6 +156,8 @@ impl Drop for Conn {
     fn drop(&mut self) {
         let g = global();
         let sh = self.shared.get_mut().unwrap();
+        QUEUED.fetch_sub(sh.cmds.len(), Ordering::Relaxed);
+        LIVE.fetch_sub(1, Ordering::Relaxed);
         for cmd in sh.cmds.drain(..) {
             if !cmd.argv.is_null() {
                 (g.cbs.free_argv)(cmd.argv, cmd.argc);
@@ -130,6 +174,8 @@ impl Drop for Conn {
 enum Msg {
     NewFd(RawFd),
     Kick(Arc<Conn>),
+    /// To thread 0: UNADOPTED fell below NEW_LOW, poll the listener again.
+    ResumeAccept,
 }
 
 struct IoThread {
@@ -601,12 +647,14 @@ impl Worker {
         }
 
         if !batch.is_empty() {
+            let n = batch.len();
             let queued = {
                 let mut sh = conn.shared.lock().unwrap();
                 sh.cmds.extend(batch);
                 sh.cmds.len()
             };
-            if queued >= CMDS_HIGH {
+            QUEUED.fetch_add(n, Ordering::Relaxed);
+            if !may_read(queued) {
                 conn.read_paused.store(true, Ordering::Release);
             }
             self.notify(&conn, 0);
@@ -679,7 +727,7 @@ impl Worker {
             self.remove(idx);
             return;
         }
-        if conn.read_paused.load(Ordering::Acquire) && conn.shared.lock().unwrap().cmds.len() < CMDS_LOW {
+        if conn.read_paused.load(Ordering::Acquire) && may_resume(conn.shared.lock().unwrap().cmds.len()) {
             conn.read_paused.store(false, Ordering::Release);
         }
         self.flush(idx);
@@ -726,15 +774,54 @@ impl Worker {
         }
     }
 
+    /// Thread 0 only: add or remove the listener from the epoll set.
+    fn listen_interest(&mut self, on: bool) {
+        let g = global();
+        let mut ev = libc::epoll_event { events: if on { libc::EPOLLIN as u32 } else { 0 }, u64: TOK_LISTEN };
+        unsafe { libc::epoll_ctl(self.me().epfd, libc::EPOLL_CTL_MOD, g.listen_fd, &mut ev) };
+    }
+
+    /// Stop polling the listener while the engine is NEW_HIGH connections
+    /// behind. Returns true when paused.
+    fn accept_backoff(&mut self) -> bool {
+        if UNADOPTED.load(Ordering::SeqCst) < NEW_HIGH {
+            return false;
+        }
+        ACCEPT_PAUSED.store(true, Ordering::SeqCst);
+        self.listen_interest(false);
+        /* The engine may have adopted below NEW_LOW between the load and
+         * the store, and seen ACCEPT_PAUSED clear: undo it ourselves. */
+        if UNADOPTED.load(Ordering::SeqCst) < NEW_LOW && ACCEPT_PAUSED.swap(false, Ordering::SeqCst) {
+            self.listen_interest(true);
+            return false;
+        }
+        true
+    }
+
     fn accept_all(&mut self) {
         let g = global();
         loop {
+            if self.accept_backoff() {
+                return;
+            }
             let fd = unsafe {
                 libc::accept4(g.listen_fd, std::ptr::null_mut(), std::ptr::null_mut(), libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC)
             };
             if fd < 0 {
                 return;
             }
+            if LIVE.load(Ordering::Relaxed) >= MAXCLIENTS.load(Ordering::Relaxed) {
+                /* What acceptCommonHandler() does at maxclients: best-effort
+                 * error, then close. */
+                unsafe {
+                    libc::write(fd, MAXCLIENTS_ERR.as_ptr() as *const c_void, MAXCLIENTS_ERR.len());
+                    libc::close(fd);
+                }
+                REJECTED.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            LIVE.fetch_add(1, Ordering::Relaxed);
+            UNADOPTED.fetch_add(1, Ordering::SeqCst);
             let one: c_int = 1;
             unsafe {
                 libc::setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY, &one as *const c_int as *const c_void, 4);
@@ -798,6 +885,10 @@ impl Worker {
                 match m {
                     Msg::NewFd(fd) => self.add_conn(fd),
                     Msg::Kick(c) => self.on_kick(c),
+                    Msg::ResumeAccept => {
+                        self.listen_interest(true);
+                        self.accept_all();
+                    }
                 }
             }
         }
@@ -1040,7 +1131,25 @@ pub extern "C" fn vio_conn_release(h: *const Conn) {
 
 #[no_mangle]
 pub extern "C" fn vio_conn_take_events(h: *const Conn) -> u32 {
-    conn_ref(h).events.swap(0, Ordering::AcqRel)
+    let ev = conn_ref(h).events.swap(0, Ordering::AcqRel);
+    if ev & VIO_EV_NEW != 0 && UNADOPTED.fetch_sub(1, Ordering::SeqCst) - 1 < NEW_LOW && ACCEPT_PAUSED.swap(false, Ordering::SeqCst) {
+        let t = &global().threads[0];
+        t.inbox.lock().unwrap().push(Msg::ResumeAccept);
+        wake_thread(t);
+    }
+    ev
+}
+
+/// Publish the engine's maxclients (admission control).
+#[no_mangle]
+pub extern "C" fn vio_set_maxclients(n: usize) {
+    MAXCLIENTS.store(n, Ordering::Relaxed);
+}
+
+/// Connections refused at maxclients since the last call.
+#[no_mangle]
+pub extern "C" fn vio_take_rejected() -> usize {
+    REJECTED.swap(0, Ordering::Relaxed)
 }
 
 #[no_mangle]
@@ -1070,6 +1179,7 @@ pub extern "C" fn vio_conn_pop_cmds(h: *const Conn, out: *mut VioCmd, max: usize
         }
         (n, sh.cmds.len())
     };
+    QUEUED.fetch_sub(n, Ordering::Relaxed);
     if n > 0 && left < CMDS_LOW && conn.read_paused.load(Ordering::Acquire) {
         kick(&conn);
     }
@@ -1166,6 +1276,15 @@ pub extern "C" fn vio_conn_set_session(h: *const Conn, s: *const precheck::VioSe
 #[no_mangle]
 pub extern "C" fn vio_conn_close(h: *const Conn) {
     let conn = conn_arc(h);
+    /* Commands the engine will never pop: free them now instead of when
+     * the output drains, so they stop counting against QUEUED_HIGH. */
+    let dropped: Vec<VioCmd> = conn.shared.lock().unwrap().cmds.drain(..).collect();
+    QUEUED.fetch_sub(dropped.len(), Ordering::Relaxed);
+    for cmd in dropped {
+        if !cmd.argv.is_null() {
+            (global().cbs.free_argv)(cmd.argv, cmd.argc);
+        }
+    }
     conn.udata.store(std::ptr::null_mut(), Ordering::Relaxed);
     conn.want_writable.store(false, Ordering::Release);
     conn.c_closed.store(true, Ordering::Release);

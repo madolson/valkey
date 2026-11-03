@@ -127,6 +127,11 @@ void vio_conn_set_auth_required(const VioConn *h, int on);
 void vio_conn_set_session(const VioConn *h, const VioSession *s);
 /* authRequired() for a new, unauthenticated connection. */
 void vio_set_default_auth_required(int on);
+/* Admission control: the engine's maxclients; IO threads refuse new
+ * connections at that many open Rust connections. */
+void vio_set_maxclients(size_t n);
+/* Connections refused at maxclients since the last call. */
+size_t vio_take_rejected(void);
 void vio_conn_close(const VioConn *h);
 void vio_conn_shutdown(const VioConn *h);
 
