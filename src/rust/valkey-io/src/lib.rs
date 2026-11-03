@@ -121,6 +121,9 @@ pub struct Conn {
     auth_required: AtomicBool,
     /// Unparsed input held until the engine republishes auth_required.
     parse_held: AtomicBool,
+    /// The engine asked for shutdown(2) (a fork child shares the fd): done
+    /// by the IO thread once the output accepted before it is written.
+    half_close: AtomicBool,
     /// Bytes accepted from the engine and not yet written to the socket.
     out_bytes: AtomicUsize,
     /// Zero-copy write job in flight (engine pointer), 0 if none. Set by
@@ -396,6 +399,7 @@ impl Worker {
             read_paused: AtomicBool::new(false),
             auth_required: AtomicBool::new(DEFAULT_AUTH_REQUIRED.load(Ordering::Relaxed)),
             parse_held: AtomicBool::new(false),
+            half_close: AtomicBool::new(false),
             out_bytes: AtomicUsize::new(0),
             job: AtomicUsize::new(0),
             shared: Mutex::new(Shared { cmds: VecDeque::new(), out: Vec::new() }),
@@ -747,6 +751,7 @@ impl Worker {
             conn.read_paused.store(false, Ordering::Release);
         }
         self.flush(idx);
+        self.maybe_half_close(idx);
         if conn.parse_held.swap(false, Ordering::AcqRel) {
             self.parse_buffered(idx);
         }
@@ -763,12 +768,31 @@ impl Worker {
         self.update_interest(idx);
     }
 
+    /// shutdown(2) once everything the engine handed over before
+    /// vio_conn_shutdown() is on the socket (or the peer is gone).
+    fn maybe_half_close(&mut self, idx: usize) {
+        let l = match self.slab[idx].as_ref() {
+            Some(l) => l,
+            None => return,
+        };
+        let c = &l.conn;
+        if !c.half_close.load(Ordering::Acquire) {
+            return;
+        }
+        let drained = l.woff == l.wbuf.len() && c.out_bytes.load(Ordering::Acquire) == 0 && c.job.load(Ordering::Acquire) == 0;
+        if drained || c.peer_closed.load(Ordering::Acquire) {
+            c.half_close.store(false, Ordering::Release);
+            sys::shutdown(c.fd);
+        }
+    }
+
     fn on_event(&mut self, idx: usize, mask: u32) {
         if mask & (libc::EPOLLOUT as u32) != 0 {
             if let Some(l) = self.slab[idx].as_mut() {
                 l.sock_blocked = false;
             }
             self.flush(idx);
+            self.maybe_half_close(idx);
             /* A closing connection is released once its output drains. */
             if let Some(l) = self.slab[idx].as_ref() {
                 let c = l.conn.clone();

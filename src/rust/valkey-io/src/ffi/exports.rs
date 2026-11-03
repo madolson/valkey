@@ -357,7 +357,10 @@ pub unsafe extern "C" fn vio_conn_close(h: ConnRef<'_>) {
 /// `h` must be a live handle.
 #[no_mangle]
 pub unsafe extern "C" fn vio_conn_shutdown(h: ConnRef<'_>) {
-    sys::shutdown(h.fd);
+    /* Not shutdown(2) here: the IO thread may not have written the reply
+     * the engine just handed over (CLIENT KILL during BGSAVE lost it). */
+    h.half_close.store(true, Ordering::Release);
+    kick(&h.arc());
 }
 
 /* ---------------------------------------------------------------------------
