@@ -233,8 +233,6 @@ struct Global {
     ready: handoff::Mailbox<Ready>,
     listen_fd: RawFd,
     adm: admission::Admission,
-    /// Maximum IO-thread spin, ns (0 = off).
-    spin_max_ns: u64,
 }
 
 
@@ -248,19 +246,10 @@ static DEFAULT_AUTH_REQUIRED: AtomicBool = AtomicBool::new(false);
 /// Measurement switch, read once from VIO_HANDOFF_DISABLE at vio_start():
 /// bit 1 = no main-thread kick batching, bit 2 = always write the IO-thread
 /// eventfd, bit 4 = always write the main eventfd (the stage 1 handoff is 7).
-/// Default 0 since plan step 20: an awake IO thread is not signaled, and
-/// IO threads spin briefly after work (SPIN_MAX_NS) instead of sleeping and
-/// being re-woken per batch, which had cost 16% to 34% throughput with one
-/// IO thread at -P 16 (DESIGN.md "Handoff v2").
-static HANDOFF_DISABLE: AtomicU32 = AtomicU32::new(0);
-
-/// IO-thread spin budget after an iteration that did work (plan step 20).
-/// Adaptive: it doubles up to the maximum when a spin finds work and halves
-/// down to SPIN_MIN_NS when it does not. The maximum is VIO_SPIN_US (default
-/// 20 us; 0 disables the spin), read at vio_start(). An idle thread does not
-/// spin: only work starts one.
-const SPIN_MIN_NS: u64 = 2_000;
-const SPIN_DEFAULT_US: u64 = 20;
+/// Default 2: skipping the eventfd for an awake IO thread lets it drain its
+/// kicks early, sleep, and be woken again; with one IO thread at -P 16 that
+/// cost 16% throughput (DESIGN.md "Handoff v2").
+static HANDOFF_DISABLE: AtomicU32 = AtomicU32::new(HD_IO_AWAKE);
 const HD_KICK_BATCH: u32 = 1;
 const HD_IO_AWAKE: u32 = 2;
 const HD_MAIN_AWAKE: u32 = 4;
@@ -989,57 +978,16 @@ impl Worker {
         }
     }
 
-    /// After an iteration that did work: poll the inbox and the epoll set
-    /// without sleeping for up to `budget` ns. The thread stays "awake", so
-    /// producers skip the eventfd write. Returns the events found (0 when
-    /// only the inbox has work), or None when the budget ran out.
-    fn spin(&self, events: &mut [sys::EpollEvent], budget: u64) -> Option<usize> {
-        let me = self.me();
-        let t0 = std::time::Instant::now();
-        loop {
-            let n = sys::epoll_wait(me.epfd, events, 0);
-            if n > 0 {
-                return Some(n);
-            }
-            /* Inbox work announced by an eventfd write is taken through
-             * TOK_WAKE (run() skips take_inbox() while signaled), which the
-             * epoll_wait above reports; returning for it here would loop
-             * without ever draining the eventfd. */
-            if me.inbox.waker.is_pending() && !me.inbox.waker.signaled() {
-                return Some(0);
-            }
-            if t0.elapsed().as_nanos() as u64 >= budget {
-                return None;
-            }
-            std::hint::spin_loop();
-        }
-    }
-
     fn run(mut self) {
         let me = self.me();
         let mut timeout: c_int = -1;
         let mut events: Vec<sys::EpollEvent> = vec![sys::EpollEvent { events: 0, u64: 0 }; 256];
-        let spin_max = global().spin_max_ns;
-        let mut budget = spin_max;
-        let mut worked = false;
         loop {
-            let mut spun = None;
-            if timeout != 0 && worked && spin_max > 0 {
-                spun = self.spin(&mut events, budget);
-                budget = if spun.is_some() { (budget * 2).min(spin_max) } else { (budget / 2).max(SPIN_MIN_NS.min(spin_max)) };
+            if timeout != 0 && me.inbox.waker.prepare_sleep() {
+                timeout = 0;
             }
-            let n = match spun {
-                Some(n) => n,
-                None => {
-                    if timeout != 0 && me.inbox.waker.prepare_sleep() {
-                        timeout = 0;
-                    }
-                    let n = sys::epoll_wait(me.epfd, &mut events, timeout);
-                    me.inbox.waker.awake();
-                    n
-                }
-            };
-            worked = n > 0 || spun.is_some() || timeout == 0;
+            let n = sys::epoll_wait(me.epfd, &mut events, timeout);
+            me.inbox.waker.awake();
             for ev in events.iter().take(n) {
                 let tok = ev.u64;
                 let mask = ev.events;
@@ -1112,7 +1060,6 @@ fn start(bind: Option<String>, port: c_int, threads: c_int, cbs: VioCallbacks, l
         ready: handoff::Mailbox::new(main_efd, true),
         listen_fd,
         adm: admission::Admission::new(),
-        spin_max_ns: std::env::var("VIO_SPIN_US").ok().and_then(|v| v.parse().ok()).unwrap_or(SPIN_DEFAULT_US) * 1000,
     };
     if GLOBAL.set(g).is_err() {
         return Err(libc::EALREADY);
