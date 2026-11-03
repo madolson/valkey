@@ -696,7 +696,7 @@ int trySendReadToIOThreads(client *c) {
     if (!c->conn) return C_ERR;
 #ifdef USE_RUST_IO
     /* Rust connections do their own IO. */
-    if (connIsRust(c->conn)) return C_ERR;
+    if (connIsExternal(c->conn)) return C_ERR;
 #endif
     /* If IO thread is still reading, return C_OK so the main thread does not race it. */
     if (c->io_read_state == CLIENT_PENDING_IO) return C_OK;
@@ -747,7 +747,7 @@ int trySendWriteToIOThreads(client *c) {
     if (server.active_io_threads_num <= 1) return C_ERR;
     if (!c->conn) return C_ERR;
 #ifdef USE_RUST_IO
-    if (connIsRust(c->conn)) return C_ERR;
+    if (connIsExternal(c->conn)) return C_ERR;
 #endif
     /* The I/O thread is already writing for this client. */
     if (c->io_write_state != CLIENT_IDLE) return C_OK;

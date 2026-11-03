@@ -27,8 +27,7 @@ typedef struct rustIoConfig {
 extern rustIoConfig rust_io_config;
 extern int rust_io_precheck_active; /* precheck mode */
 
-int RegisterConnectionTypeRust(void);
-int connIsRust(struct connection *conn);
+#include "connection_external.h"
 /* True when the C TCP listener on 'port' must not be created. */
 int rustIoTakesOverPort(void);
 int rustIoListenerUnchanged(void);

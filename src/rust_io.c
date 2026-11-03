@@ -15,6 +15,7 @@
 #include "connhelpers.h"
 #include "rust_io.h"
 #include "rust_io_timing.h"
+#include "connection_external.h"
 
 #ifdef USE_RUST_IO
 
@@ -49,7 +50,6 @@ typedef struct rustConnection {
     VioSession sess;           /* last session published to Rust (precheck) */
 } rustConnection;
 
-static ConnectionType CT_Rust;
 static list *rust_stalled; /* client ids */
 static int rust_started = 0;
 /* bind list at startup, joined, for rustIoListenerUnchanged(). */
@@ -174,7 +174,7 @@ static int rustIoPull(rustConnection *rc, client *c) {
 }
 
 const VioSession *rustIoConnSession(connection *conn) {
-    if (!connIsRust(conn)) return NULL;
+    if (!connIsExternal(conn)) return NULL;
     return &((rustConnection *)conn)->sess;
 }
 
@@ -265,11 +265,7 @@ static void rustIoDeliver(rustConnection *rc) {
  * ------------------------------------------------------------------------- */
 
 static void rustIoAccept(const VioConn *h) {
-    rustConnection *rc = zcalloc(sizeof(*rc));
-    rc->c.type = &CT_Rust;
-    rc->c.fd = vio_conn_fd(h);
-    rc->c.iovcnt = IOV_MAX;
-    rc->c.state = CONN_STATE_ACCEPTING;
+    rustConnection *rc = (rustConnection *)connCreateExternal(sizeof(rustConnection), vio_conn_fd(h));
     rc->h = vio_conn_retain(h);
     vio_conn_set_udata(h, rc);
 
@@ -372,7 +368,7 @@ static int connRustProcessPendingData(void) {
 
     for (i = 0; i < n; i++) {
         client *c = lookupClientByID(ids[i]);
-        if (!c || !c->conn || !connIsRust(c->conn)) continue;
+        if (!c || !c->conn || !connIsExternal(c->conn)) continue;
         rustConnection *rc = (rustConnection *)c->conn;
         rc->stalled = false;
         if (!rc->h) continue;
@@ -395,177 +391,61 @@ static int connRustHasPendingData(void) {
     listRewind(rust_stalled, &li);
     while ((ln = listNext(&li))) {
         client *c = lookupClientByID((uint64_t)(uintptr_t)listNodeValue(ln));
-        if (!c || !c->conn || !connIsRust(c->conn)) continue;
+        if (!c || !c->conn || !connIsExternal(c->conn)) continue;
         if (rustIoCanProgress((rustConnection *)c->conn, c)) return 1;
     }
     return 0;
 }
 
 /* ---------------------------------------------------------------------------
- * ConnectionType "rust"
+ * Transport ops for connection_external.c
  * ------------------------------------------------------------------------- */
 
-static int connRustGetType(void) {
-    return CONN_TYPE_RUST;
+static ssize_t rustExtWritev(connection *conn, const struct iovec *iov, int iovcnt) {
+    rustConnection *rc = (rustConnection *)conn;
+    if (!rc->h) {
+        errno = EBADF;
+        return -1;
+    }
+    RUST_IO_TIMING_WRITEV(conn);
+    return vio_conn_writev(rc->h, iov, iovcnt);
 }
 
-static int connRustAddr(connection *conn, char *ip, size_t ip_len, int *port, int remote) {
-    if (anetFdToString(conn->fd, ip, ip_len, port, remote) == 0) return 0;
-    conn->last_errno = errno;
-    return -1;
+static void rustExtClose(connection *conn) {
+    rustConnection *rc = (rustConnection *)conn;
+    if (!rc->h) return;
+    /* Rust flushes what we already handed over, then closes the fd. */
+    vio_conn_close(rc->h);
+    vio_conn_release(rc->h);
+    rc->h = NULL;
 }
 
-static int connRustIsLocal(connection *conn) {
-    char cip[NET_IP_STR_LEN + 1] = {0};
-    if (connRustAddr(conn, cip, sizeof(cip) - 1, NULL, 1) == -1) return -1;
-    return !strncmp(cip, "127.", 4) || !strcmp(cip, "::1");
-}
-
-static void connRustShutdown(connection *conn) {
+static void rustExtShutdown(connection *conn) {
     rustConnection *rc = (rustConnection *)conn;
     if (rc->h) vio_conn_shutdown(rc->h);
 }
 
-static void connRustClose(connection *conn) {
+static void rustExtWantWritable(connection *conn, int on) {
     rustConnection *rc = (rustConnection *)conn;
-    if (rc->h) {
-        /* Rust flushes what we already handed over, then closes the fd. */
-        vio_conn_close(rc->h);
-        vio_conn_release(rc->h);
-        rc->h = NULL;
-    }
-    if (connHasRefs(conn)) {
-        conn->flags |= CONN_FLAG_CLOSE_SCHEDULED;
-        return;
-    }
-    zfree(rc);
+    if (rc->h) vio_conn_want_writable(rc->h, on);
 }
 
-static int connRustAccept(connection *conn, ConnectionCallbackFunc accept_handler) {
-    if (conn->state != CONN_STATE_ACCEPTING) return C_ERR;
-    conn->state = CONN_STATE_CONNECTED;
-    if (!callHandler(conn, accept_handler)) return C_ERR;
-    return C_OK;
-}
-
-static int connRustWritev(connection *conn, const struct iovec *iov, int iovcnt) {
+/* unprotectClient(): input held in Rust can flow again. */
+static void rustExtReadResumed(connection *conn) {
     rustConnection *rc = (rustConnection *)conn;
-    ssize_t n;
-    if (!rc->h) {
-        errno = EBADF;
-        n = -1;
-    } else {
-        RUST_IO_TIMING_WRITEV(conn);
-        n = vio_conn_writev(rc->h, iov, iovcnt);
-    }
-    if (n < 0 && errno != EAGAIN) {
-        conn->last_errno = errno;
-        if (conn->state == CONN_STATE_CONNECTED) conn->state = CONN_STATE_ERROR;
-    }
-    return (int)n;
-}
-
-static int connRustWrite(connection *conn, const void *data, size_t data_len) {
-    struct iovec iov = {.iov_base = (void *)data, .iov_len = data_len};
-    return connRustWritev(conn, &iov, 1);
-}
-
-/* Input arrives through rustIoDeliver(), never through read(). */
-static int connRustRead(connection *conn, void *buf, size_t buf_len) {
-    UNUSED(conn);
-    UNUSED(buf);
-    UNUSED(buf_len);
-    errno = EAGAIN;
-    return -1;
-}
-
-static int connRustSetWriteHandler(connection *conn, ConnectionCallbackFunc func, int barrier) {
-    rustConnection *rc = (rustConnection *)conn;
-    conn->write_handler = func;
-    if (barrier)
-        conn->flags |= CONN_FLAG_WRITE_BARRIER;
-    else
-        conn->flags &= ~CONN_FLAG_WRITE_BARRIER;
-    if (rc->h) vio_conn_want_writable(rc->h, func != NULL);
-    return C_OK;
-}
-
-static int connRustSetReadHandler(connection *conn, ConnectionCallbackFunc func) {
-    rustConnection *rc = (rustConnection *)conn;
-    conn->read_handler = func;
-    /* unprotectClient(): input held in Rust can flow again. */
     client *c = connGetPrivateData(conn);
-    if (func && c && rc->h && vio_conn_pending_cmds(rc->h)) rustIoStall(rc, c);
-    return C_OK;
+    if (c && rc->h && vio_conn_pending_cmds(rc->h)) rustIoStall(rc, c);
 }
 
-static const char *connRustGetLastError(connection *conn) {
-    return strerror(conn->last_errno);
-}
-
-static ssize_t connRustSyncWrite(connection *conn, char *ptr, ssize_t size, long long timeout) {
-    UNUSED(timeout);
-    return connRustWrite(conn, ptr, size);
-}
-
-static ssize_t connRustSyncRead(connection *conn, char *ptr, ssize_t size, long long timeout) {
-    UNUSED(timeout);
-    return connRustRead(conn, ptr, size);
-}
-
-static ssize_t connRustSyncReadLine(connection *conn, char *ptr, ssize_t size, long long timeout) {
-    UNUSED(timeout);
-    return connRustRead(conn, ptr, size);
-}
-
-static int connRustIsClosing(connection *conn) {
-    return conn->state != CONN_STATE_CONNECTED;
-}
-
-static ConnectionType CT_Rust = {
-    .get_type = connRustGetType,
-    .init = NULL,
-    .cleanup = NULL,
-    .configure = NULL,
-    .ae_handler = NULL,
-    .accept_handler = NULL,
-    .addr = connRustAddr,
-    .is_local = connRustIsLocal,
-    .listen = NULL,
-    .closeListener = NULL,
-    .conn_create = NULL,
-    .conn_create_accepted = NULL,
-    .shutdown = connRustShutdown,
-    .close = connRustClose,
-    .connect = NULL,
-    .blocking_connect = NULL,
-    .accept = connRustAccept,
-    .write = connRustWrite,
-    .writev = connRustWritev,
-    .read = connRustRead,
-    .set_write_handler = connRustSetWriteHandler,
-    .set_read_handler = connRustSetReadHandler,
-    .get_last_error = connRustGetLastError,
-    .sync_write = connRustSyncWrite,
-    .sync_read = connRustSyncRead,
-    .sync_readline = connRustSyncReadLine,
+static const externalConnOps rust_ext_ops = {
+    .writev = rustExtWritev,
+    .close = rustExtClose,
+    .shutdown = rustExtShutdown,
+    .want_writable = rustExtWantWritable,
+    .read_resumed = rustExtReadResumed,
     .has_pending_data = connRustHasPendingData,
     .process_pending_data = connRustProcessPendingData,
-    .postpone_update_state = NULL,
-    .update_state = NULL,
-    .get_peer_cert = NULL,
-    .get_peer_user = NULL,
-    .connIntegrityChecked = NULL,
-    .is_closing = connRustIsClosing,
 };
-
-int RegisterConnectionTypeRust(void) {
-    return connTypeRegister(&CT_Rust);
-}
-
-int connIsRust(connection *conn) {
-    return conn && conn->type == &CT_Rust;
-}
 
 /* ---------------------------------------------------------------------------
  * Startup
@@ -604,6 +484,7 @@ int rustIoInitListeners(void) {
         serverLog(LL_WARNING, "Failed listening on rust-io port %d: %s, aborting.", port, strerror(errno));
         exit(1);
     }
+    serverAssert(connExternalAttach(&rust_ext_ops) == C_OK);
     if (aeCreateFileEvent(server.el, efd, AE_READABLE, rustIoEventHandler, NULL) == AE_ERR)
         serverPanic("Unrecoverable error creating rust-io event handler.");
     rust_stalled = listCreate();
@@ -649,7 +530,7 @@ void rustIoFlushReplicas(long long timeout_ms) {
         listRewind(server.replicas, &li);
         while ((ln = listNext(&li))) {
             client *r = listNodeValue(ln);
-            if (!r->conn || !connIsRust(r->conn)) continue;
+            if (!r->conn || !connIsExternal(r->conn)) continue;
             rustConnection *rc = (rustConnection *)r->conn;
             if (rc->h) pending += vio_conn_pending_out(rc->h);
         }

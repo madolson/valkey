@@ -87,7 +87,7 @@ typedef enum {
     CONN_TYPE_TLS,
     CONN_TYPE_RDMA,
 #ifdef USE_RUST_IO
-    CONN_TYPE_RUST,
+    CONN_TYPE_EXTERNAL, /* connection_external.c */
 #endif
     CONN_TYPE_MAX,
 } ConnectionTypeId;
@@ -103,8 +103,8 @@ static inline const char *getConnectionTypeName(int type) {
     case CONN_TYPE_RDMA:
         return "rdma";
 #ifdef USE_RUST_IO
-    case CONN_TYPE_RUST:
-        return "rust";
+    case CONN_TYPE_EXTERNAL:
+        return "external";
 #endif
     default:
         return "invalid type";

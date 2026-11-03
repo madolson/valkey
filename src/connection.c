@@ -56,10 +56,6 @@ int connTypeInitialize(void) {
     /* may fail if without BUILD_RDMA=yes */
     RegisterConnectionTypeRdma();
 
-#ifdef USE_RUST_IO
-    serverAssert(RegisterConnectionTypeRust() == C_OK);
-#endif
-
     return C_OK;
 }
 
