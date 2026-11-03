@@ -161,8 +161,13 @@ void rustPrecheckPublish(void) {
 }
 
 /* Evidence that a server served commands through the fast path: logged at
- * exit, so test harness server logs carry the counters. */
+ * exit, so test harness server logs carry the counters. Skipped when nothing
+ * was prechecked: a server that exits during startup (e.g. a bad RDB) must
+ * keep its fatal error as the last log line. */
 static void pcLogAtExit(void) {
+    unsigned long long any = 0;
+    for (int i = 0; i < PC_CODE_MAX; i++) any |= pc_stats.code[i];
+    if (!any) return;
     serverLog(LL_NOTICE, "rust-io precheck: fast=%llu rejected=%llu barrier=%llu epoch=%llu session=%llu cluster=%llu",
               pc_stats.code[PC_FAST], pc_stats.code[PC_REJECT], pc_stats.code[PC_FB_BARRIER], pc_stats.code[PC_FB_EPOCH],
               pc_stats.code[PC_FB_SESSION], pc_stats.code[PC_FB_CLUSTER]);
