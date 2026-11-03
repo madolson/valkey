@@ -2198,10 +2198,6 @@ void afterSleep(struct aeEventLoop *eventLoop, int numevents) {
         server.el_cmd_cnt_start = server.stat_numcommands;
     }
 
-#ifdef USE_RUST_IO
-    rustIoAfterPoll();
-#endif
-
     /* Update the time cache. Skip the (relatively expensive) daylight-saving
      * refresh here since afterSleep() runs on every event-loop wakeup. */
     updateCachedTime(0);
@@ -2214,6 +2210,9 @@ void afterSleep(struct aeEventLoop *eventLoop, int numevents) {
     }
 
     IOThreadsAfterSleep(numevents);
+#ifdef USE_RUST_IO
+    rustIoAfterPoll();
+#endif
 }
 
 /* Callback invoked by the event loop after draining priority events.

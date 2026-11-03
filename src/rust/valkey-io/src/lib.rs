@@ -175,7 +175,10 @@ static DEFAULT_AUTH_REQUIRED: AtomicBool = AtomicBool::new(false);
 /// Measurement switch, read once from VIO_HANDOFF_DISABLE at vio_start():
 /// bit 1 = no main-thread kick batching, bit 2 = always write the IO-thread
 /// eventfd, bit 4 = always write the main eventfd (the stage 1 handoff is 7).
-static HANDOFF_DISABLE: AtomicU32 = AtomicU32::new(0);
+/// Default 2: skipping the eventfd for an awake IO thread lets it drain its
+/// kicks early, sleep, and be woken again; with one IO thread at -P 16 that
+/// cost 16% throughput (DESIGN.md "Handoff v2").
+static HANDOFF_DISABLE: AtomicU32 = AtomicU32::new(HD_IO_AWAKE);
 const HD_KICK_BATCH: u32 = 1;
 const HD_IO_AWAKE: u32 = 2;
 const HD_MAIN_AWAKE: u32 = 4;
@@ -787,6 +790,19 @@ impl Worker {
         !self.to_notify.is_empty()
     }
 
+    fn take_inbox(&mut self) {
+        let me = self.me();
+        if me.pending.swap(false, Ordering::SeqCst) {
+            let msgs = std::mem::take(&mut *me.inbox.lock().unwrap());
+            for m in msgs {
+                match m {
+                    Msg::NewFd(fd) => self.add_conn(fd),
+                    Msg::Kick(c) => self.on_kick(c),
+                }
+            }
+        }
+    }
+
     fn run(mut self) {
         let me = self.me();
         let rtc = exec::rtc_ops();
@@ -814,20 +830,19 @@ impl Worker {
                      * taken below, after the clear. */
                     eventfd_drain(me.wakefd);
                     me.signaled.store(false, Ordering::SeqCst);
+                    self.take_inbox();
                 } else if tok == TOK_LISTEN {
                     self.accept_all();
                 } else {
                     self.on_event((tok - TOK_BASE) as usize, mask);
                 }
             }
-            if me.pending.swap(false, Ordering::SeqCst) {
-                let msgs = std::mem::take(&mut *me.inbox.lock().unwrap());
-                for m in msgs {
-                    match m {
-                        Msg::NewFd(fd) => self.add_conn(fd),
-                        Msg::Kick(c) => self.on_kick(c),
-                    }
-                }
+            /* Kicks pushed while this thread was awake, so no eventfd was
+             * written for them. When one was, leave them to its TOK_WAKE:
+             * taking them here too, ahead of the notification, tripled the
+             * IO thread's sleeps and cost 18% at -P 16 with one IO thread. */
+            if !me.signaled.load(Ordering::SeqCst) {
+                self.take_inbox();
             }
             timeout = -1;
             match rtc {
@@ -964,9 +979,18 @@ pub extern "C" fn vio_main_before_poll() -> c_int {
     g.main_pending.load(Ordering::SeqCst) as c_int
 }
 
+/// First call after the main thread polled. Takes work handed over while
+/// it was awake and returns 1 if there is some, unless an eventfd write is
+/// pending: then the eventfd handler takes it in this iteration, and taking
+/// it here as well would run two batches before the first one's replies.
 #[no_mangle]
-pub extern "C" fn vio_main_after_poll() {
-    global().main_sleeping.store(false, Ordering::SeqCst);
+pub extern "C" fn vio_main_after_poll() -> c_int {
+    let g = global();
+    g.main_sleeping.store(false, Ordering::SeqCst);
+    if g.main_signaled.load(Ordering::SeqCst) {
+        return 0;
+    }
+    vio_main_take_ready()
 }
 
 /// Next ready connection from the current batch, or NULL. The caller owns

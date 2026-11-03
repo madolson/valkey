@@ -2710,6 +2710,13 @@ static int updateHZ(const char **err) {
 }
 
 static int updatePort(const char **err) {
+#ifdef USE_RUST_IO
+    if (rustIoTakesOverPort()) {
+        if (rustIoListenerUnchanged()) return 1;
+        *err = "Changing bind or port is not supported with rust-io-takeover";
+        return 0;
+    }
+#endif
     connListener *listener = listenerByType(CONN_TYPE_SOCKET);
 
     serverAssert(listener != NULL);
@@ -2888,6 +2895,13 @@ int updateAppendFsync(const char **err) {
 
 /* applyBind affects both TCP and TLS (if enabled) together */
 static int applyBind(const char **err) {
+#ifdef USE_RUST_IO
+    if (rustIoTakesOverPort()) {
+        if (rustIoListenerUnchanged()) return 1;
+        *err = "Changing bind or port is not supported with rust-io-takeover";
+        return 0;
+    }
+#endif
     connListener *tcp_listener = listenerByType(CONN_TYPE_SOCKET);
     connListener *tls_listener = listenerByType(CONN_TYPE_TLS);
 

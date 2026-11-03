@@ -39,6 +39,7 @@ int RegisterConnectionTypeRust(void);
 int connIsRust(struct connection *conn);
 /* True when the C TCP listener on 'port' must not be created. */
 int rustIoTakesOverPort(void);
+int rustIoListenerUnchanged(void);
 /* Start the Rust layer if configured. Returns the number of listeners. */
 int rustIoInitListeners(void);
 void rustIoLogReady(void);

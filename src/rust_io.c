@@ -52,6 +52,25 @@ typedef struct rustConnection {
 static ConnectionType CT_Rust;
 static list *rust_stalled; /* client ids */
 static int rust_started = 0;
+/* bind list at startup, joined, for rustIoListenerUnchanged(). */
+static sds rust_bind_at_start = NULL;
+
+static sds rustIoJoinBind(void) {
+    sds s = sdsempty();
+    for (int j = 0; j < server.bindaddr_count; j++) s = sdscatfmt(s, "%s ", server.bindaddr[j]);
+    return s;
+}
+
+/* CONFIG SET bind/port under takeover: Rust cannot re-bind, so only a set
+ * to the startup value is accepted (CONFIG SET of the current value, as in
+ * "CONFIG sanity"). */
+int rustIoListenerUnchanged(void) {
+    if (!rust_started || server.port != rust_started) return 0;
+    sds cur = rustIoJoinBind();
+    int same = rust_bind_at_start && sdscmp(cur, rust_bind_at_start) == 0;
+    sdsfree(cur);
+    return same;
+}
 
 /* ---------------------------------------------------------------------------
  * Callbacks from Rust IO threads. Allocation only; no engine state.
@@ -350,11 +369,7 @@ static int connRustProcessPendingData(void) {
      * its batch in Rust's main-thread list, behind an eventfd that was
      * already drained. processEventsWhileBlocked() reaches it only here
      * (SCRIPT KILL from a connection in the same batch never ran). */
-    int processed = 0;
-    if (rust_started) {
-        vio_main_take_ready();
-        processed = rustIoDrainReady();
-    }
+    int processed = rust_started ? rustIoDrainReady() : 0;
     if (!rust_stalled || listLength(rust_stalled) == 0) return processed;
     unsigned long n = listLength(rust_stalled);
     uint64_t *ids = zmalloc(sizeof(uint64_t) * n);
@@ -606,6 +621,7 @@ int rustIoInitListeners(void) {
         serverPanic("Unrecoverable error creating rust-io event handler.");
     rust_stalled = listCreate();
     rust_started = port;
+    rust_bind_at_start = rustIoJoinBind();
     serverLog(LL_NOTICE, "Rust IO layer listening on %s:%d with %d thread(s)%s%s",
               cfg.bindaddr ? cfg.bindaddr : "*", port, rust_io_config.threads,
               rust_io_config.mode != RUST_IO_MODE_EXEC                ? ""
@@ -625,9 +641,14 @@ int rustIoBeforePoll(int sleeping) {
     return sleeping ? vio_main_before_poll() : 0;
 }
 
-/* afterSleep(). */
+/* End of afterSleep(), where rustIoEventHandler() would run next: take the
+ * connections handed over while the main thread was awake (no eventfd was
+ * written for them). Not earlier in beforeSleep(): running them there
+ * delays the replies of the batch just executed, and a single IO thread
+ * waits for those. */
 void rustIoAfterPoll(void) {
-    if (rust_started) vio_main_after_poll();
+    if (!rust_started) return;
+    if (vio_main_after_poll()) rustIoDrainReady();
 }
 
 void rustIoLogReady(void) {
