@@ -823,3 +823,130 @@ and the measurements are on branch `rust-io/exec` (and `rust-io/integrate`,
 `src/rust/valkey-io/DESIGN.md` "Stage 3"). Ideas that survive as ideas:
 `defer_to_main` as a prototype for shard routing, and rtc's lock-busy
 93-95% at saturation as the cost model for a single engine.
+
+# Iteration 1: boundary changes
+
+## Crate layout (steps 4-6)
+
+All `unsafe` lives in `src/ffi/` (exports, `ConnHandle`/`ConnRef`, the
+Send/Sync claims, the engine limit-pointer reads) and `src/sys.rs`
+(syscalls). The crate root has `#![deny(unsafe_code, unsafe_op_in_unsafe_fn)]`;
+test modules that build raw callbacks opt out locally. Every export is
+`unsafe extern "C"` with a `# Safety` contract. `ConnHandle` is the
+engine's strong reference (Drop releases it); `ConnRef` is a borrow for one
+call. The Makefile's cargo rule runs `cargo clippy -- -D warnings` first.
+
+## connection_external.c (step 12)
+
+The engine-side transport for IO-layer connections is ConnectionType
+"external" (`src/connection_external.{c,h}`). It forwards writev, close,
+shutdown, write/read-handler changes and the beforeSleep pending-data hooks
+through `externalConnOps`, which `rust_io.c` registers with
+`connExternalAttach()` when the layer starts (not registered when
+`rust-io-mode off`). The transport has no Rust types in it; `rust_io.c` is
+the only file that includes `valkey_io.h` besides the timing build.
+
+# Iteration 1: zero-copy replies and argv return
+
+## Zero-copy replies (plan steps 22-23)
+
+Before: every reply byte was copied on the main thread into the Rust
+outbound buffer (`vio_conn_writev`, `ffi/exports.rs`), from `c->buf`, the
+reply blocks and, for strings of 16 KiB or more, from the value itself
+(`isCopyAvoidPreferred()` makes those `BULK_STR_REF`s when `io-threads` is
+1, `networking.c:308`).
+
+Now an external connection offloads its writes the way a C IO thread does,
+with the same contract and the same engine code:
+
+1. Seal (engine thread). `trySendWriteToIOThreads()` hands external
+   connections to `rustIoTrySendWrite()` (`rust_io.c`). It snapshots
+   `io_last_reply_block`/`io_last_bufpos` exactly as the C path does for a
+   non-replica client, sets `io_write_state = CLIENT_PENDING_IO` and passes
+   the client pointer as the job to `vio_conn_submit_write()`. The sealed
+   chunk is everything up to the snapshot; the engine may keep appending
+   after it.
+2. Write (IO thread). The connection's IO thread first writes every copied
+   byte queued ahead of the job, then calls the `write_job` callback, which
+   runs `_writeToClient()` with `inMainThread()` false
+   (`ioThreadsEnterExternal()`), so `writevToClient()` builds the iovec from
+   the snapshot (payload headers, bulk-string references, prefixes) and the
+   connection's writev goes straight to the socket. This is
+   `ioThreadWriteToClient()` (`networking.c`). The iovec is built on the IO
+   thread, as in C, rather than on the main thread: it is the only choice
+   that removes the main thread's per-reply iovec walk too, and it reuses
+   the existing builder unchanged.
+3. Complete (IO thread to engine). The job sets `CLIENT_COMPLETED_IO` and is
+   queued with the ready connections (`Ready.done`, one lock and one wakeup
+   per IO-thread iteration). The engine takes it in `rustIoDrainDone()` and
+   runs `processClientIOWriteDone()`, i.e. `_postWriteToClient()` and
+   `releaseBufReferences()` on the engine thread, because they drop robj
+   refcounts and trim the reply list.
+
+Rules, each inherited from the C IO threads rather than re-invented:
+
+- One chunk in flight per connection (`io_write_state`); `Conn.job` asserts it.
+- The main thread never touches an in-flight block: every path that
+  rewrites the reply tail or resizes `c->buf` already checks
+  `io_write_state != CLIENT_PENDING_IO` (`networking.c:1149-1255`,
+  `server.c:1042`, `server.c:1296`).
+- `freeClient()` defers while `clientHasPendingIO()`, and
+  `freeClientsInAsyncFreeQueue()` skips such clients, so a client is never
+  freed with a job outstanding. `waitForClientIO()` (CLIENT LIST, logging)
+  first hands the batched kicks to the IO threads, because a job can still
+  sit in the main thread's kick batch.
+- Every job comes back exactly once. The IO thread completes it after a
+  write (`can_write` 1), and unwritten (`can_write` 0, the engine sees a
+  write error and re-arms its write handler) when copied bytes ahead of it
+  are blocked, when the peer is gone (`peer_gone`), or when the connection
+  was already removed. `INFO rust_io` reports `rust_io_writes_submitted`
+  and `rust_io_writes_outstanding`; the engine asserts the latter never goes
+  negative and that each returned job is `CLIENT_COMPLETED_IO`.
+- EAGAIN: the job returns with the write-error flag, the engine installs its
+  write handler, and Rust reports `VIO_EV_WRITABLE` only after the socket
+  reports EPOLLOUT (`Local.sock_blocked`), not on the copied-bytes low
+  watermark.
+- Bytes in flight stay in `c->reply`/`c->buf` until released, so
+  `client-output-buffer-limit`, `CLIENT LIST omem` and client eviction see
+  them.
+
+Threshold. `rust-io-zero-copy-min-bytes` (modifiable): a write is offloaded
+when the reply list is non-empty, `c->buf` holds bulk-string references, or
+`c->bufpos` is at least the threshold. -1 always copies (step 22's
+behaviour). The default is chosen from the size sweep (ITERATIONS.md).
+
+Scope. Replica, primary and slot-migration connections stay on the copy
+path (`getClientType()` check in `rustIoTrySendWrite()`): their output is
+the shared replication backlog with its own refcounting
+(`io_last_reply_block` points into `server.repl_buffer_blocks` there). The
+RDB channel and Lua-debugger clients also copy. B5 (`rustIoFlushReplicas()`)
+is unaffected: it waits for copied replica bytes only.
+
+Durability fences (#3381, not in this tree). `vio_conn_submit_write()`
+carries `release_offset` (0 today; Rust asserts it). With #3381 the engine
+would seal at most up to the first reply whose
+`computeCommandBlockingOffset()` exceeds the durable offset (the snapshot
+point is already a parameter of the seal), stamp the chunk with that
+offset, and the IO thread would run the job only once
+`durable.load(Acquire) >= release_offset`, holding later jobs behind it.
+`ioOps.durable_advanced` (api-analysis.md section 4) would store the offset
+and kick the connections that hold fenced jobs. Held bytes stay in
+`c->reply`, so the output buffer limit still bounds them.
+
+## Executed argv freed on the IO thread that built it (plan step 19)
+
+`tryOffloadFreeArgvToIOThreads()` hands external connections to
+`rustIoTryOffloadFreeArgv()`, which applies the C rule (objects with
+refcount > 1 are decremented on the main thread and set to NULL) and passes
+the array to `vio_conn_return_argv()`. Rust queues it per IO thread on the
+main thread and hands it over with the kicks in `vio_main_flush_kicks()`
+(one inbox lock per IO thread per iteration; early at 256 entries). The IO
+thread frees it through `free_argv`, which skips NULL entries.
+
+Cases: `original_argv` goes through the same hook (`freeClientOriginalArgv`
+calls `tryOffloadFreeArgvToIOThreads` too), and a rewritten `c->argv` is
+main-thread memory, which `freeClientArgv()` already frees locally.
+MULTI-queued argv is freed by `freeClientMultiState()` on the main thread,
+as in C. A blocked client keeps its argv until it runs. A client freed with
+argv already returned is fine: the queued arrays belong to the IO thread,
+not to the connection.

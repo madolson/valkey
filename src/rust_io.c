@@ -16,6 +16,7 @@
 #include "rust_io.h"
 #include "rust_io_timing.h"
 #include "connection_external.h"
+#include "io_threads.h"
 
 #ifdef USE_RUST_IO
 
@@ -23,8 +24,9 @@
 
 /* Not exported through server.h. */
 void trimCommandQueue(client *c);
+int _writeToClient(client *c);
 
-rustIoConfig rust_io_config = {RUST_IO_MODE_OFF, 0, 1, 0};
+rustIoConfig rust_io_config = {RUST_IO_MODE_OFF, 0, 1, 0, -1};
 int rust_io_precheck_active = 0;
 
 configEnum rust_io_mode_enum[] = {
@@ -261,6 +263,107 @@ static void rustIoDeliver(rustConnection *rc) {
 }
 
 /* ---------------------------------------------------------------------------
+ * Zero-copy replies (DESIGN.md "Zero-copy replies")
+ *
+ * The contract is the C IO threads' (trySendWriteToIOThreads(),
+ * ioThreadWriteToClient(), processClientIOWriteDone()): the engine seals the
+ * reply chunk by snapshotting io_last_reply_block/io_last_bufpos, marks the
+ * client CLIENT_PENDING_IO and hands it to the connection's IO thread. That
+ * thread builds the iovec with _writeToClient() and writes from engine
+ * memory; the engine releases what was written (_postWriteToClient()) when
+ * the job comes back. Every engine path that would touch an in-flight block
+ * already checks io_write_state, and freeClient() defers while it is not
+ * idle.
+ * ------------------------------------------------------------------------- */
+
+/* Set on a Rust IO thread while it runs a zero-copy write job: the
+ * connection's writev goes to the socket directly. */
+static _Thread_local int rust_direct_fd = -1;
+
+/* Jobs handed to Rust and not yet returned (must be 0 when idle). */
+static long long rust_writes_outstanding = 0;
+static unsigned long long rust_writes_submitted = 0;
+
+int rustIoTrySendWrite(client *c) {
+    rustConnection *rc = (rustConnection *)c->conn;
+    if (rust_io_config.zero_copy_min < 0 || !rc->h) return C_ERR;
+    if (c->io_write_state != CLIENT_IDLE) return C_OK; /* already in flight */
+    if (c->io_read_state != CLIENT_IDLE) return C_ERR;
+    if (!clientHasPendingReplies(c)) return C_ERR;
+    /* Replicas, primary and slot-migration links keep the copy path: their
+     * output lives in the shared replication backlog blocks. */
+    int type = getClientType(c);
+    if ((type != CLIENT_TYPE_NORMAL && type != CLIENT_TYPE_PUBSUB) || c->flag.lua_debug) return C_ERR;
+    /* Small replies are copied (the token round trip costs more than the
+     * copy). Referenced bulk strings (buf_encoded) and reply blocks are
+     * always large. */
+    if (!c->flag.buf_encoded && listLength(c->reply) == 0 && (long long)c->bufpos < (long long)rust_io_config.zero_copy_min) return C_ERR;
+
+    /* Seal: as trySendWriteToIOThreads() for a non-replica. */
+    c->io_last_reply_block = listLast(c->reply);
+    if (c->io_last_reply_block) {
+        clientReplyBlock *block = (clientReplyBlock *)listNodeValue(c->io_last_reply_block);
+        c->io_last_bufpos = block->used;
+    } else {
+        c->io_last_bufpos = (size_t)c->bufpos;
+    }
+    c->write_flags = 0;
+    c->io_write_state = CLIENT_PENDING_IO;
+    RUST_IO_TIMING_WRITEV(c->conn); /* stage "reply_copied": handed over */
+    rust_writes_outstanding++;
+    rust_writes_submitted++;
+    vio_conn_submit_write(rc->h, c, 0);
+    return C_OK;
+}
+
+/* Rust IO thread: write the sealed chunk (ioThreadWriteToClient()). */
+static int rustIoWriteJob(void *job, int fd, int can_write) {
+    client *c = job;
+    int r = 0;
+    c->nwritten = 0;
+    if (can_write) {
+        ioThreadsEnterExternal(1);
+        rust_direct_fd = fd;
+        _writeToClient(c);
+        rust_direct_fd = -1;
+        ioThreadsEnterExternal(0);
+        if (!(c->write_flags & WRITE_FLAGS_WRITE_ERROR))
+            r = 1;
+        else
+            r = connGetState(c->conn) == CONN_STATE_CONNECTED ? 0 : -1;
+    } else {
+        /* Not written: the engine re-arms its write handler. */
+        c->write_flags |= WRITE_FLAGS_WRITE_ERROR;
+    }
+    atomic_thread_fence(memory_order_release);
+    c->io_write_state = CLIENT_COMPLETED_IO;
+    return r;
+}
+
+/* Engine thread: release what the IO thread wrote. */
+static void rustIoDrainDone(void) {
+    void *job;
+    while ((job = vio_main_next_done()) != NULL) {
+        client *c = job;
+        rust_writes_outstanding--;
+        serverAssert(rust_writes_outstanding >= 0 && c->io_write_state == CLIENT_COMPLETED_IO);
+        processClientIOWriteDone(c);
+    }
+}
+
+void rustIoFlushKicks(void) {
+    if (rust_started) vio_main_flush_kicks();
+}
+
+sds rustIoCatInfo(sds info) {
+    return sdscatprintf(info,
+                        "rust_io_zero_copy_min_bytes:%d\r\n"
+                        "rust_io_writes_submitted:%llu\r\n"
+                        "rust_io_writes_outstanding:%lld\r\n",
+                        rust_io_config.zero_copy_min, rust_writes_submitted, rust_writes_outstanding);
+}
+
+/* ---------------------------------------------------------------------------
  * Accept and readiness
  * ------------------------------------------------------------------------- */
 
@@ -326,6 +429,7 @@ static void rustIoHandleReady(const VioConn *h) {
 static int rustIoDrainReady(void) {
     const VioConn *h;
     int n = 0;
+    rustIoDrainDone();
     while ((h = vio_main_next_ready()) != NULL) {
         rustIoHandleReady(h);
         vio_conn_release(h);
@@ -403,6 +507,7 @@ static int connRustHasPendingData(void) {
 
 static ssize_t rustExtWritev(connection *conn, const struct iovec *iov, int iovcnt) {
     rustConnection *rc = (rustConnection *)conn;
+    if (rust_direct_fd >= 0) return writev(rust_direct_fd, iov, iovcnt);
     if (!rc->h) {
         errno = EBADF;
         return -1;
@@ -466,7 +571,7 @@ int rustIoInitListeners(void) {
         .threads = rust_io_config.threads,
         .proto_max_bulk_len = &server.proto_max_bulk_len,
         .client_max_querybuf_len = &server.client_max_querybuf_len,
-        .cbs = {.create_argv = rustIoCreateArgv, .free_argv = rustIoFreeArgv},
+        .cbs = {.create_argv = rustIoCreateArgv, .free_argv = rustIoFreeArgv, .write_job = rustIoWriteJob},
     };
     rust_io_precheck_active = rust_io_config.mode == RUST_IO_MODE_PRECHECK;
     if (rust_io_precheck_active) {

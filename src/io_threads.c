@@ -129,6 +129,13 @@ void drainIOThreadsQueue(void) {
     }
 }
 
+/* An external IO layer's thread is about to run engine write code
+ * (_writeToClient) for a client it was handed: inMainThread() must be false
+ * there, as on an engine IO thread. */
+void ioThreadsEnterExternal(int on) {
+    thread_id = on ? -1 : 0;
+}
+
 /* Returns if there is an IO operation in progress for the given client. */
 int clientHasPendingIO(client *c) {
     return c->io_read_state != CLIENT_IDLE || c->io_write_state != CLIENT_IDLE;
@@ -138,6 +145,10 @@ int clientHasPendingIO(client *c) {
 void waitForClientIO(client *c) {
     /* No need to wait if the client was not offloaded to the IO thread. */
     if (c->io_read_state == CLIENT_IDLE && c->io_write_state == CLIENT_IDLE) return;
+#ifdef USE_RUST_IO
+    /* The job may still sit in the main thread's batched kicks. */
+    if (c->io_write_state == CLIENT_PENDING_IO && c->conn && connIsExternal(c->conn)) rustIoFlushKicks();
+#endif
 
     /* Wait for read operation to complete if pending. */
     while (c->io_read_state == CLIENT_PENDING_IO) {
@@ -744,11 +755,12 @@ int trySendReadToIOThreads(client *c) {
  * Returns C_OK if the client's writes were successfully offloaded to an I/O thread,
  * or C_ERR if the client is not eligible for offloading. */
 int trySendWriteToIOThreads(client *c) {
+#ifdef USE_RUST_IO
+    /* External connections offload to their own IO layer (zero-copy). */
+    if (c->conn && connIsExternal(c->conn)) return rustIoTrySendWrite(c);
+#endif
     if (server.active_io_threads_num <= 1) return C_ERR;
     if (!c->conn) return C_ERR;
-#ifdef USE_RUST_IO
-    if (connIsExternal(c->conn)) return C_ERR;
-#endif
     /* The I/O thread is already writing for this client. */
     if (c->io_write_state != CLIENT_IDLE) return C_OK;
     if (c->io_read_state == CLIENT_PENDING_IO) return C_ERR;

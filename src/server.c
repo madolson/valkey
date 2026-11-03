@@ -7262,6 +7262,7 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
     if (dictFind(section_dict, "rust_io") != NULL) {
         if (sections++) info = sdscat(info, "\r\n");
         info = rustPrecheckCatInfo(info);
+        info = rustIoCatInfo(info);
     }
 #ifdef RUST_IO_TIMING
     if (dictFind(section_dict, "rust_io_timing") != NULL) {

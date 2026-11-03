@@ -138,6 +138,7 @@ mod tests {
         VioCallbacks {
             create_argv: t_create,
             free_argv: t_free,
+            write_job: None,
             precheck_begin: Some(t_begin),
             precheck_end: Some(t_end),
             precheck_cmd: Some(t_check),

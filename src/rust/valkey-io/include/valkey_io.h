@@ -37,6 +37,9 @@ typedef struct VioCallbacks {
     void **(*create_argv)(const unsigned char *const *ptrs, const size_t *lens, int argc);
     /* Free an argv from create_argv that never reached the engine. */
     void (*free_argv)(void **argv, int argc);
+    /* Zero-copy replies, on the IO thread: write the sealed chunk of job to
+     * fd (can_write 0: only complete it). 1 written, 0 would block, -1 error. */
+    int (*write_job)(void *job, int fd, int can_write);
     /* Precheck mode only (NULL otherwise). begin/end bracket one parsed
      * batch and pin the policy snapshot for this IO thread. precheck_cmd
      * fills cmd/slot/read_flags/token and returns 1 for a session barrier. */
@@ -111,6 +114,8 @@ int vio_main_has_ready(void);
 /* Next ready connection, or NULL. Each handle carries one reference the
  * caller must vio_conn_release(). */
 const VioConn *vio_main_next_ready(void);
+/* Next completed zero-copy write job of the current batch, or NULL. */
+void *vio_main_next_done(void);
 
 /* Per connection, main thread only. */
 /* Returns a new reference to h. */
@@ -125,6 +130,9 @@ size_t vio_conn_pending_cmds(const VioConn *h);
 /* Bytes accepted by vio_conn_writev() not yet written to the socket. */
 size_t vio_conn_pending_out(const VioConn *h);
 ssize_t vio_conn_writev(const VioConn *h, const struct iovec *iov, int iovcnt);
+/* Zero-copy: write the sealed reply chunk of job from engine memory; job
+ * comes back once through write_job and vio_main_next_done(). */
+void vio_conn_submit_write(const VioConn *h, void *job, uint64_t release_offset);
 void vio_conn_want_writable(const VioConn *h, int on);
 void vio_conn_set_auth_required(const VioConn *h, int on);
 void vio_conn_set_session(const VioConn *h, const VioSession *s);

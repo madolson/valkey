@@ -109,6 +109,15 @@ pub unsafe extern "C" fn vio_main_next_ready() -> Option<ConnHandle> {
     })
 }
 
+/// Next completed zero-copy write job from the current batch, or NULL.
+///
+/// # Safety
+/// Engine thread only (the thread that called vio_start()).
+#[no_mangle]
+pub unsafe extern "C" fn vio_main_next_done() -> *mut c_void {
+    MAIN_DONE.with(|d| d.borrow_mut().pop_front()).unwrap_or(0) as *mut c_void
+}
+
 /// Whether the current batch still holds connections. True inside a long
 /// command (script, module) that was started from vio_main_next_ready():
 /// the rest of that batch is only reachable through this list, because the
@@ -118,7 +127,7 @@ pub unsafe extern "C" fn vio_main_next_ready() -> Option<ConnHandle> {
 /// Engine thread only (the thread that called vio_start()).
 #[no_mangle]
 pub unsafe extern "C" fn vio_main_has_ready() -> c_int {
-    MAIN_READY.with(|r| !r.borrow().is_empty()) as c_int
+    (MAIN_READY.with(|r| !r.borrow().is_empty()) || MAIN_DONE.with(|d| !d.borrow().is_empty())) as c_int
 }
 
 /// A new strong reference to `h`.
@@ -256,6 +265,30 @@ pub unsafe extern "C" fn vio_conn_writev(h: ConnRef<'_>, iov: *const libc::iovec
         kick(&conn);
     }
     written as isize
+}
+
+/// Hand the IO thread a sealed reply chunk to write from engine memory
+/// (zero-copy). `job` comes back exactly once, through write_job on the IO
+/// thread and then vio_main_next_done(). `release_offset` is the durable
+/// offset the chunk's replies depend on; 0 means none (the only value used
+/// until a durability fence exists, see DESIGN.md "Zero-copy replies").
+///
+/// # Safety
+/// `h` must be a live handle with no job in flight; `job` stays valid until
+/// it is returned.
+#[no_mangle]
+pub unsafe extern "C" fn vio_conn_submit_write(h: ConnRef<'_>, job: *mut c_void, release_offset: u64) {
+    assert_eq!(release_offset, 0, "durability fences are not implemented");
+    #[cfg(feature = "timing")]
+    {
+        let t = crate::timing::take_next_write();
+        if t != 0 && h.trace.compare_exchange(0, t, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+            crate::timing::drop_trace(t);
+        }
+    }
+    let prev = h.job.swap(job as usize, Ordering::AcqRel);
+    assert_eq!(prev, 0, "one write job per connection");
+    kick(&h.arc());
 }
 
 /// The engine wants VIO_EV_WRITABLE once outbound bytes drop below the low

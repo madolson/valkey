@@ -22,6 +22,8 @@ typedef struct rustIoConfig {
     int port;     /* 0 = disabled (unless takeover) */
     int threads;  /* Rust IO threads */
     int takeover; /* Rust binds 'port'; the C TCP listener is not created */
+    int zero_copy_min; /* replies of at least this many bytes are written by the IO thread from
+                        * engine memory; -1 = always copy (DESIGN.md "Zero-copy replies") */
 } rustIoConfig;
 
 extern rustIoConfig rust_io_config;
@@ -36,6 +38,12 @@ int rustIoInitListeners(void);
 void rustIoLogReady(void);
 int rustIoBeforePoll(int sleeping);
 void rustIoAfterPoll(void);
+struct client;
+/* trySendWriteToIOThreads() for external connections. */
+int rustIoTrySendWrite(struct client *c);
+/* waitForClientIO(): hand batched kicks to the IO threads first. */
+void rustIoFlushKicks(void);
+sds rustIoCatInfo(sds info);
 /* Wait up to timeout_ms for Rust to write what replicas were handed. */
 void rustIoFlushReplicas(long long timeout_ms);
 

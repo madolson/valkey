@@ -38,6 +38,14 @@ pub struct VioCallbacks {
     pub create_argv: extern "C" fn(ptrs: *const *const u8, lens: *const usize, argc: c_int) -> *mut *mut c_void,
     /// Free an argv built by create_argv that the engine never consumed.
     pub free_argv: extern "C" fn(argv: *mut *mut c_void, argc: c_int),
+    /// Zero-copy replies: write the sealed reply chunk of `job` (an engine
+    /// session, see vio_conn_submit_write) to `fd`, from engine memory, on
+    /// the IO thread. `can_write` 0: do not write (copied bytes are still
+    /// queued ahead of it, or the peer is gone), only complete. Returns 1
+    /// when the chunk was written, 0 when the socket would block, -1 on a
+    /// socket error. The job is complete when this returns; the engine
+    /// releases it on its own thread (vio_main_next_done). NULL disables.
+    pub write_job: Option<extern "C" fn(job: *mut c_void, fd: c_int, can_write: c_int) -> c_int>,
     /// Precheck mode only (cut point 2), NULL otherwise. See precheck.rs.
     pub precheck_begin: Option<precheck::BeginFn>,
     pub precheck_end: Option<precheck::EndFn>,
@@ -115,6 +123,9 @@ pub struct Conn {
     parse_held: AtomicBool,
     /// Bytes accepted from the engine and not yet written to the socket.
     out_bytes: AtomicUsize,
+    /// Zero-copy write job in flight (engine pointer), 0 if none. Set by
+    /// the engine thread, taken by the IO thread. At most one.
+    job: AtomicUsize,
     shared: Mutex<Shared>,
     /// Engine session mirror (precheck mode).
     session: precheck::SessionCell,
@@ -157,6 +168,14 @@ struct IoThread {
     inbox: Mutex<Vec<Msg>>,
 }
 
+/// What the IO threads hand the engine thread: connections with work, and
+/// completed zero-copy write jobs.
+#[derive(Default)]
+struct Ready {
+    conns: Vec<Arc<Conn>>,
+    done: Vec<usize>,
+}
+
 struct Global {
     cbs: VioCallbacks,
     limits: LimitPtrs,
@@ -169,7 +188,7 @@ struct Global {
     main_sleeping: AtomicBool,
     /// `ready` has entries that the main thread has not taken yet.
     main_pending: AtomicBool,
-    ready: Mutex<Vec<Arc<Conn>>>,
+    ready: Mutex<Ready>,
     listen_fd: RawFd,
 }
 
@@ -287,6 +306,9 @@ struct Local {
     proto_err: bool,
     wbuf: Vec<u8>,
     woff: usize,
+    /// The last zero-copy write would have blocked: wait for EPOLLOUT
+    /// before reporting VIO_EV_WRITABLE.
+    sock_blocked: bool,
     registered: bool,
     interest: u32,
 }
@@ -296,6 +318,8 @@ struct Worker {
     slab: Vec<Option<Local>>,
     free: Vec<usize>,
     to_notify: Vec<Arc<Conn>>,
+    /// Write jobs completed in this poll iteration.
+    done: Vec<usize>,
     rr: usize,
 }
 
@@ -316,12 +340,45 @@ impl Worker {
     /// Hand everything gathered in this poll iteration to the main thread
     /// with a single wakeup.
     fn flush_notify(&mut self) {
-        if self.to_notify.is_empty() {
+        if self.to_notify.is_empty() && self.done.is_empty() {
             return;
         }
         let g = global();
-        g.ready.lock().unwrap().append(&mut self.to_notify);
+        {
+            let mut r = g.ready.lock().unwrap();
+            r.conns.append(&mut self.to_notify);
+            r.done.append(&mut self.done);
+        }
         wake_main(g);
+    }
+
+    /// Run and complete the connection's write job, if any. Writes only
+    /// when every copied byte ahead of it is on the socket and the peer is
+    /// still there; otherwise the engine gets it back unwritten.
+    fn run_job(&mut self, idx: usize) {
+        let l = match self.slab[idx].as_mut() {
+            Some(l) => l,
+            None => return,
+        };
+        let job = l.conn.job.swap(0, Ordering::AcqRel);
+        if job == 0 {
+            return;
+        }
+        let can = !l.conn.peer_closed.load(Ordering::Acquire) && l.woff == l.wbuf.len();
+        let r = (global().cbs.write_job.expect("write_job"))(job as *mut c_void, l.conn.fd, can as c_int);
+        #[cfg(feature = "timing")]
+        if l.woff == l.wbuf.len() {
+            let t = l.conn.trace.swap(0, Ordering::Relaxed);
+            if t != 0 {
+                timing::complete(t);
+            }
+        }
+        /* Would block, or copied bytes still wait for the socket: report
+         * VIO_EV_WRITABLE only after EPOLLOUT. */
+        if (can && r == 0) || (!can && !l.conn.peer_closed.load(Ordering::Acquire)) {
+            l.sock_blocked = true;
+        }
+        self.done.push(job);
     }
 
     fn add_conn(&mut self, fd: RawFd) {
@@ -340,6 +397,7 @@ impl Worker {
             auth_required: AtomicBool::new(DEFAULT_AUTH_REQUIRED.load(Ordering::Relaxed)),
             parse_held: AtomicBool::new(false),
             out_bytes: AtomicUsize::new(0),
+            job: AtomicUsize::new(0),
             shared: Mutex::new(Shared { cmds: VecDeque::new(), out: Vec::new() }),
             session: precheck::SessionCell::new(),
             #[cfg(feature = "timing")]
@@ -363,6 +421,7 @@ impl Worker {
             proto_err: false,
             wbuf: Vec::new(),
             woff: 0,
+            sock_blocked: false,
             registered: true,
             interest: libc::EPOLLIN as u32,
         });
@@ -392,7 +451,7 @@ impl Worker {
         if !c.read_paused.load(Ordering::Acquire) && !c.c_closed.load(Ordering::Acquire) && !l.proto_err {
             want |= libc::EPOLLIN as u32;
         }
-        if l.woff < l.wbuf.len() {
+        if l.woff < l.wbuf.len() || l.sock_blocked {
             want |= libc::EPOLLOUT as u32;
         }
         if want != l.interest {
@@ -415,6 +474,7 @@ impl Worker {
             l.conn.clone()
         };
         conn.peer_closed.store(true, Ordering::Release);
+        self.run_job(idx);
         if conn.c_closed.load(Ordering::Acquire) {
             self.remove(idx);
         } else {
@@ -603,6 +663,7 @@ impl Worker {
         };
         let conn = l.conn.clone();
         if conn.peer_closed.load(Ordering::Acquire) {
+            self.run_job(idx);
             return;
         }
         let mut failed = false;
@@ -650,9 +711,14 @@ impl Worker {
             self.peer_gone(idx);
             return;
         }
+        self.run_job(idx);
+        let blocked = self.slab[idx].as_ref().is_some_and(|l| l.sock_blocked);
         /* Level triggered, like a socket write handler: keep firing after
          * each flush while the engine keeps its handler installed. */
-        if conn.want_writable.load(Ordering::Acquire) && conn.out_bytes.load(Ordering::Acquire) < OUT_LOW {
+        if !blocked
+            && conn.want_writable.load(Ordering::Acquire)
+            && conn.out_bytes.load(Ordering::Acquire) < OUT_LOW
+        {
             self.notify(&conn, VIO_EV_WRITABLE);
         }
         self.update_interest(idx);
@@ -663,7 +729,15 @@ impl Worker {
         let idx = conn.token.load(Ordering::Relaxed);
         match self.slab.get(idx) {
             Some(Some(l)) if Arc::ptr_eq(&l.conn, &conn) => {}
-            _ => return,
+            _ => {
+                /* Removed already: hand a job back unwritten. */
+                let job = conn.job.swap(0, Ordering::AcqRel);
+                if job != 0 {
+                    (global().cbs.write_job.expect("write_job"))(job as *mut c_void, conn.fd, 0);
+                    self.done.push(job);
+                }
+                return;
+            }
         }
         if conn.c_closed.load(Ordering::Acquire) && conn.peer_closed.load(Ordering::Acquire) {
             self.remove(idx);
@@ -691,6 +765,9 @@ impl Worker {
 
     fn on_event(&mut self, idx: usize, mask: u32) {
         if mask & (libc::EPOLLOUT as u32) != 0 {
+            if let Some(l) = self.slab[idx].as_mut() {
+                l.sock_blocked = false;
+            }
             self.flush(idx);
             /* A closing connection is released once its output drains. */
             if let Some(l) = self.slab[idx].as_ref() {
@@ -842,7 +919,7 @@ fn start(bind: Option<String>, port: c_int, threads: c_int, cbs: VioCallbacks, l
         main_signaled: AtomicBool::new(false),
         main_sleeping: AtomicBool::new(true),
         main_pending: AtomicBool::new(false),
-        ready: Mutex::new(Vec::new()),
+        ready: Mutex::new(Ready::default()),
         listen_fd,
     };
     if GLOBAL.set(g).is_err() {
@@ -853,7 +930,7 @@ fn start(bind: Option<String>, port: c_int, threads: c_int, cbs: VioCallbacks, l
         HANDOFF_DISABLE.store(v, Ordering::Relaxed);
     }
     for idx in 0..nthreads {
-        let w = Worker { idx, slab: Vec::new(), free: Vec::new(), to_notify: Vec::new(), rr: 0 };
+        let w = Worker { idx, slab: Vec::new(), free: Vec::new(), to_notify: Vec::new(), done: Vec::new(), rr: 0 };
         std::thread::Builder::new()
             .name(format!("rust-io-{}", idx))
             .spawn(move || w.run())
@@ -868,6 +945,8 @@ fn start(bind: Option<String>, port: c_int, threads: c_int, cbs: VioCallbacks, l
 
 thread_local! {
     static MAIN_READY: RefCell<VecDeque<Arc<Conn>>> = const { RefCell::new(VecDeque::new()) };
+    /// Completed write jobs taken with the current batch.
+    static MAIN_DONE: RefCell<VecDeque<usize>> = const { RefCell::new(VecDeque::new()) };
 }
 
 
@@ -878,7 +957,8 @@ fn take_ready(g: &Global) -> c_int {
         return 0;
     }
     let batch = std::mem::take(&mut *g.ready.lock().unwrap());
-    MAIN_READY.with(|r| r.borrow_mut().extend(batch));
+    MAIN_READY.with(|r| r.borrow_mut().extend(batch.conns));
+    MAIN_DONE.with(|d| d.borrow_mut().extend(batch.done));
     1
 }
 
