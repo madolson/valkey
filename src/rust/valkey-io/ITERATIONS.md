@@ -545,3 +545,12 @@ EXIT 0
 ```
 
 Verdict: KEEP.
+
+## Final (iteration 3a)
+
+iter2 HEAD vs final, same session, fresh server per rep, alternated
+(`~/rust-io/iter3a/m/final-table.md`; report `~/rust-io/iter3a/report.md`):
+precheck GET -P 16 2.58M -> 2.78M (T=4, now +0.1% vs C's 2.77M),
+2.49M -> 2.84M (T=8), 1.99M -> 2.52M (T=16); SET -P 16 +1.0% / +1.5% /
++11.8%. Q4 T=4 main thread: precheck 386 -> 365 ns/req (C 375),
+handoff/drain 38 -> 32 ns, glibc arena futex 1.2% -> 0.
