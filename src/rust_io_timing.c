@@ -109,8 +109,8 @@ void ritWritev(connection *conn) {
     }
 }
 
-static const char *rit_names[] = {"read",     "parsed",     "argv",      "precheck",     "enqueued", "dequeued",
-                                  "process_entry", "call_entry", "call_exit", "reply_copied", "written",  "end_to_end"};
+static const char *rit_names[] = {"read", "parsed", "argv", "precheck", "enqueued", "dequeued",
+                                  "process_entry", "call_entry", "call_exit", "reply_copied", "written", "end_to_end"};
 
 sds ritCatInfo(sds info) {
     info = sdscatprintf(info,

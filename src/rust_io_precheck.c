@@ -39,7 +39,7 @@ const VioSession *rustIoConnSession(connection *conn);
 #define PC_MAX_THREADS 128
 
 typedef struct pcSnapshot {
-    unsigned long long epoch; /* acl_mutation_epoch the copies reflect */
+    unsigned long long epoch;  /* acl_mutation_epoch the copies reflect */
     int default_auth_required; /* authRequired() of an unauthenticated client */
     int modules;               /* module command filters registered at build time */
     int nusers;
@@ -63,9 +63,28 @@ static struct {
  * by pointer (container commands such as ACL and CLIENT have no proc of
  * their own, so a proc comparison would miss their subcommands). */
 static const char *pc_barrier_names[] = {
-    "auth", "hello", "select", "multi", "exec", "discard", "reset", "subscribe", "unsubscribe",
-    "psubscribe", "punsubscribe", "ssubscribe", "sunsubscribe", "readonly", "readwrite", "client",
-    "acl", "sync", "psync", "replconf", "quit", NULL,
+    "auth",
+    "hello",
+    "select",
+    "multi",
+    "exec",
+    "discard",
+    "reset",
+    "subscribe",
+    "unsubscribe",
+    "psubscribe",
+    "punsubscribe",
+    "ssubscribe",
+    "sunsubscribe",
+    "readonly",
+    "readwrite",
+    "client",
+    "acl",
+    "sync",
+    "psync",
+    "replconf",
+    "quit",
+    NULL,
 };
 #define PC_MAX_BARRIERS 32
 static struct serverCommand *pc_barrier_cmds[PC_MAX_BARRIERS];
@@ -73,7 +92,14 @@ static struct serverCommand *pc_barrier_cmds[PC_MAX_BARRIERS];
 /* Commands whose checks read more than (cmd, argv, session, ACL, slot):
  * EXEC reads the MULTI queue, scripts read declared script flags. */
 static serverCommandProc *pc_ineligible_procs[] = {
-    execCommand, evalCommand, evalRoCommand, evalShaCommand, evalShaRoCommand, fcallCommand, fcallroCommand, NULL,
+    execCommand,
+    evalCommand,
+    evalRoCommand,
+    evalShaCommand,
+    evalShaRoCommand,
+    fcallCommand,
+    fcallroCommand,
+    NULL,
 };
 
 static int procIn(serverCommandProc *p, serverCommandProc **set) {
@@ -213,8 +239,7 @@ static user *pcFindUser(pcSnapshot *s, void *live) {
     return NULL;
 }
 
-static int pcDecide(pcSnapshot *s, const VioSession *sess, int barrier_active, robj **argv, int argc,
-                    struct serverCommand *cmd, int rf) {
+static int pcDecide(pcSnapshot *s, const VioSession *sess, int barrier_active, robj **argv, int argc, struct serverCommand *cmd, int rf) {
     if (!s) return PC_FB_NO_SNAPSHOT;
     if (sess->gen == 0) return PC_FB_NO_SESSION;
     if (barrier_active) return PC_FB_BARRIER;
@@ -347,10 +372,19 @@ sds rustPrecheckCatInfo(sds info) {
         int code;
         const char *name;
     } names[] = {
-        {PC_FB_NO_SNAPSHOT, "no_snapshot"}, {PC_FB_BARRIER, "barrier"}, {PC_FB_MODULES, "modules"},
-        {PC_FB_INELIGIBLE, "ineligible"}, {PC_FB_MULTI, "multi"}, {PC_FB_PUBSUB, "pubsub_resp2"},
-        {PC_FB_SPECIAL_CLIENT, "special_client"}, {PC_FB_ACL_USER, "acl_user"}, {PC_FB_NO_SESSION, "no_session"}, {PC_FB_EPOCH, "epoch"},
-        {PC_FB_SESSION, "session"}, {PC_FB_MODULES_LIVE, "modules_live"}, {PC_FB_CLUSTER, "cluster"},
+        {PC_FB_NO_SNAPSHOT, "no_snapshot"},
+        {PC_FB_BARRIER, "barrier"},
+        {PC_FB_MODULES, "modules"},
+        {PC_FB_INELIGIBLE, "ineligible"},
+        {PC_FB_MULTI, "multi"},
+        {PC_FB_PUBSUB, "pubsub_resp2"},
+        {PC_FB_SPECIAL_CLIENT, "special_client"},
+        {PC_FB_ACL_USER, "acl_user"},
+        {PC_FB_NO_SESSION, "no_session"},
+        {PC_FB_EPOCH, "epoch"},
+        {PC_FB_SESSION, "session"},
+        {PC_FB_MODULES_LIVE, "modules_live"},
+        {PC_FB_CLUSTER, "cluster"},
     };
     unsigned long long fb = 0;
     for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) fb += pc_stats.code[names[i].code];

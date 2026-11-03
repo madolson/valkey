@@ -64,12 +64,12 @@ configEnum rust_io_mode_enum[] = {
 
 typedef struct rustConnection {
     connection c;
-    VioConn *h; /* our reference; NULL once closed */
-    bool stalled;     /* in rust_stalled: commands wait in Rust */
-    int pending_err;  /* VIO_ERR_* seen but not yet replied, -1 once replied */
+    VioConn *h;      /* our reference; NULL once closed */
+    bool stalled;    /* in rust_stalled: commands wait in Rust */
+    int pending_err; /* VIO_ERR_* seen but not yet replied, -1 once replied */
     int pending_err_byte;
-    unsigned long long pulled; /* commands moved into cmd_queue so far */
-    VioSession sess;           /* session last written to Rust's view (precheck) */
+    unsigned long long pulled;       /* commands moved into cmd_queue so far */
+    VioSession sess;                 /* session last written to Rust's view (precheck) */
     unsigned long long consumed_pub; /* consumed count last published */
     int auth_pub;                    /* auth_required last published, -1 none */
     size_t job_reply_bytes;          /* c->reply_bytes sealed into the write job in flight */

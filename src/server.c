@@ -4692,7 +4692,6 @@ typedef struct commandContext {
  * a policy snapshot (rust-io precheck): NO_MULTI, ACL, cluster routing.
  * Returns 0 when the command was rejected (the reply is queued). */
 static inline int processCommandChecks(client *c, const commandContext *x) {
-
     if (c->flag.multi && c->cmd->flags & CMD_NO_MULTI) {
         sds nomulti_err =
             sdscatprintf(sdsempty(), "Command '%s' not allowed inside a transaction", c->cmd->fullname);

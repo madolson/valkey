@@ -19,9 +19,9 @@ enum {
 
 typedef struct rustIoConfig {
     int mode;
-    int port;     /* 0 = disabled (unless takeover) */
-    int threads;  /* Rust IO threads */
-    int takeover; /* Rust binds 'port'; the C TCP listener is not created */
+    int port;          /* 0 = disabled (unless takeover) */
+    int threads;       /* Rust IO threads */
+    int takeover;      /* Rust binds 'port'; the C TCP listener is not created */
     int zero_copy_min; /* replies of at least this many bytes are written by the IO thread from
                         * engine memory; -1 = always copy (DESIGN.md "Zero-copy replies") */
 } rustIoConfig;

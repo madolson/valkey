@@ -29,17 +29,17 @@ uint64_t ritTicks(void);
 void ritReset(void);
 
 /* Each hook costs one load and compare when the command is not sampled. */
-#define RUST_IO_TIMING_HOOK(c, stage)                                  \
-    do {                                                               \
-        if ((stage) == RIT_PROCESS) {                                  \
-            if (rit_nq) ritProcess(c);                                 \
-        } else if (rit_cur_c == (c)) {                                 \
-            ritCall((c), (stage));                                     \
-        }                                                              \
+#define RUST_IO_TIMING_HOOK(c, stage)  \
+    do {                               \
+        if ((stage) == RIT_PROCESS) {  \
+            if (rit_nq) ritProcess(c); \
+        } else if (rit_cur_c == (c)) { \
+            ritCall((c), (stage));     \
+        }                              \
     } while (0)
-#define RUST_IO_TIMING_WRITEV(conn)          \
-    do {                                     \
-        if (rit_nr) ritWritev((conn));       \
+#define RUST_IO_TIMING_WRITEV(conn)    \
+    do {                               \
+        if (rit_nr) ritWritev((conn)); \
     } while (0)
 #define RUST_IO_TIMING_FREE_ARGV_BEGIN() uint64_t rit_fa0 = ritTicks()
 #define RUST_IO_TIMING_FREE_ARGV_END()        \
