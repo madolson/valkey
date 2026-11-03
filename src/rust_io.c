@@ -21,6 +21,7 @@
 
 /* Not exported through server.h. */
 void trimCommandQueue(client *c);
+extern int ProcessingEventsWhileBlocked;
 
 rustIoConfig rust_io_config = {RUST_IO_MODE_OFF, 0, 1, 0};
 
@@ -323,8 +324,21 @@ static void rustIoEventHandler(aeEventLoop *el, int fd, void *privdata, int mask
 static int connRustProcessPendingData(void) {
     vio_set_default_auth_required(!(DefaultUser->flags & USER_FLAG_NOPASS) || (DefaultUser->flags & USER_FLAG_DISABLED));
     rustPrecheckPublish();
-    if (!rust_stalled || listLength(rust_stalled) == 0) return 0;
     int processed = 0;
+    /* A command run from rustIoEventHandler() that yields through
+     * processEventsWhileBlocked() (busy script, loading) leaves the rest of
+     * its ready batch undelivered. Those connections are still marked ready,
+     * so new input on them does not signal the eventfd again, and a nested
+     * event loop would never see them: SCRIPT KILL hangs. Serve them here. */
+    if (ProcessingEventsWhileBlocked) {
+        const VioConn *h;
+        while ((h = vio_main_next_ready()) != NULL) {
+            rustIoHandleReady(h);
+            vio_conn_release(h);
+            processed++;
+        }
+    }
+    if (!rust_stalled || listLength(rust_stalled) == 0) return processed;
     unsigned long n = listLength(rust_stalled);
     uint64_t *ids = zmalloc(sizeof(uint64_t) * n);
     listIter li;
