@@ -124,6 +124,13 @@ typedef struct {
    Offending byte for ProtoError::UnexpectedChar.
    */
   int err_byte;
+  /*
+   Sampled stage-timing id (RUST_IO_TIMING builds), else 0. Always
+   present: cbindgen emits a `#[cfg]` field's `;` after the `#endif`,
+   which -pedantic rejects when the feature is off. It sits in the
+   padding before argv_len_sum, so it costs no space.
+   */
+  uint32_t trace;
   size_t argv_len_sum;
   uint64_t input_bytes;
   /*
@@ -134,13 +141,6 @@ typedef struct {
   int slot;
   int read_flags;
   uint64_t token;
-#if defined(RUST_IO_TIMING)
-  /*
-   Sampled stage-timing id, 0 when not sampled.
-   */
-  uint32_t trace
-#endif
-  ;
 } VioCmd;
 
 typedef struct {

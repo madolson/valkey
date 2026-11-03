@@ -41,9 +41,7 @@ static_assert(offsetof(VioCmd, cmd) == offsetof(engineCmd, cmd), "VioCmd layout"
 static_assert(offsetof(VioCmd, slot) == offsetof(engineCmd, slot), "VioCmd layout");
 static_assert(offsetof(VioCmd, read_flags) == offsetof(engineCmd, read_flags), "VioCmd layout");
 static_assert(offsetof(VioCmd, token) == offsetof(engineCmd, token), "VioCmd layout");
-#ifdef RUST_IO_TIMING
 static_assert(offsetof(VioCmd, trace) == offsetof(engineCmd, trace), "VioCmd layout");
-#endif
 
 /* Not exported through server.h. */
 void trimCommandQueue(client *c);

@@ -84,6 +84,11 @@ pub struct VioCmd {
     pub err: c_int,
     /// Offending byte for ProtoError::UnexpectedChar.
     pub err_byte: c_int,
+    /// Sampled stage-timing id (RUST_IO_TIMING builds), else 0. Always
+    /// present: cbindgen emits a `#[cfg]` field's `;` after the `#endif`,
+    /// which -pedantic rejects when the feature is off. It sits in the
+    /// padding before argv_len_sum, so it costs no space.
+    pub trace: u32,
     pub argv_len_sum: usize,
     pub input_bytes: u64,
     /// Precheck mode: struct serverCommand *, slot, read flags and token
@@ -92,9 +97,6 @@ pub struct VioCmd {
     pub slot: c_int,
     pub read_flags: c_int,
     pub token: u64,
-    /// Sampled stage-timing id, 0 when not sampled.
-    #[cfg(feature = "timing")]
-    pub trace: u32,
 }
 
 pub const VIO_EV_NEW: u32 = 1 << 0;
@@ -968,7 +970,6 @@ impl Worker {
                         slot: -1,
                         read_flags: 0,
                         token: 0,
-                        #[cfg(feature = "timing")]
                         trace: 0,
                     };
                     #[cfg(feature = "timing")]
@@ -1001,7 +1002,6 @@ impl Worker {
                         slot: -1,
                         read_flags: 0,
                         token: 0,
-                        #[cfg(feature = "timing")]
                         trace: 0,
                     });
                     l.proto_err = true;

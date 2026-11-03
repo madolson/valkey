@@ -17,15 +17,13 @@ typedef struct engineCmd {
     int argc;
     int err; /* protocol error code (VIO_ERR_*), 0 for a command */
     int err_byte;
+    uint32_t trace; /* stage-timing id (RUST_IO_TIMING), 0 otherwise */
     size_t argv_len_sum;
     uint64_t input_bytes;
     void *cmd; /* precheck: struct serverCommand *, filled off the engine thread */
     int slot;
     int read_flags;
     uint64_t token; /* precheck token, 0 when not prechecked */
-#ifdef RUST_IO_TIMING
-    uint32_t trace;
-#endif
 } engineCmd;
 
 /* Commands in c->cmd_queue not yet executed. */
