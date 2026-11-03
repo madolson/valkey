@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Hazard tests for rust-io precheck mode.
 
-Usage: hazards.py <valkey-server binary>
+Usage: hazards.py <valkey-server binary> [server args, default: --rust-io-mode precheck]
+e.g. hazards.py src/valkey-server --rust-io-mode exec --rust-io-exec-model rtc --rust-io-threads 2
 
 Every scenario forces the ordering it needs: a command is parsed and
 prechecked by the Rust IO thread while the connection is blocked in BLPOP,
@@ -12,6 +13,7 @@ state. INFO rust_io counter deltas show which path each command took.
 import os, socket, subprocess, sys, time, shutil
 
 BIN = sys.argv[1]
+MODE = sys.argv[2:] or ["--rust-io-mode", "precheck"]
 FAILS = 0
 
 
@@ -106,7 +108,7 @@ def start(port, *extra):
     d = f"/tmp/rio-hazard-{port}"
     shutil.rmtree(d, ignore_errors=True)
     os.makedirs(d)
-    args = ["taskset", "-c", "0-7", BIN, "--port", str(port), "--rust-io-mode", "precheck", "--rust-io-takeover", "yes",
+    args = ["taskset", "-c", "0-7", BIN, "--port", str(port)] + MODE + ["--rust-io-takeover", "yes",
             "--save", "", "--appendonly", "no", "--dir", d, "--enable-debug-command", "yes"] + list(extra)
     p = subprocess.Popen(args, stdout=open(d + "/log", "w"), stderr=subprocess.STDOUT)
     for _ in range(100):

@@ -144,7 +144,7 @@ static void pcReclaim(void) {
 }
 
 void rustPrecheckPublish(void) {
-    if (rust_io_config.mode != RUST_IO_MODE_PRECHECK) return;
+    if (!rust_io_precheck_active) return;
     pcSnapshot *cur = atomic_load_explicit(&pc_current, memory_order_relaxed);
     int modules = moduleCommandFilterCount() > 0;
     if (!cur || cur->epoch != acl_mutation_epoch || cur->modules != modules) {
@@ -345,7 +345,8 @@ sds rustPrecheckCatInfo(sds info) {
                         "precheck_fallback:%llu\r\n",
                         rust_io_config.mode == RUST_IO_MODE_PRECHECK ? "precheck"
                         : rust_io_config.mode == RUST_IO_MODE_IO     ? "io"
-                                                                     : "other",
+                        : rust_io_precheck_active                    ? "exec"
+                                                                     : "exec-noprecheck",
                         pc_stats.code[PC_FAST], pc_stats.code[PC_REJECT], fb);
     for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++)
         info = sdscatprintf(info, "precheck_fallback_%s:%llu\r\n", names[i].name, pc_stats.code[names[i].code]);

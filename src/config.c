@@ -72,6 +72,7 @@ configEnum maxmemory_policy_enum[] = {
 
 #ifdef USE_RUST_IO
 extern configEnum rust_io_mode_enum[]; /* rust_io.c */
+extern configEnum rust_io_exec_model_enum[]; /* rust_io_exec.c */
 #endif
 
 configEnum syslog_facility_enum[] = {
@@ -3725,6 +3726,8 @@ standardConfig static_configs[] = {
     createIntConfig("rust-io-port", NULL, IMMUTABLE_CONFIG, 0, 65535, rust_io_config.port, 0, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("rust-io-threads", NULL, IMMUTABLE_CONFIG, 1, 128, rust_io_config.threads, 1, INTEGER_CONFIG, NULL, NULL),
     createBoolConfig("rust-io-takeover", NULL, IMMUTABLE_CONFIG, rust_io_config.takeover, 0, NULL, NULL),
+    createEnumConfig("rust-io-exec-model", NULL, IMMUTABLE_CONFIG, rust_io_exec_model_enum, rust_io_config.exec_model, RUST_IO_EXEC_HANDOFF, NULL, NULL),
+    createBoolConfig("rust-io-exec-precheck", NULL, IMMUTABLE_CONFIG, rust_io_config.exec_precheck, 1, NULL, NULL),
 #endif
 
     /* NULL Terminator, this is dropped when we convert to the runtime array. */
