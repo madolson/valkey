@@ -41,6 +41,8 @@ void rustIoAfterPoll(void);
 struct client;
 /* trySendWriteToIOThreads() for external connections. */
 int rustIoTrySendWrite(struct client *c);
+/* tryOffloadFreeArgvToIOThreads() for external connections. */
+int rustIoTryOffloadFreeArgv(struct client *c, int argc, struct serverObject **argv);
 /* waitForClientIO(): hand batched kicks to the IO threads first. */
 void rustIoFlushKicks(void);
 sds rustIoCatInfo(sds info);

@@ -1026,6 +1026,9 @@ void ioThreadFreeArgv(robj **argv) {
  * Returns C_OK if the client's argv were successfully offloaded to an IO thread,
  * C_ERR otherwise. */
 int tryOffloadFreeArgvToIOThreads(client *c, int argc, robj **argv) {
+#ifdef USE_RUST_IO
+    if (c->conn && connIsExternal(c->conn)) return rustIoTryOffloadFreeArgv(c, argc, argv);
+#endif
     if (server.active_io_threads_num <= 1 || argc == 0) {
         return C_ERR;
     }

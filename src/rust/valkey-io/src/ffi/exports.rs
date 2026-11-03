@@ -44,11 +44,17 @@ pub unsafe extern "C" fn vio_main_flush_kicks() {
         return;
     }
     MAIN_KICKS.with(|k| {
-        for (idx, list) in k.borrow_mut().iter_mut().enumerate() {
-            if !list.is_empty() {
-                flush_kicks(idx, list);
+        MAIN_ARGV.with(|a| {
+            let mut k = k.borrow_mut();
+            let mut a = a.borrow_mut();
+            let n = k.len().max(a.len());
+            if k.len() < n {
+                k.resize_with(n, Vec::new);
             }
-        }
+            for (idx, list) in k.iter_mut().enumerate() {
+                flush_thread(idx, list, a.get_mut(idx));
+            }
+        })
     });
 }
 
@@ -289,6 +295,16 @@ pub unsafe extern "C" fn vio_conn_submit_write(h: ConnRef<'_>, job: *mut c_void,
     let prev = h.job.swap(job as usize, Ordering::AcqRel);
     assert_eq!(prev, 0, "one write job per connection");
     kick(&h.arc());
+}
+
+/// Return an executed argv to the IO thread that built it, to be freed
+/// there (batched with the kicks). NULL entries are skipped.
+///
+/// # Safety
+/// `h` must be a live handle; ownership of `argv[0..argc]` moves to Rust.
+#[no_mangle]
+pub unsafe extern "C" fn vio_conn_return_argv(h: ConnRef<'_>, argv: *mut *mut c_void, argc: c_int) {
+    return_argv(h.thread, argv as usize, argc);
 }
 
 /// The engine wants VIO_EV_WRITABLE once outbound bytes drop below the low

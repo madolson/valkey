@@ -157,6 +157,9 @@ impl Drop for Conn {
 enum Msg {
     NewFd(RawFd),
     Kick(Arc<Conn>),
+    /// Executed argv the engine returned, to free on the thread that built
+    /// them: (argv, argc) pairs.
+    FreeArgv(Vec<(usize, c_int)>),
 }
 
 struct IoThread {
@@ -285,6 +288,46 @@ fn flush_kicks(idx: usize, list: &mut Vec<Arc<Conn>>) {
     wake_thread(t);
 }
 
+/// Argv returned per IO thread handed over before the end of the iteration.
+const ARGV_BATCH: usize = 256;
+
+/// Main thread: queue an executed argv for the IO thread that built it.
+/// Handed over with the kicks (vio_main_flush_kicks), or early when the
+/// batch is large.
+fn return_argv(thread: usize, argv: usize, argc: c_int) {
+    MAIN_ARGV.with(|a| {
+        let mut a = a.borrow_mut();
+        if a.len() <= thread {
+            a.resize_with(thread + 1, Vec::new);
+        }
+        a[thread].push((argv, argc));
+        if a[thread].len() >= ARGV_BATCH {
+            let v = std::mem::take(&mut a[thread]);
+            let t = &global().threads[thread];
+            t.inbox.lock().unwrap().push(Msg::FreeArgv(v));
+            wake_thread(t);
+        }
+    });
+}
+
+/// Main thread: hand IO thread `idx` its kicks and returned argv with one
+/// inbox lock and at most one wakeup.
+fn flush_thread(idx: usize, kicks: &mut Vec<Arc<Conn>>, argv: Option<&mut Vec<(usize, c_int)>>) {
+    let argv = argv.filter(|a| !a.is_empty()).map(std::mem::take);
+    if kicks.is_empty() && argv.is_none() {
+        return;
+    }
+    let t = &global().threads[idx];
+    {
+        let mut inbox = t.inbox.lock().unwrap();
+        inbox.extend(kicks.drain(..).map(Msg::Kick));
+        if let Some(v) = argv {
+            inbox.push(Msg::FreeArgv(v));
+        }
+    }
+    wake_thread(t);
+}
+
 /* ---------------------------------------------------------------------------
  * IO thread
  * ------------------------------------------------------------------------- */
@@ -294,6 +337,8 @@ thread_local! {
     static IS_MAIN: Cell<bool> = const { Cell::new(false) };
     /// Main thread: kicks per IO thread, flushed by vio_main_flush_kicks().
     static MAIN_KICKS: RefCell<Vec<Vec<Arc<Conn>>>> = const { RefCell::new(Vec::new()) };
+    /// Main thread: returned argv per IO thread, flushed with the kicks.
+    static MAIN_ARGV: RefCell<Vec<Vec<(usize, c_int)>>> = const { RefCell::new(Vec::new()) };
 }
 
 const TOK_WAKE: u64 = 0;
@@ -842,6 +887,12 @@ impl Worker {
                 match m {
                     Msg::NewFd(fd) => self.add_conn(fd),
                     Msg::Kick(c) => self.on_kick(c),
+                    Msg::FreeArgv(v) => {
+                        let free = global().cbs.free_argv;
+                        for (argv, argc) in v {
+                            free(argv as *mut *mut c_void, argc);
+                        }
+                    }
                 }
             }
         }

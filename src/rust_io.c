@@ -84,9 +84,35 @@ static void **rustIoCreateArgv(const unsigned char *const *ptrs, const size_t *l
     return (void **)argv;
 }
 
+/* Also frees argv the engine returned (vio_conn_return_argv): entries the
+ * engine still referenced were already released and set to NULL. */
 static void rustIoFreeArgv(void **argv, int argc) {
-    for (int j = 0; j < argc; j++) decrRefCount(argv[j]);
+    for (int j = 0; j < argc; j++)
+        if (argv[j]) decrRefCount(argv[j]);
     zfree(argv);
+}
+
+/* tryOffloadFreeArgvToIOThreads() for external connections: free the argv
+ * on the IO thread that built it. Same rule as the C IO threads: objects
+ * someone else still references (refcount > 1, e.g. a value SET stored)
+ * are decremented here. */
+int rustIoTryOffloadFreeArgv(client *c, int argc, robj **argv) {
+    rustConnection *rc = (rustConnection *)c->conn;
+    if (!rc->h || argc == 0) return C_ERR;
+    int keep = 0;
+    for (int j = 0; j < argc; j++) {
+        if (argv[j]->refcount > 1) {
+            decrRefCount(argv[j]);
+            argv[j] = NULL;
+        } else {
+            keep = 1;
+        }
+    }
+    if (keep)
+        vio_conn_return_argv(rc->h, (void **)argv, argc);
+    else
+        zfree(argv);
+    return C_OK;
 }
 
 /* ---------------------------------------------------------------------------

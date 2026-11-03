@@ -133,6 +133,9 @@ ssize_t vio_conn_writev(const VioConn *h, const struct iovec *iov, int iovcnt);
 /* Zero-copy: write the sealed reply chunk of job from engine memory; job
  * comes back once through write_job and vio_main_next_done(). */
 void vio_conn_submit_write(const VioConn *h, void *job, uint64_t release_offset);
+/* Return an executed argv to the IO thread that built it (freed there with
+ * free_argv, NULL entries skipped). Batched with the kicks. */
+void vio_conn_return_argv(const VioConn *h, void **argv, int argc);
 void vio_conn_want_writable(const VioConn *h, int on);
 void vio_conn_set_auth_required(const VioConn *h, int on);
 void vio_conn_set_session(const VioConn *h, const VioSession *s);
