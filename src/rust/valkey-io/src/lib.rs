@@ -911,6 +911,20 @@ pub extern "C" fn vio_conn_close(h: *const Conn) {
     kick(&conn);
 }
 
+/// exec-rtc: queue the connection on the main thread's ready list, as the
+/// io mode does, so the main thread pulls and executes its commands.
+#[no_mangle]
+pub extern "C" fn vio_conn_defer_to_main(h: *const Conn) {
+    let conn = conn_arc(h);
+    if !conn.in_ready.swap(true, Ordering::AcqRel) {
+        let g = global();
+        g.ready.lock().unwrap().push((*conn).clone());
+        if !g.main_signaled.swap(true, Ordering::AcqRel) {
+            eventfd_signal(g.main_efd);
+        }
+    }
+}
+
 /// Wake the main thread's event loop (exec-rtc: it has beforeSleep() work).
 #[no_mangle]
 pub extern "C" fn vio_wake_main() {

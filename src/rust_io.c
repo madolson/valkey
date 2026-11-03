@@ -190,6 +190,11 @@ static void rustIoDeliver(rustConnection *rc) {
     if (rc->pending_err > 0 || vio_conn_pending_cmds(h)) rustIoStall(rc, c);
 
     if (c->flag.blocked) return; /* resumed by processUnblockedClients() */
+    /* exec-rtc: commands that may yield run on the main thread. */
+    if (rustIoRtcShouldDefer(c)) {
+        vio_conn_defer_to_main(h);
+        return;
+    }
     if (processInputBuffer(c) == C_ERR) return;
     if (rc->pending_err > 0 && cmdQueuePending(c) == 0 && canParseCommand(c)) {
         rustIoProtocolError(c, rc->pending_err, rc->pending_err_byte);

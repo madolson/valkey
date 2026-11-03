@@ -48,6 +48,7 @@ extern int rust_io_rtc_active;  /* exec-rtc: the engine lock is released around 
 void rustIoExecCall(struct client *c, int flags);
 int rustIoExecInit(void);
 char *rustIoGenInfo(char *info);
+int rustIoRtcShouldDefer(struct client *c);
 
 #endif /* USE_RUST_IO */
 #endif /* RUST_IO_H */

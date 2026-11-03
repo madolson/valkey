@@ -15,12 +15,13 @@ bridge (everything is behind `USE_RUST_IO`).
 
 | Config | Values | Meaning |
 |---|---|---|
-| `rust-io-mode` | `off` (default), `io`, `precheck`, `exec` | `precheck`/`exec` log a warning and run as `io`. |
+| `rust-io-mode` | `off` (default), `io`, `precheck`, `exec` | `precheck` logs a warning and runs as `io`. `exec`: see Stage 3. |
+| `rust-io-exec-model` | `handoff` (default), `rtc` | exec mode only. |
 | `rust-io-port` | 0..65535, default 0 | Extra port served by Rust. Ignored when takeover is on. |
 | `rust-io-threads` | 1..128, default 1 | Rust IO threads, each with its own epoll loop. |
 | `rust-io-takeover` | yes/no, default no | Rust binds `port`; the C TCP listener is not created. |
 
-All four are startup-only (`IMMUTABLE_CONFIG`). Rust binds the first `bind`
+All five are startup-only (`IMMUTABLE_CONFIG`). Rust binds the first `bind`
 address (`*` maps to 0.0.0.0, `-::*` to `::`).
 
 ## Threading and ownership
@@ -290,3 +291,240 @@ thread already releases around `aeApiPoll()` in `beforeSleep()`/`afterSleep()`
 (`src/server.c`), so engine state is only touched by one thread at a time.
 `server.current_client`, `server.in_exec`, propagation and keyspace
 notification paths assume the main thread and would need auditing.
+
+# Stage 3: cut point 3, "exec"
+
+`rust-io-mode exec` makes the IO layer own the top-level `call()` for
+clients on Rust connections. Two models:
+
+- **handoff** (`rust-io-exec-model handoff`): everything stays where io
+  mode puts it (main thread, stage 1 drain hook, `processInputBuffer()`),
+  but the final `call(c, CMD_CALL_FULL)` in `processCommand()`
+  (`src/server.c:5060`) becomes `vio_exec_call()`, a Rust port of
+  `call()`'s control flow (`src/exec.rs:148`).
+- **rtc** (`rust-io-exec-model rtc`, run to completion): the Rust IO thread
+  that parsed a poll iteration's commands executes them itself, under the
+  module GIL, using the same `vio_exec_call()`. No hop to the main thread.
+
+The split point for "the C checks as an engine-provided function" is the
+same line: `processCommand()` runs every check unchanged and only the final
+`call()` is replaced. A stage 2 precheck plugs in before it without touching
+exec.
+
+## The Rust call()
+
+`vio_exec_call()` keeps call()'s order exactly and owns: the forkless-save
+gate decision, the call frame (`VioCallFrame`: prev executing client,
+real_cmd, dirty and repl-offset snapshots, saved propagation flags,
+update_command_stats, reprocessing), the wall-clock `call_timer` and the
+monotonic duration (Rust `clock_gettime`, C uses `ustime()`/`getMonotonicUs()`),
+calling `cmd->proc` through the pointer, every "blocked / update stats /
+reprocessing" condition, and the full propagation flag computation
+(`PROPAGATE_AOF|REPL` from dirty, force and prevent bits and the call
+flags). Everything that reads or writes `client`, `server` or a
+`serverCommand` is a C helper, because Rust has no view of those structs.
+
+Duplication, measured on this branch: C `call()` is 279 lines
+(`src/server.c:4185-4463`), 149 without comments and blanks. The Rust port
+is 96 lines (`src/exec.rs:148-243`), 86 without comments, plus 190
+non-comment lines of C helpers in `src/rust_io_exec.c` that are copies of
+call() fragments (field accesses, the latency block, the debug-argv check,
+tracking condition). So the whole of call() exists twice: ~86 lines of
+control flow in Rust and ~190 lines of re-expressed C. Nothing could be
+moved into Rust that touches engine state; what moved is control flow and
+arithmetic.
+
+What could not move at all: nested `call()` from EXEC (`execCommand`),
+scripts (`scriptCall`), `RM_Call` and `processPendingCommandAndInputBuffer`
+re-execution still use the C `call()`. Divergence risk: every future change
+to `call()` (for example #3381's two new hooks) must be made in three places
+(C call(), exec.rs, a new helper), and a missed one only shows up for
+top-level commands on Rust connections. Commandstats, slowlog, MONITOR and
+propagation tests pass in both models (unit/info-command, unit/info,
+unit/multi propagation tests), which is the only guard. A real
+implementation would need either a single call() with the side effects
+behind a table both sides use, or call() moved wholesale.
+
+### C symbols the exec modes call
+
+`VioExecOps` (`include/valkey_io.h`, built in `rustIoExecInit()`,
+`src/rust_io_exec.c`), in the order `vio_exec_call()` uses them:
+
+| Op | C | Purpose |
+|---|---|---|
+| `bg_block` | `exBgBlock` -> `bgIteration_blockClientIfRequired()` | Forkless save gate, first line of call(). |
+| `enter` | `exEnter` | `in_call++`, `executing_client` swap, frame snapshot, clear force/prevent flags and redaction bitmap. |
+| `stats_err_reset` | `exStatsErrReset` -> `incrCommandStatsOnError(NULL, 0)` | Reset the error-stat snapshot. |
+| `enter_execution_unit` | `enterExecutionUnit()` | Nesting + cached time. |
+| `begin_exec` | `exBeginExec` | `executing_command=1`, clear `buffered_reply`, `keyspace_notified`. |
+| `proc_of` | `exProcOf` | `c->cmd->proc`; Rust calls it. |
+| `debug_argv_begin/end` | `exDebugArgv*` | enable-debug-assert check that a borrowed argv is untouched. |
+| `exit_execution_unit` | `exitExecutionUnit()` | |
+| `after_proc` | `exAfterProc` | Clear `executing_command` unless blocked; returns blocked. |
+| `add_duration` | `exAddDuration` | `c->duration += d`. |
+| `server_dirty` | `exServerDirty` | `server.dirty`. |
+| `count_failure` | `exCountFailure` | `incrCommandStatsOnError(real_cmd, FAILED)` + deferred errors. |
+| `fire_result_event` | `exFireResultEvent` | USDT trace + `moduleFireCommandResultEvent()`. |
+| `close_after_command` | `exCloseAfterCommand` | close_after_command -> close_after_reply. |
+| `latency` | `exLatency` | Latency monitor, trace, event-loop duration samples. |
+| `commandlog` | `exCommandlog` -> `commandlogPushCurrentCommand()` | Slowlog / commandlog. |
+| `feed_monitors` | `exFeedMonitors` | `replicationFeedMonitors()` unless SKIP_MONITOR/ADMIN. |
+| `cmd_stats` | `exCmdStats` | calls, usec, latency histogram, slot CPU. |
+| `reset_duration` | `exResetDuration` | |
+| `prop_info` | `exPropInfo` | Propagation-relevant flag bits (`VIO_PI_*`). |
+| `also_propagate` | `exAlsoPropagate` -> `alsoPropagate()` | AOF/replication. |
+| `restore_flags` | `exRestoreFlags` | Restore force/prevent flags (re-entrancy). |
+| `track_keys` | `exTrackKeys` | `trackingRememberKeys()` for read-only commands. |
+| `count_command` | `exCountCommand` | `commands_processed`, `stat_numcommands`. |
+| `peak_memory` | `exPeakMemory` | `stat_peak_memory`. |
+| `after_command` | `exAfterCommand` -> `afterCommand()` | Post-execution unit ops, propagatePendingCommands, tracking, push messages. |
+| `set_woff` | `exSetWoff` | `c->woff`. |
+| `leave` | `exLeave` | Pause-after-transaction, restore `executing_client`, `in_call--`. |
+
+29 ops: `enterExecutionUnit()`/`exitExecutionUnit()` are passed directly; the other 27 are new static functions in `rust_io_exec.c` (four of them, `bg_block`, `stats_err_reset`, `commandlog`, `after_command`, are one-line wrappers that exist only to fix the signature).
+
+`VioRtcOps` (rtc only, called on IO threads):
+
+| Op | C | Purpose |
+|---|---|---|
+| `try_lock` | `rtcTryLock` -> `moduleTryAcquireGIL()` | Uncontended fast path (counted). |
+| `lock` | `rtcLock` -> `moduleTimedAcquireGIL(1 ms)` loop | Blocking acquire; returns 1 if the holder is yielding in a long command (see below). |
+| `unlock` | `rtcUnlock` -> `moduleReleaseGIL()` | Restores `server.main_thread_id` first. |
+| `exec_ready` | `rtcExecReady` -> `rustIoHandleReady()` | The stage 1 per-connection engine work (adopt, pull, `processInputBuffer()`, close). |
+| `after_batch` | `rtcAfterBatch` | `flushAppendOnlyFile(0)`, `handleClientsWithPendingWrites()`, wake main if it has `beforeSleep()` work. |
+
+Other engine entry points: `rustIoRtcShouldDefer()` (called from
+`rustIoDeliver()`, `src/rust_io.c:194`), `rustIoGenInfo()` (`INFO rustio`).
+
+New Rust exports: `vio_exec_configure`, `vio_exec_call`,
+`vio_conn_defer_to_main`, `vio_wake_main`, `vio_rtc_stats` (21 total).
+
+### Changes outside the new files
+
+| File | Change |
+|---|---|
+| `src/server.c:5060` | `processCommand()`: Rust connections in exec mode use `rustIoExecCall()` instead of `call()`. |
+| `src/server.c:129,2156,2175` | `engineLockShared()`: the main thread releases/acquires the GIL around poll when modules are loaded *or* rtc is active. |
+| `src/server.c:6970` | `INFO rustio` section. |
+| `src/module.c:9588` | `moduleTimedAcquireGIL()` (the GIL mutex is static). |
+| `src/rust_io.c` | `rustIoHandleReady()` non-static; exec init; the defer check in `rustIoDeliver()`. |
+| `src/rust/valkey-io/src/lib.rs` | `kick()` short-circuits to a thread-local list for the IO thread's own connections; `Worker::rtc_cycle()`; two exports. |
+| `src/config.c`, `src/Makefile`, `src/rust_io.h` | The config and the object file. |
+
+## exec-rtc
+
+### Control flow
+
+```
+IO thread poll iteration:
+  epoll events -> parse -> to_notify (as io mode)
+  rtc_cycle():
+    t0; try_lock() || lock(); t1          <- wait = t1 - t0
+    for conn in to_notify: clear in_ready; exec_ready(conn)
+         (adopt / pull into cmd_queue / processInputBuffer -> processCommand
+          -> vio_exec_call -> cmd->proc, all on this thread)
+    after_batch(): AOF write, write replies of every pending client
+         (Rust conns: memcpy into Conn.out; kick is local for own conns)
+    t2; unlock()                           <- hold = t2 - t1
+    run local kicks: write(2) the replies, no eventfd
+    repeat while flushes produced new events (max 16, then poll with 0 timeout)
+main thread: unchanged event loop; holds the GIL except around aeApiPoll.
+```
+
+One lock acquisition per poll iteration per IO thread, covering every
+connection that had input in that iteration. `in_ready` is cleared before
+the connection's events and commands are read, the same rule as
+`vio_main_next_ready()`, so a racing producer re-queues instead of being lost.
+
+### Engine invariants that assume the main thread, and what happened
+
+| Invariant | Where | Hit? | Handling |
+|---|---|---|---|
+| Main thread holds the GIL from startup | `moduleInitModulesSystem()`, `src/module.c:13576` | Yes: a second `moduleAcquireGIL()` in exec init deadlocked startup | Rely on it: IO threads that start before load finishes wait on the lock. |
+| GIL released around poll only with modules | `beforeSleep()`/`afterSleep()`, `src/server.c:2156,2175` | By design | `engineLockShared()`. |
+| `thread_shared_qb` is a per-thread buffer, NULL on new threads | `src/networking.c:164`, `trimClientQueryBuffer()` `:2592` | Yes: SIGSEGV in `resetSharedQueryBuf()` (`c->querybuf == thread_shared_qb` is `NULL == NULL`) | Give each Rust thread a private empty sds (`rtcExecReady`). Not `initSharedQueryBuf()`: it registers under `getCurTid()`, which is 0 (the main thread's slot) on a Rust thread. |
+| `inMainThread()` = io-thread id 0 | `src/io_threads.c:98` | Silent: true on Rust threads (`_Thread_local thread_id` defaults to 0), so `serverAssert(inMainThread())` (`networking.c:3616` etc.) and the main-thread branches in the reply path (`networking.c:2792,3213,3317`) take the main-thread side, which is correct only because the lock is held. | None needed; the asserts prove nothing in this mode. |
+| `onServerMainThread()` = `pthread_self() == server.main_thread_id` | `src/server.h:3009`; asserts in `forkless.c` (8), `bgiteration.c:2448`, `scripting_engine.c:311` | Yes: `forkless.c:309 'onServerMainThread()' is not true` on BGSAVE (unit/introspection). Also `scriptingEngineCallFreeFunction()` took the async path and self-deadlocked on the GIL in FUNCTION LOAD (unit/info, eu-stack in `functionLoadCommand`). | The lock holder sets `server.main_thread_id = pthread_self()` and restores the real main id before unlocking (`rtcLock`/`rtcUnlock`). "Main thread" now means "GIL holder". Racy unlocked reads of `main_thread_id` by forkless/bio threads (`forkless.c:69,177`) still see a non-matching id. |
+| Long commands yield via `processEventsWhileBlocked()` on the executing thread | `scriptInterrupt`, module yield | Yes: "MULTI and script timeout" hung. The script ran on IO thread 1, the test's SCRIPT KILL connection lived on the same IO thread, which cannot poll its sockets while running Lua; other IO threads sat in `pthread_mutex_lock` | Two fixes. (1) `rustIoRtcShouldDefer()`: a connection whose queue holds EVAL*/FCALL*/DEBUG/module commands, or EXEC of a MULTI containing one, is handed to the main thread (`vio_conn_defer_to_main`, the stage 1 ready list). (2) Waiters use a 1 ms timed lock and, if `isInsideYieldingLongCommand()`, route their batch through the ready list, which the holder's `processEventsWhileBlocked()` drains, so they get `-BUSY` and SCRIPT KILL works. |
+| `processEventsWhileBlocked()` on a non-main thread | `src/networking.c`, `ae.c` | Avoided by the deferral above. If a deferred-set gap lets one run on an IO thread, it polls `server.el` concurrently with the main thread's `aeApiPoll` and both write `el->fired`. | Not fixed; the deferral list is the mitigation. |
+| Loading: `-LOADING` replies come from `processEventsWhileBlocked()` | `loadDataFromDisk()` | Yes: "config during loading", "MEMORY commands during loading" fail: commands on Rust connections wait for the GIL until loading ends instead of getting `-LOADING` | Not fixed. Would need the same routing as the yield case, keyed on `server.loading`. |
+| Event-loop metrics count main-loop work | `eventloop_cycles`, `el_cmd_cnt_max` (`server.c` beforeSleep) | Yes: "stats: eventloop metrics", "stats: debug metrics" (unit/info) see 0 cycles with commands | Not fixed: commands no longer run inside the main event loop. |
+| `server.current_client`/`executing_client`, `in_call`, `execution_nesting`, propagation, `also_propagate` | `server.c` | No failures | Plain globals, safe under the lock; set and restored inside one batch. |
+| Blocking/unblocking | `handleClientsBlockedOnKeys()` (`processCommand` tail), `processUnblockedClients()` (beforeSleep) | No failures (unit/type/list 289/0 with blocked clients on other IO threads) | Unblock-on-key runs on the IO thread inside `processCommand()`; the unblocked client's reply is written in `after_batch`; its remaining pipeline runs from the main thread's `beforeSleep()` (main is woken when `unblocked_clients` is non-empty). |
+| AOF write before reply | `beforeSleep()` order | Not tested by the suites run | `after_batch` calls `flushAppendOnlyFile(0)` before `handleClientsWithPendingWrites()`. fsync policy as in beforeSleep. |
+| Lazyfree, client eviction, keyspace notifications, MONITOR, pub/sub to C clients | various | No failures (pubsub 38/0, info-command) | Thread-safe or plain globals under the lock. Replies to C-port clients are written from the IO thread in `after_batch` (`writev` and, if needed, `aeCreateFileEvent` on `server.el` while the main thread may be in `epoll_wait`: epoll_ctl is thread safe and ae reads `el->events` only after reacquiring the GIL). |
+| `freeClientAsync()`, `clients_to_close` freed in beforeSleep | `networking.c` | No failures | Main woken when `clients_to_close` is non-empty. |
+| Forked children (Lua debugger) talk on the client's fd | `ldb` | Yes in all Rust modes: "Forked scripting debug session ..." gets EOF; the child has no Rust IO threads. Transport problem, not exec. | Skipped. |
+
+### Lock statistics
+
+`INFO rustio` (rtc only): `rtc_batches`, `rtc_uncontended` (try_lock
+succeeded), `rtc_conns` (connections per batch), wait and hold sums and
+log2-ns histograms (bucket i = [2^(i-1), 2^i) ns). `bench.py` diffs them
+around each benchmark cell.
+
+## Compatibility with in-flight upstream work
+
+| Hook | Where in C | exec-handoff / Rust call() | exec-rtc |
+|---|---|---|---|
+| Forkless save `bgIteration_blockClientIfRequired()` | first line of `call()` | Kept as `bg_block`, first op of `vio_exec_call()`. A BLOCKED_INUSE client is re-executed through `processCommand()`, which routes back into Rust. | Same; the forkless machinery asserts `onServerMainThread()`, satisfied by the identity swap. Its propagation hook (`server.c` `alsoPropagate` path) is reached through the `also_propagate` op. |
+| AOF durability #3381: `recordReplOffsetBaseline()` next to `executing_client = c`; `computeCommandBlockingOffset()` after `afterCommand()`; stamping in `postExecutionUnitOperations()`; reply byte-offset fences in the C write path | `call()` and `networking.c` | Two more ops (`enter` would call the baseline, a new op after `after_command`). Stamping is inside `afterCommand()`, so it is inherited. Fences live in `_writeToClient()`/`writevToClient()`, which still run (they produce the iovec the Rust `writev` copies), so a fence that stops the write before the fenced offset works unchanged. | Replies are produced and handed to Rust on the IO thread inside `after_batch`. The fence check in the C write path runs there too, under the lock, so a client's bytes past its fence stay in `c->reply`. What is missing is the release: when fsync completes the fenced clients must be re-queued for write; as #3381 is written that would happen on the main thread in `beforeSleep()`, which then copies into Rust and kicks the IO thread. (Design only: #3381 is not in this tree.) Correct but adds a main-thread hop per fsync. A better design moves the fence into Rust: `vio_conn_writev(h, iov, n, fence_offset)` keeps bytes beyond the fence in `Conn.out` with a per-connection fence, and a single atomic "durable offset" published by the fsync path lets IO threads release them without the engine lock. |
+| Data tiering #3326: pre-execution gate that may block and re-execute | would sit with the forkless gate | Add as an op before `enter`; re-execution comes back through `processCommand()`. | Same; if the gate does disk IO it must not do it under the engine lock: it should block the client and let a background thread unblock it. |
+| BLOCKED_ASYNC (Cluster V2, #3536) and `VALKEYMODULE_REPLY_AGAIN` (#3707) | blocked.c / module.c | Nothing in `call()` itself; the Rust port already treats "blocked after proc" generically (no stats, no duration reset, no commandlog). Re-execution re-enters via `processCommand()`. | Unblock completions arrive on the main thread (module/bio pipes) and run there; module commands are deferred to the main thread by `rustIoRtcShouldDefer()`, so re-block from a module never runs on an IO thread. |
+
+## What a shared-nothing future would additionally need
+
+Target: N engine shards in one process, each owning a slot range, the IO
+layer routing each command to its owner.
+
+Carries over from exec-rtc:
+- The IO thread as the execution site, batching per poll iteration, and the
+  measured lock-hold/batch numbers as the cost model of "one owner at a
+  time".
+- `rtc_cycle()`'s structure: acquire the owner, run the batch, flush replies
+  with local kicks, release. With shards, "acquire" becomes "am I the
+  owner of these slots" (or a per-shard lock/queue).
+- `vio_conn_defer_to_main()`: the mechanism for "this command must run
+  somewhere else" already exists and is what cross-shard routing would use
+  (enqueue the connection to the owning shard's ready list + eventfd).
+- `prepareCommandGeneric()` already computes `c->slot` before execution, so
+  routing by slot has its input.
+- The Rust `call()` frame shows what per-call state is really per-call vs
+  global.
+
+Blocks it (each is a global in `struct valkeyServer server` or a file
+static, touched on every command):
+- `server.db` / keyspace, `server.dirty`, `server.stat_*`, `server.commands`
+  (per-command `calls`/`microseconds`/histograms mutated in `cmd_stats`),
+  `server.errors`.
+- Propagation: `server.also_propagate`, `server.execution_nesting`,
+  `server.in_call`, `server.executing_client`, `server.current_client`,
+  `server.primary_repl_offset`, the single replication backlog and AOF
+  buffer. One ordered replication stream cannot be fed by N shards without
+  a merge point.
+- Blocking: `server.ready_keys`, `server.unblocked_clients`, the blocking
+  keys dicts per db; tracking (`TrackingTable`), pub/sub dicts, MONITOR list,
+  client list, `clients_pending_write`.
+- Lua/function engine: one Lua state, `curr_run_ctx`.
+- Module API: assumes one GIL and one main thread.
+- Multi-key commands and MULTI across slots owned by different shards need
+  cross-shard coordination that cluster mode avoids by rejecting them
+  (CROSSSLOT); in one process the IO layer would have to reject the same way.
+- `onServerMainThread()` / `inMainThread()` and every `serverAssert` on
+  them would have to become "owns shard X".
+
+Minimal first step: make `server` a pointer selected per shard
+(thread-local `server_shard`) for the keyspace, dirty/stat counters and
+command stats, keep replication/AOF/pubsub/modules on a coordinator thread
+reached through the existing ready-list handoff, and route by
+`prepareCommandGeneric()`'s slot. The exec-rtc numbers below bound the gain:
+the engine lock is the serialization point that sharding removes.
+
+## What I would change in the shared handoff (not done, sibling stage)
+
+- rtc removed per-command main-thread work but kept the main loop running
+  `beforeSleep()` for unblocked clients etc. A per-IO-thread "pending
+  beforeSleep work" list would let IO threads do it at the end of their batch.
+- io/handoff: defer IO-thread kicks to one pass at the end of
+  `beforeSleep()` (stage 1 note still stands; rtc's local-kick shortcut
+  shows the gain of skipping the eventfd for the common case).

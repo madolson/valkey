@@ -337,6 +337,32 @@ static void rtcAfterBatch(void) {
         vio_wake_main();
 }
 
+/* Commands that can run long and yield through processEventsWhileBlocked():
+ * scripts, functions, module commands, DEBUG. An IO thread running one
+ * cannot poll its own sockets, so a SCRIPT KILL arriving on the same IO
+ * thread would never be read (the "MULTI and script timeout" test hung). */
+static int rtcMayYield(struct serverCommand *cmd) {
+    if (!cmd) return 0;
+    serverCommandProc *p = cmd->proc;
+    return p == evalCommand || p == evalRoCommand || p == evalShaCommand || p == evalShaRoCommand ||
+           p == fcallCommand || p == fcallroCommand || p == debugCommand || (cmd->flags & CMD_MODULE);
+}
+
+/* On a Rust IO thread in exec-rtc: whether this client's queued commands
+ * must run on the main thread instead. */
+int rustIoRtcShouldDefer(client *c) {
+    if (!rust_io_rtc_active || pthread_equal(pthread_self(), rtc_real_main)) return 0;
+    for (int i = c->cmd_queue.off; i < c->cmd_queue.len; i++) {
+        struct serverCommand *cmd = c->cmd_queue.cmds[i].cmd;
+        if (rtcMayYield(cmd)) return 1;
+        if (cmd && cmd->proc == execCommand && c->mstate) {
+            for (int j = 0; j < c->mstate->count; j++)
+                if (rtcMayYield(c->mstate->commands[j].cmd)) return 1;
+        }
+    }
+    return 0;
+}
+
 /* Configure exec mode before vio_start(). */
 int rustIoExecInit(void) {
     VioExecConfig cfg = {

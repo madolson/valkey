@@ -164,6 +164,8 @@ typedef struct VioExecConfig {
 int vio_exec_configure(const VioExecConfig *cfg);
 /* The top-level call() for a client on a Rust connection. */
 void vio_exec_call(void *c, int flags);
+/* exec-rtc: hand this connection's pending work to the main thread. */
+void vio_conn_defer_to_main(const VioConn *h);
 /* Wake the main event loop. */
 void vio_wake_main(void);
 /* exec-rtc lock statistics as INFO lines. Returns length written. */
