@@ -72,6 +72,7 @@ typedef struct rustConnection {
     VioSession sess;           /* session last written to Rust's view (precheck) */
     unsigned long long consumed_pub; /* consumed count last published */
     int auth_pub;                    /* auth_required last published, -1 none */
+    size_t job_reply_bytes;          /* c->reply_bytes sealed into the write job in flight */
 } rustConnection;
 
 static list *rust_stalled; /* client ids */
@@ -389,6 +390,8 @@ int rustIoTrySendWrite(client *c) {
     RUST_IO_TIMING_WRITEV(c->conn); /* stage "reply_copied": handed over */
     rust_writes_outstanding++;
     rust_writes_submitted++;
+    rc->job_reply_bytes = c->reply_bytes;
+    server.io_inflight_reply_bytes += rc->job_reply_bytes;
     vio_conn_submit_write(rc->h, c, 0);
     return C_OK;
 }
@@ -424,6 +427,9 @@ static void rustIoDrainDone(void) {
         client *c = job;
         rust_writes_outstanding--;
         serverAssert(rust_writes_outstanding >= 0 && c->io_write_state == CLIENT_COMPLETED_IO);
+        rustConnection *rc = (rustConnection *)c->conn;
+        server.io_inflight_reply_bytes -= rc->job_reply_bytes;
+        rc->job_reply_bytes = 0;
         processClientIOWriteDone(c);
     }
 }

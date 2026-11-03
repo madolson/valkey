@@ -316,3 +316,66 @@ so T=4 GET -P 16 is now IO-thread bound. -P 1 missed the prediction
 same as s1a; unit/client-eviction with the input-side tests skipped 8/8,
 unit/maxmemory 28/2 (input-buffer tests) in io and precheck, as in iteration
 1's copy mode. Verdict: KEEP.
+
+## Step 2: zero-copy replies on by default
+
+Deviation: this step's prediction was not written before measuring. The
+two failing unit/maxmemory tests were reproduced and diagnosed first
+(`~/rust-io/iter3a/scripts/mget_repro.py`), then fixed, then measured.
+
+Diagnosis, `rust-io-zero-copy-min-bytes 2048`, s1b binary, the MGET test's
+setup (11 MB maxmemory, 3 MB maxmemory-clients, 20 non-reading MGET
+clients): after 1 s `evicted_clients:20` and `evicted_keys:13`. Client
+eviction picked the clients, but each had a write job in flight, so
+`freeClient()` only scheduled them (`clientHasPendingIO()`), and the next
+`performEvictions()` still counted their memory and evicted keys. The
+tracking test emptied the database (`evicted: 300`, dbsize 0): the
+invalidation messages of the keys one eviction removed sat in jobs while
+the next commands ran `performEvictions()`, which evicted more keys.
+
+Change (`src/evict.c` `freeMemoryGetNotCountedMemory()`):
+- (a) not counted: `last_memory_usage` of normal and pubsub clients in
+  `server.clients_to_close`. Engine code, also active for C IO threads.
+- (b) not counted: `server.io_inflight_reply_bytes`, the `reply_bytes`
+  sealed into Rust write jobs in flight (`rustIoTrySendWrite()` adds,
+  `rustIoDrainDone()` subtracts). Only rust_io.c writes it.
+- `rust-io-zero-copy-min-bytes` default -1 -> 2048 (`src/config.c`).
+
+Attribution (precheck, zero-copy 2048, unit/maxmemory): s1b 26/4; (a)
+only 27/3, MGET passes, tracking fails; (a)+(b) 28/2, the copy-mode result
+(the two remaining failures are the input-buffer tests, Rust-held query
+buffers). The repro after (a): `evicted_clients:20`, `evicted_keys:0`.
+
+Quick profile (64 B, so writes stay under 2048 B and are copied), s1b-r vs
+s2, T=4: GET -P 16 +0.6% RPS / +0.5% main ns, SET -P 16 -0.8% / +0.6%,
+-P 1 within 0.6%; T=8 vs s1b: GET -P 16 -2.0% RPS (spreads 0.7%/1.1%),
+others within 0.6%. Neutral, as expected for copied writes.
+
+Headline, T=4 GET -P 16, `-c 400`, `KEYS=10000`, 3 reps (variants
+`zc16384-*`, `zc204800-*`):
+
+| value | C io-threads 4 | precheck, copy (-1) | precheck, default (2048) |
+|---|---|---|---|
+| 16 KB | 173,012 RPS, main 5786 ns/req | 277,199 RPS, main 2124 ns/req (main CPU 58%) | 282,532 RPS, main 370 ns/req (10.5%) |
+| 200 KB | 30,731 RPS, main 32,508 ns/req | 27,758 RPS, main 19,479 ns/req (54%) | 28,415 RPS, main 459 ns/req (1.3%) |
+
+Same shape as 6d (371 and 511 ns): the IO threads are at 99-100% in every
+Rust cell, so RPS moves +2%; the main thread leaves the payload.
+
+Gates (`gates/s2/summary.txt`, default now zero-copy 2048): identical to
+s1b for every file outside the eviction set. unit/maxmemory 28/2 (s1b
+copy mode 28/2; zero-copy before the fix 26/4). unit/client-eviction
+(input-side tests skipped) 9/7: "BLPOP + maxmemory-clients: successor
+eviction during ready-key reexec" now passes, the other 7 are unchanged.
+unit/obuf-limits 13/0. integration/throttle-repl io 2/5, precheck 3/4,
+the 6d counts (the 4 COB tests remain). So of the suite's MISSING-FEATURE
+tests, 1 of the 14 client-mem-accounting ones passes by default now
+(the BLPOP one) and the 4 rust-held-output-not-in-cob ones still fail.
+Default build (no Rust) of this tree vs iter2's, unit/maxmemory,
+unit/client-eviction, unit/obuf-limits, with and without
+`--config io-threads 4`: 30/0, 19/0, 13/0 in all four runs
+(`gates/def-{s2,iter2}{,-io4}`). ASAN soak, precheck, default config,
+600 s (`soak/asan-precheck-s2`): `server alive after soak: True`,
+`SOAK EXIT 0`, `SERVER EXIT 0`, no `asan.*` report; 401,800 connections.
+Zero-copy engaged by default on that binary: three `GET` of a 200 KB value
+moved `rust_io_writes_submitted` 0 -> 3. Verdict: KEEP.

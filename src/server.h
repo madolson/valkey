@@ -2044,6 +2044,7 @@ struct valkeyServer {
     size_t stat_slot_migration_cow_bytes;               /* Copy on write bytes during slot migration fork. */
     double stat_module_progress;                        /* Module save progress. */
     size_t stat_clients_type_memory[CLIENT_TYPE_COUNT]; /* Mem usage by type */
+    size_t io_inflight_reply_bytes; /* Reply list bytes in zero-copy writes in flight (rust_io.c) */
     size_t stat_cluster_links_memory;                   /* Mem usage by cluster links */
     long long stat_cluster_threaded_reads_processed;    /* Cluster reads completed by I/O threads */
     long long stat_cluster_threaded_writes_processed;   /* Cluster writes completed by I/O threads */

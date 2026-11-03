@@ -1057,7 +1057,7 @@ Rules, each inherited from the C IO threads rather than re-invented:
 Threshold. `rust-io-zero-copy-min-bytes` (modifiable): a write is offloaded
 when the reply list is non-empty, `c->buf` holds bulk-string references, or
 `c->bufpos` is at least the threshold. -1 always copies (step 22's
-behaviour) and is the default; 2048 is the recommended value, chosen from the sweep (ITERATIONS.md "Reply-size
+behaviour); 2048 is the default since iteration 3a, chosen from the sweep (ITERATIONS.md "Reply-size
 sweep"): the job costs a fixed round trip per write (about +5% to +18%
 main-thread ns per request for 64-1024 B replies at -P 1, where the main
 thread is about 50% idle), and breaks even at about 1.2 KB per write (64 B
@@ -1067,19 +1067,25 @@ The threshold applies to the bytes of one write, so one 64 B reply is
 copied and 16 pipelined 128 B replies are not. Strings of 16 KiB and more
 are referenced, never copied, so they always take the job.
 
-Why the default stays -1. With zero-copy on, unit/maxmemory loses two tests
-that copy mode passes ("eviction due to output buffers of many MGET
-clients, client eviction: true" and "client tracking don't cause eviction
-feedback loop"), while unit/client-eviction gains one ("BLPOP +
-maxmemory-clients: successor eviction during ready-key reexec"). In copy
-mode output handed to Rust sits in the Rust heap, invisible to
-`used_memory`; with jobs it stays in `c->reply` (as in C) but is released
-later, and `freeClient()` of a client with a job in flight is deferred
-(`clientHasPendingIO()`), so `evictClients()` cannot free it at once and
-`performEvictions()` evicts keys instead. Fixing that (count clients
-pending an async free, which the C test "a client pending an async free
-doesn't cause over-eviction" also covers and which fails in both modes)
-is left for the next stage; until then zero-copy is opt-in.
+Eviction accounting (iteration 3a, step 2). Until then the default was -1,
+because with jobs unit/maxmemory lost two tests that copy mode passes. In
+copy mode output handed to Rust sits in the Rust heap, invisible to
+`used_memory`; with jobs it stays in `c->reply` (as in C) until the IO
+thread has written it. Two engine fixes in
+`freeMemoryGetNotCountedMemory()` (`src/evict.c`) make the accounting match:
+- "eviction due to output buffers of many MGET clients, client eviction:
+  true": `evictClients()` frees the clients, but a client with a job in
+  flight can only be freed asynchronously (`clientHasPendingIO()`), so
+  `performEvictions()` evicted keys for memory that was about to go. The
+  memory of normal and pubsub clients in `server.clients_to_close` is now
+  not counted. This also applies to C IO threads.
+- "client tracking don't cause eviction feedback loop": the invalidation
+  messages of evicted keys sat in jobs while the next commands ran
+  `performEvictions()`, which evicted more keys, and so on until the
+  database was empty. `server.io_inflight_reply_bytes`, the `reply_bytes`
+  sealed into jobs in flight (`rustIoTrySendWrite()` adds, `rustIoDrainDone()`
+  subtracts), is not counted, like the output copy mode hands to Rust. Only
+  rust_io.c writes it; it is 0 in the default build.
 
 Scope. Replica, primary and slot-migration connections stay on the copy
 path (`getClientType()` check in `rustIoTrySendWrite()`): their output is
@@ -1173,7 +1179,7 @@ Before iteration 2 every command crossed twice (`create_argv`,
   seven entries: `writev`, `close`, `shutdown`, `want_writable`,
   `read_resumed`, `has_pending_data`, `process_pending_data`.
 - Zero-copy replies: unchanged since iteration 1 ("Zero-copy replies"
-  above). Off by default (`rust-io-zero-copy-min-bytes -1`).
+  above). On by default for writes of >= 2048 B since iteration 3a.
 - `engine_io.{h,c}`: `engineSubmit()` is the only writer of a client's
   `cmd_queue` for an external connection. `engineCmd` is the layout the IO
   layer's `VioCmd` must have (static_assert in `rust_io.c`).
