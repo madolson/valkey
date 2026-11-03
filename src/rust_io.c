@@ -22,7 +22,7 @@
 /* Not exported through server.h. */
 void trimCommandQueue(client *c);
 
-rustIoConfig rust_io_config = {RUST_IO_MODE_OFF, 0, 1, 0};
+rustIoConfig rust_io_config = {RUST_IO_MODE_OFF, 0, 1, 0, RUST_IO_EXEC_HANDOFF};
 
 configEnum rust_io_mode_enum[] = {
     {"off", RUST_IO_MODE_OFF},
@@ -190,6 +190,11 @@ static void rustIoDeliver(rustConnection *rc) {
     if (rc->pending_err > 0 || vio_conn_pending_cmds(h)) rustIoStall(rc, c);
 
     if (c->flag.blocked) return; /* resumed by processUnblockedClients() */
+    /* exec-rtc: commands that may yield run on the main thread. */
+    if (rustIoRtcShouldDefer(c)) {
+        vio_conn_defer_to_main(h);
+        return;
+    }
     if (processInputBuffer(c) == C_ERR) return;
     if (rc->pending_err > 0 && cmdQueuePending(c) == 0 && canParseCommand(c)) {
         rustIoProtocolError(c, rc->pending_err, rc->pending_err_byte);
@@ -227,7 +232,8 @@ static void rustIoAccept(const VioConn *h) {
     if (rc && connGetPrivateData(&rc->c)) vio_conn_set_auth_required(h, authRequired(connGetPrivateData(&rc->c)));
 }
 
-static void rustIoHandleReady(const VioConn *h) {
+/* Also the exec-rtc entry point, on a Rust IO thread (rust_io_exec.c). */
+void rustIoHandleReady(const VioConn *h) {
     uint32_t ev = vio_conn_take_events(h);
     if (ev & VIO_EV_NEW) rustIoAccept(h);
 
@@ -498,12 +504,12 @@ int rustIoTakesOverPort(void) {
 
 int rustIoInitListeners(void) {
     if (rust_io_config.mode == RUST_IO_MODE_OFF) return 0;
-    if (rust_io_config.mode != RUST_IO_MODE_IO) {
-        serverLog(LL_WARNING, "rust-io-mode %s is not implemented yet, running as 'io'",
-                  rust_io_config.mode == RUST_IO_MODE_PRECHECK ? "precheck" : "exec");
+    if (rust_io_config.mode == RUST_IO_MODE_PRECHECK) {
+        serverLog(LL_WARNING, "rust-io-mode precheck is not implemented yet, running as 'io'");
     }
     int port = rust_io_config.takeover ? server.port : rust_io_config.port;
     if (port == 0) return 0;
+    if (rust_io_config.mode == RUST_IO_MODE_EXEC && rustIoExecInit() != 0) serverPanic("rust-io exec init failed");
 
     VioConfig cfg = {
         .bindaddr = server.bindaddr_count ? server.bindaddr[0] : NULL,
@@ -522,8 +528,11 @@ int rustIoInitListeners(void) {
         serverPanic("Unrecoverable error creating rust-io event handler.");
     rust_stalled = listCreate();
     rust_started = port;
-    serverLog(LL_NOTICE, "Rust IO layer listening on %s:%d with %d thread(s)",
-              cfg.bindaddr ? cfg.bindaddr : "*", port, rust_io_config.threads);
+    serverLog(LL_NOTICE, "Rust IO layer listening on %s:%d with %d thread(s)%s",
+              cfg.bindaddr ? cfg.bindaddr : "*", port, rust_io_config.threads,
+              rust_io_config.mode != RUST_IO_MODE_EXEC                ? ""
+              : rust_io_config.exec_model == RUST_IO_EXEC_RTC ? ", exec-rtc"
+                                                                      : ", exec-handoff");
     return 1;
 }
 
