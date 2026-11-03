@@ -96,21 +96,20 @@ struct VioCmd {
 /* Startup. Returns an eventfd to poll for readability, or -1 with errno. */
 int vio_start(const VioConfig *cfg);
 
-/* Main thread: consume the wakeup and iterate connections with work. Each
- * handle from vio_main_next_ready() carries one reference to release. */
+/* Main thread: consume the wakeup and take the current batch of ready
+ * connections. */
 void vio_main_begin_drain(void);
-/* Connections left in the current batch (processEventsWhileBlocked()). */
 /* Hand the kicks collected during this iteration to the IO threads. */
 void vio_main_flush_kicks(void);
-/* Take connections that became ready while the main thread was awake;
- * 1 when there was pending work. */
-int vio_main_take_ready(void);
 /* Last call before the main thread polls; 1 = do not block. */
 int vio_main_before_poll(void);
 /* First call after the main thread polled; 1 = work was taken into the
  * current batch (drain it with vio_main_next_ready()). */
 int vio_main_after_poll(void);
+/* Connections left in the current batch (processEventsWhileBlocked()). */
 int vio_main_has_ready(void);
+/* Next ready connection, or NULL. Each handle carries one reference the
+ * caller must vio_conn_release(). */
 const VioConn *vio_main_next_ready(void);
 
 /* Per connection, main thread only. */

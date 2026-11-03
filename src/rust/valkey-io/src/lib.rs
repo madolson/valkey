@@ -938,15 +938,12 @@ pub extern "C" fn vio_main_begin_drain() {
      * when a producer signals between the clear and the drain. */
     eventfd_drain(g.main_efd);
     g.main_signaled.store(false, Ordering::SeqCst);
-    vio_main_take_ready();
+    take_ready(g);
 }
 
 /// Take connections that became ready while the main thread was awake (no
 /// eventfd was written for them). Returns 1 when there was pending work.
-/// Called from beforeSleep() through the connection type's pending-data hook.
-#[no_mangle]
-pub extern "C" fn vio_main_take_ready() -> c_int {
-    let g = global();
+fn take_ready(g: &Global) -> c_int {
     if !g.main_pending.swap(false, Ordering::SeqCst) {
         return 0;
     }
@@ -975,7 +972,7 @@ pub extern "C" fn vio_main_after_poll() -> c_int {
     if g.main_signaled.load(Ordering::SeqCst) {
         return 0;
     }
-    vio_main_take_ready()
+    take_ready(g)
 }
 
 /// Next ready connection from the current batch, or NULL. The caller owns
