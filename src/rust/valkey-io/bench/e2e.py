@@ -284,7 +284,7 @@ def main():
             w.writerow(cols)
         return f, w
 
-    fo, wo = writer(a.out, key + ["reps", "n"] + METRICS + ["rps_min", "rps_max", "rps_spread_pct"])
+    out_f, out_w = writer(a.out, key + ["reps", "n"] + METRICS + ["rps_min", "rps_max", "rps_spread_pct"])
     fr, wr = writer(a.raw, key + ["rep", "n"] + METRICS + ["attempt"])
     for name in configs:
         srv = Server(a, name)
@@ -338,7 +338,7 @@ def main():
                     row = [sha, a.label, a.profile, name, test, pipe, a.clients, a.reps, n] + \
                           [med[x] for x in METRICS] + \
                           [min(rps), max(rps), round(100.0 * (max(rps) - min(rps)) / med["rps"], 2)]
-                    wo.writerow(row); fo.flush()
+                    out_w.writerow(row); out_f.flush()
                     print("%-12s %-3s P%-2d rps=%9.0f p50=%.3f p99=%.3f main=%5.1f%% %6.0f ns/req io=%5.1f%% "
                           "proc=%5.1f%% client=%5.1f%% spread=%.1f%% foreign=%.0f%%" %
                           (name, test, pipe, med["rps"], med["p50_ms"], med["p99_ms"], med["main_cpu_pct"],
