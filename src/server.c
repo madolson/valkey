@@ -4668,7 +4668,7 @@ int processCommand(client *c) {
 
     /* rust-io precheck mode: the IO thread already ran the auth, lookup,
      * arity, protected, NO_MULTI, ACL and cluster routing checks and the
-     * result is still valid. No module is loaded, so there are no filters. */
+     * result is still valid. No module command filter is registered. */
     int prechecked = 0;
 #ifdef USE_RUST_IO
     if (!client_reprocessing_command) prechecked = rustPrecheckValidate(c);
