@@ -159,15 +159,25 @@ static void rustIoStall(rustConnection *rc, client *c) {
     listAddNodeTail(rust_stalled, (void *)(uintptr_t)c->id);
 }
 
+/* A replicated client (slot import) keeps the commands it has not applied
+ * in its querybuf as well (engine_io.c). Pull them a little at a time, as
+ * C reads PROTO_IOBUF_LEN at a time, so that copy stays small. */
+#define RUST_IO_REPL_POP_BATCH 16
+
 /* Move parsed commands from Rust into c->cmd_queue (engineSubmit()). */
 static int rustIoPull(rustConnection *rc, client *c) {
     VioCmd cmds[RUST_IO_POP_BATCH];
     unsigned long long bytes = 0;
     int pulled = 0;
+    int replicated = c->repl_data && isReplicatedClient(c);
 
     while (rc->pending_err == 0 && engineCmdQueuePending(c) < RUST_IO_CMD_QUEUE_MAX) {
         size_t want = RUST_IO_CMD_QUEUE_MAX - engineCmdQueuePending(c);
         if (want > RUST_IO_POP_BATCH) want = RUST_IO_POP_BATCH;
+        if (replicated) {
+            if (sdslen(c->querybuf) - c->qb_applied >= PROTO_IOBUF_LEN) break;
+            if (want > RUST_IO_REPL_POP_BATCH) want = RUST_IO_REPL_POP_BATCH;
+        }
         size_t n = vio_conn_pop_cmds(rc->h, cmds, want);
         if (n == 0) break;
         pulled += engineSubmit(c, (const engineCmd *)cmds, n, &rc->pending_err, &rc->pending_err_byte, &bytes);
@@ -311,15 +321,25 @@ static client *rustIoDeliverPull(rustConnection *rc) {
     return c;
 }
 
+/* Rounds of pull and execute for a replicated client in one delivery
+ * (rustIoPull() takes about PROTO_IOBUF_LEN of its stream per round). */
+#define RUST_IO_REPL_ROUNDS 64
+
 /* Pull and execute what Rust parsed for this connection. Mirrors the tail
  * of readQueryFromClient(). The client may be freed. */
 static void rustIoDeliver(rustConnection *rc) {
-    client *c = rustIoDeliverPull(rc);
-    if (!c) return;
-    if (processInputBuffer(c) == C_ERR) return;
-    rustIoAfterCommands(rc, c);
-    /* May free the client (close_asap). */
-    beforeNextClient(c);
+    for (int round = 0; round < RUST_IO_REPL_ROUNDS; round++) {
+        client *c = rustIoDeliverPull(rc);
+        if (!c) return;
+        uint64_t id = c->id;
+        if (processInputBuffer(c) == C_ERR) return;
+        rustIoAfterCommands(rc, c);
+        int again = isReplicatedClient(c) && rc->h && engineCmdQueuePending(c) == 0 && vio_conn_pending_cmds(rc->h);
+        /* May free the client (close_asap). beforeNextClient() trims the
+         * applied stream from a replicated client's querybuf. */
+        beforeNextClient(c);
+        if (!again || !lookupClientByID(id)) return;
+    }
 }
 
 /* Cross-connection batch (plan step 21), the C IO threads' scheme
@@ -471,8 +491,10 @@ sds rustIoCatInfo(sds info) {
     return sdscatprintf(info,
                         "rust_io_zero_copy_min_bytes:%d\r\n"
                         "rust_io_writes_submitted:%llu\r\n"
-                        "rust_io_writes_outstanding:%lld\r\n",
-                        rust_io_config.zero_copy_min, rust_writes_submitted, rust_writes_outstanding);
+                        "rust_io_writes_outstanding:%lld\r\n"
+                        "rust_io_held_input_bytes:%zu\r\n",
+                        rust_io_config.zero_copy_min, rust_writes_submitted, rust_writes_outstanding,
+                        rustIoHeldMemory());
 }
 
 /* ---------------------------------------------------------------------------
