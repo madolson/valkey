@@ -541,6 +541,16 @@ size_t zmalloc_used_memory(void) {
     return um;
 }
 
+/* Net bytes allocated minus freed by the calling thread, modulo 2^64: a
+ * thread that frees memory another thread allocated goes "negative". Only
+ * the difference between two calls on the same thread is meaningful. It
+ * reads one counter, the caller's own, unlike zmalloc_used_memory(). */
+size_t zmalloc_thread_used_memory(void) {
+    if (unlikely(thread_index == -1)) zmalloc_register_thread_index();
+    if (unlikely(thread_index >= MAX_THREADS_NUM)) return zmalloc_used_memory();
+    return used_memory_thread[thread_index].value;
+}
+
 size_t zmalloc_used_external_memory(void) {
     return atomic_load_explicit(&used_memory_external, memory_order_relaxed);
 }

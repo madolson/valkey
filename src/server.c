@@ -1543,10 +1543,19 @@ static void sumEngineUsedMemory(scriptingEngine *engine, void *context) {
     *total_memory += mem_info.used_memory;
 }
 
+/* This thread's zmalloc_thread_used_memory() at its last peak update. */
+static _Thread_local size_t peak_thread_used;
+
+/* Record the max memory used since the server was started. */
+static void updatePeakMemory(void) {
+    peak_thread_used = zmalloc_thread_used_memory();
+    size_t zmalloc_used = zmalloc_used_memory();
+    if (zmalloc_used > server.stat_peak_memory) server.stat_peak_memory = zmalloc_used;
+}
+
 /* Called from serverCron and cronUpdateMemoryStats to update cached memory metrics. */
 void cronUpdateMemoryStats(void) {
-    /* Record the max memory used since the server was started. */
-    if (zmalloc_used_memory() > server.stat_peak_memory) server.stat_peak_memory = zmalloc_used_memory();
+    updatePeakMemory();
 
     run_with_period(100) {
         /* Sample the RSS and other metrics here since this is a relatively slow call.
@@ -1949,8 +1958,7 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
     /* When I/O threads are enabled and there are pending I/O jobs, the poll is offloaded to one of the I/O threads. */
     trySendPollJobToIOThreads();
 
-    size_t zmalloc_used = zmalloc_used_memory();
-    if (zmalloc_used > server.stat_peak_memory) server.stat_peak_memory = zmalloc_used;
+    updatePeakMemory();
 
     /* Just call a subset of vital functions in case we are re-entering
      * the event loop from processEventsWhileBlocked(). Note that in this
@@ -4425,9 +4433,12 @@ void call(client *c, int flags) {
     }
 
     /* Record peak memory after each command and before the eviction that runs
-     * before the next command. */
-    size_t zmalloc_used = zmalloc_used_memory();
-    if (zmalloc_used > server.stat_peak_memory) server.stat_peak_memory = zmalloc_used;
+     * before the next command. zmalloc_used_memory() reads one cache line per
+     * thread, most of them written by IO threads all the time, so only call
+     * it when this thread's own allocations grew since the last update: then
+     * whatever the command allocated is in the peak. Growth on other threads
+     * alone is recorded by beforeSleep(), the cron and getMaxmemoryState(). */
+    if ((ssize_t)(zmalloc_thread_used_memory() - peak_thread_used) > 0) updatePeakMemory();
 
     /* Do some maintenance job and cleanup */
     afterCommand(c);

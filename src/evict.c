@@ -269,6 +269,8 @@ int getMaxmemoryState(size_t *total, size_t *logical, size_t *tofree, float *lev
      * to subtract the replicas output buffers. We can just return ASAP. */
     mem_reported = zmalloc_used_memory();
     if (total) *total = mem_reported;
+    /* call() skips the peak update when only other threads allocated. */
+    if (mem_reported > server.stat_peak_memory) server.stat_peak_memory = mem_reported;
 
     /* We may return ASAP if there is no need to compute the level. */
     if (!server.maxmemory) {
