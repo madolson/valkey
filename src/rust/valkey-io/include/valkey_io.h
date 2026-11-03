@@ -82,6 +82,9 @@ struct VioCmd {
     int slot;
     int read_flags;
     uint64_t token; /* 0 when not prechecked */
+#ifdef RUST_IO_TIMING
+    uint32_t trace; /* sampled stage-timing id, 0 when not sampled */
+#endif
 };
 
 /* Event bits returned by vio_conn_take_events(). */
@@ -214,5 +217,20 @@ void vio_conn_defer_to_main(const VioConn *h);
 void vio_wake_main(void);
 /* exec-rtc lock statistics as INFO lines. Returns length written. */
 size_t vio_rtc_stats(char *buf, size_t len);
+
+#ifdef RUST_IO_TIMING
+/* Sampled stage timing (src/rust/valkey-io/src/timing.rs). */
+typedef struct VioTimingStat {
+    uint64_t count, p50_ns, p90_ns, p99_ns, max_ns;
+} VioTimingStat;
+void vio_timing_stamp(uint32_t id, uint32_t stage);
+void vio_timing_drop(uint32_t id);
+/* Tag the bytes of the next vio_conn_writev() on this thread with trace id. */
+void vio_timing_next_write(uint32_t id);
+void vio_timing_stat(uint32_t stage, VioTimingStat *out);
+uint32_t vio_timing_sample_n(void);
+uint64_t vio_timing_dropped(void);
+void vio_timing_reset(void);
+#endif
 
 #endif /* VALKEY_IO_H */

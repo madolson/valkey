@@ -434,6 +434,10 @@ RUST_IO_LIB=rust/valkey-io/target/release/libvalkey_io.a
 CARGO?=$(shell command -v cargo 2>/dev/null || echo $(HOME)/.cargo/bin/cargo)
 ifeq ($(BUILD_RUST_IO),yes)
 	FINAL_CFLAGS+=-DUSE_RUST_IO
+ifeq ($(RUST_IO_TIMING),yes)
+	FINAL_CFLAGS+=-DRUST_IO_TIMING
+	RUST_IO_CARGO_FEATURES=--features timing
+endif
 	FINAL_LIBS := $(RUST_IO_LIB) $(FINAL_LIBS) -lpthread -ldl -lrt -lm -lgcc_s
 endif
 
@@ -778,12 +782,12 @@ ifneq ($(strip $(PREV_FINAL_LDFLAGS)), $(strip $(FINAL_LDFLAGS)))
 endif
 
 ifeq ($(BUILD_RUST_IO),yes)
-ENGINE_SERVER_OBJ += rust_io.o rust_io_precheck.o rust_io_exec.o
+ENGINE_SERVER_OBJ += rust_io.o rust_io_precheck.o rust_io_exec.o rust_io_timing.o
 $(SERVER_NAME): $(RUST_IO_LIB)
 # Always ask cargo; it is a no-op when the crate is up to date.
 $(RUST_IO_LIB): rust-io-cargo
 rust-io-cargo:
-	cd rust/valkey-io && $(CARGO) build --release --quiet
+	cd rust/valkey-io && $(CARGO) build --release --quiet $(RUST_IO_CARGO_FEATURES)
 .PHONY: rust-io-cargo
 endif
 

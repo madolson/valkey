@@ -1,0 +1,24 @@
+samples: 5942
+group                                          self%   incl%
+call() and command procs                        32.5    78.4
+allocator: jemalloc (zmalloc)                   15.6    15.9
+key prefetch (prefetchCommandQueueKeys)         12.7    12.7
+processCommand checks                            7.8    87.2
+handoff: pop/drain/kick                          6.6     7.5
+clock reads (getMonotonicUs, ustime)             5.7     5.7
+freeing argv                                     5.0    12.0
+reply building                                   5.0     6.4
+argv build (create_argv: createStringObject)     2.8     5.7
+prepareCommand and lookup                        2.2     8.3
+memcpy/libc                                      1.4     3.6
+reply memcpy into Rust (connRustWritev)          0.8     1.1
+handoff: bridge dispatch (rustIoEventHandler, Deliver)     0.5    94.5
+other                                            0.4     0.4
+syscall:write                                    0.2     0.3
+syscall:epoll_wait                               0.2     0.2
+RESP parse / IO-thread logic                     0.1     1.3
+syscall:other                                    0.1     0.6
+syscall:eventfd                                  0.1     0.1
+event loop                                       0.1    96.7
+precheck (IO-thread checks; main-thread token validate)     0.1     0.1
+syscall:read                                     0.0     0.0

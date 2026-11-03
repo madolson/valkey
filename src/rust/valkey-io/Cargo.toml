@@ -3,9 +3,17 @@ name = "valkey-io"
 version = "0.1.0"
 edition = "2021"
 publish = false
+# benches/ is its own crate (criterion stays out of this lockfile).
+autobenches = false
 
 [lib]
 crate-type = ["staticlib", "rlib"]
+
+[features]
+# Sampled per-stage timing (make RUST_IO_TIMING=yes).
+timing = []
+# Re-exports internals for the micro-benchmarks in benches/.
+bench = []
 
 [dependencies]
 libc = "0.2"
