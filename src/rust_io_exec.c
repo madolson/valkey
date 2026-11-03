@@ -20,6 +20,7 @@
 #include "bgiteration.h"
 #include "cluster_slot_stats.h"
 #include "latency.h"
+#include "cluster_legacy.h"
 #include "rust_io.h"
 
 #ifdef USE_RUST_IO
@@ -338,15 +339,29 @@ static void rtcExecReady(const VioConn *h) {
 }
 
 /* The part of beforeSleep() a batch needs before its replies may leave,
- * done here with the lock held, and a main-thread wakeup for the rest. */
+ * done here with the lock held, and a main-thread wakeup for the rest.
+ * DESIGN.md "beforeSleep() under rtc" lists every beforeSleep() item. */
 static void rtcAfterBatch(void) {
+    /* The cluster state a command changed (CONFIG SET
+     * cluster-require-full-coverage, CLUSTER ADDSLOTS ...) must be visible
+     * to the next command, which may run on an IO thread before the main
+     * thread wakes. The rest of clusterBeforeSleep() (failover, config
+     * save, pong broadcast) uses the cluster bus and stays on the main
+     * thread. */
+    if (server.cluster_enabled && (server.cluster->todo_before_sleep & CLUSTER_TODO_UPDATE_STATE))
+        clusterUpdateState();
+    /* BCAST invalidations go out with the batch's replies, as in
+     * beforeSleep(), instead of at the next main-thread iteration. */
+    trackingBroadcastInvalidationMessages();
     /* Replies must not leave before the AOF write (beforeSleep() order). */
     if (server.aof_state == AOF_ON || server.aof_state == AOF_WAIT_REWRITE) flushAppendOnlyFile(0);
     handleClientsWithPendingWrites();
     rustIoPublishGlobals();
     if (listLength(server.unblocked_clients) || listLength(server.clients_pending_write) ||
         listLength(server.clients_to_close) || listLength(server.ready_keys) || server.get_ack_from_replicas ||
-        listLength(server.postponed_clients) || connTypeHasPendingData())
+        listLength(server.postponed_clients) || connTypeHasPendingData() ||
+        listLength(server.clients_waiting_acks) || server.failover_state == FAILOVER_WAIT_FOR_SYNC ||
+        (server.cluster_enabled && server.cluster->todo_before_sleep) || bgIteration_iterationActive())
         vio_wake_main();
 }
 
