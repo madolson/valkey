@@ -333,6 +333,12 @@ int rustIoTrySendWrite(client *c) {
     } else {
         c->io_last_bufpos = (size_t)c->bufpos;
     }
+    /* Unlike a C IO-thread write, the engine keeps executing this client's
+     * pipelined commands while the job is in flight, and upsertPayloadHeader()
+     * would extend the last payload header, which lies inside the sealed
+     * chunk the IO thread is walking. Start new headers after the seal. */
+    c->last_header = NULL;
+    if (c->io_last_reply_block) ((clientReplyBlock *)listNodeValue(c->io_last_reply_block))->last_header = NULL;
     c->write_flags = 0;
     c->io_write_state = CLIENT_PENDING_IO;
     RUST_IO_TIMING_WRITEV(c->conn); /* stage "reply_copied": handed over */

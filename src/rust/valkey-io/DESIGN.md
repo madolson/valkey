@@ -958,3 +958,20 @@ MULTI-queued argv is freed by `freeClientMultiState()` on the main thread,
 as in C. A blocked client keeps its argv until it runs. A client freed with
 argv already returned is fine: the queued arrays belong to the IO thread,
 not to the connection.
+
+## Other iteration-1 changes
+
+- Header (step 7): `include/valkey_io.h` is cbindgen output (`cbindgen.toml`);
+  `make -C src rust-header` regenerates it, `make -C src check-rust-header`
+  fails on drift. Constants (`VIO_EV_*`, `VIO_ERR_*`, `VIO_SESS_*`) come
+  from Rust; `VIO_ERR_*` are tied to `resp::ProtoError` by const asserts.
+- Limits (step 9): `proto-max-bulk-len` and `client-query-buffer-limit` reach
+  Rust by value (`VioConfig`, then `vio_set_limits()` from the configs' apply
+  functions). Rust no longer reads engine memory outside a call.
+- Shutdown (step 13): `vio_conn_shutdown()` defers `shutdown(2)` until the
+  output handed over before it (copied bytes and any write job) is on the
+  socket. This was the CLIENT KILL during BGSAVE reply loss.
+- processCommand (step 15): `processCommandChecks()` holds the checks rust-io
+  precheck runs off-thread; `processCommandExecute()` holds the live-state
+  gates and `call()`. The precheck fast path skips the first call instead of
+  jumping to a label.
