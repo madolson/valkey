@@ -2182,6 +2182,9 @@ void afterSleep(struct aeEventLoop *eventLoop, int numevents) {
             mstime_t latency;
             latencyStartMonitor(latency);
             atomic_store_explicit(&server.module_gil_acquiring, 1, memory_order_relaxed);
+#ifdef USE_RUST_IO
+            rustIoRtcBeforeAcquire();
+#endif
             moduleAcquireGIL();
             atomic_store_explicit(&server.module_gil_acquiring, 0, memory_order_relaxed);
             atomic_store_explicit(&server.module_gil_acquired, 1, memory_order_relaxed);

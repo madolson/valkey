@@ -58,6 +58,7 @@ void rustIoExecCall(struct client *c, int flags);
 int rustIoExecInit(void);
 char *rustIoGenInfo(char *info);
 int rustIoRtcShouldDefer(struct client *c);
+void rustIoRtcBeforeAcquire(void);
 
 #endif /* USE_RUST_IO */
 #endif /* RUST_IO_H */

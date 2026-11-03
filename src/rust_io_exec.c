@@ -315,12 +315,33 @@ int moduleTimedAcquireGIL(long usec); /* module.c */
  * those clients get -BUSY and SCRIPT KILL / FUNCTION KILL get through.
  * isInsideYieldingLongCommand() is read without the lock (a flag and a
  * pointer the holder sets); a stale read costs one more 1 ms wait. */
+/* IO threads blocked in rtcLock(). The engine lock is a plain mutex: the
+ * main thread unlocks it at the end of beforeSleep() and, with events
+ * still pending, locks it again right away in afterSleep(), so a waiting
+ * IO thread could lose every race (unit/cluster/packet: a cluster bus
+ * backlog delayed a client command until all of it was read). */
+static _Atomic int rtc_lock_waiters;
+
 static int rtcLock(void) {
+    atomic_fetch_add_explicit(&rtc_lock_waiters, 1, memory_order_relaxed);
     while (moduleTimedAcquireGIL(1000) != 0) {
-        if (isInsideYieldingLongCommand()) return 1;
+        if (isInsideYieldingLongCommand()) {
+            atomic_fetch_sub_explicit(&rtc_lock_waiters, 1, memory_order_relaxed);
+            return 1;
+        }
     }
+    atomic_fetch_sub_explicit(&rtc_lock_waiters, 1, memory_order_relaxed);
     rtcTakeEngine();
     return 0;
+}
+
+/* afterSleep(), before the main thread takes the engine lock back: let IO
+ * threads already waiting for it go first, for up to 1 ms. */
+void rustIoRtcBeforeAcquire(void) {
+    if (!rust_io_rtc_active || atomic_load_explicit(&rtc_lock_waiters, memory_order_relaxed) == 0) return;
+    monotime start = getMonotonicUs();
+    while (atomic_load_explicit(&rtc_lock_waiters, memory_order_relaxed) > 0 && getMonotonicUs() - start < 1000)
+        sched_yield();
 }
 
 static void rtcUnlock(void) {
