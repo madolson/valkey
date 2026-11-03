@@ -1,0 +1,17 @@
+# Rust_io_timing
+rust_io_timing_sample_n:64
+rust_io_timing_dropped:0
+rust_io_timing_evicted:0
+rust_io_timing_queued:0
+rust_io_timing_replied:0
+stage_parsed:count=308162,p50=1877,p90=4437,p99=6826,max=252670
+stage_argv:count=308162,p50=319,p90=469,p99=1279,max=22413
+stage_precheck:count=0,p50=0,p90=0,p99=0,max=0
+stage_enqueued:count=308162,p50=3071,p90=6143,p99=8191,max=804531
+stage_dequeued:count=308162,p50=1922412,p90=2446707,p99=2621471,max=7906101
+stage_process_entry:count=308162,p50=6143,p90=10922,p99=17749,max=1143268
+stage_call_entry:count=308162,p50=63,p90=117,p99=159,max=578955
+stage_call_exit:count=308162,p50=554,p90=938,p99=1279,max=26420
+stage_reply_copied:count=308162,p50=786441,p90=1572883,p99=1922412,max=443580651
+stage_written:count=308162,p50=218455,p90=480602,p99=655367,max=16676203
+stage_end_to_end:count=308162,p50=3145766,p90=3495295,p99=3844825,max=445148364

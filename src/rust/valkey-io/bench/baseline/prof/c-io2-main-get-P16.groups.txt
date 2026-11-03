@@ -1,0 +1,17 @@
+samples: 6013
+group                                          self%   incl%
+call() and command procs                        19.1    57.3
+syscall:epoll_wait                              16.5    16.5
+clock reads (getMonotonicUs, ustime)            12.9    12.9
+event loop                                      12.2    96.7
+key prefetch (prefetchCommandQueueKeys)         11.8    11.8
+reply building                                   9.6    11.3
+processCommand checks                            7.2    44.8
+freeing argv                                     3.0     3.1
+prepareCommand and lookup                        2.9     4.2
+allocator: jemalloc (zmalloc)                    2.3     2.4
+memcpy/libc                                      2.0     4.4
+RESP parse / IO-thread logic                     0.2     0.2
+other                                            0.2     0.2
+precheck (IO-thread checks; main-thread token validate)     0.1     0.1
+syscall:other                                    0.0    12.1

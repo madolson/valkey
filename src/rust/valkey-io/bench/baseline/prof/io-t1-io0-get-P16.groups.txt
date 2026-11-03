@@ -1,0 +1,13 @@
+samples: 5918
+group                                          self%   incl%
+syscall:write                                   55.3    55.6
+RESP parse / IO-thread logic                    11.1    99.9
+syscall:read                                     7.7     7.7
+allocator: jemalloc (zmalloc)                    6.1     6.1
+allocator: glibc malloc (Rust Vec/VecDeque/Arc)     4.8     5.0
+syscall:other                                    4.4    69.9
+argv build (create_argv: createStringObject)     4.0    10.3
+handoff: pop/drain/kick                          3.5    61.7
+syscall:epoll_wait                               2.2     2.2
+memcpy/libc                                      0.7     1.1
+syscall:eventfd                                  0.3     0.3

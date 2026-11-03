@@ -28,6 +28,7 @@
  */
 
 #include "server.h"
+#include "rust_io_timing.h"
 #include "cluster.h"
 #include "cluster_slot_stats.h"
 #include "cluster_migrateslots.h"
@@ -2198,6 +2199,7 @@ void freeClientOriginalArgv(client *c) {
 }
 
 void freeClientArgv(client *c) {
+    RUST_IO_TIMING_FREE_ARGV_BEGIN();
     if (c->flag.argv_borrowed && !c->original_argv) {
         /* Client does not own the argv, and there is no original argv, so just clear the fields. */
         goto clear;
@@ -2216,6 +2218,7 @@ clear:
     c->argv_len_sum = 0;
     c->argv_len = 0;
     c->argv = NULL;
+    RUST_IO_TIMING_FREE_ARGV_END();
 }
 
 /* Close all the replicas connections. This is useful in chained replication
@@ -4600,6 +4603,7 @@ static bool consumeCommandQueue(client *c) {
     c->net_input_bytes_curr_cmd = p->input_bytes;
     c->parsed_cmd = p->cmd;
     c->slot = p->slot;
+    c->rust_precheck = p->rust_precheck;
     c->qb_applied += p->input_bytes;
     if (queue->off == queue->len) {
         /* The queue is empty. Don't free it here, because if parsing is done in

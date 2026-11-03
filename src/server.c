@@ -32,6 +32,7 @@
  * SPDX-License-Identifier: BSD-3-Clause
  */
 #include "server.h"
+#include "rust_io_timing.h"
 #include "hotkeys.h"
 #include "ordered_index.h"
 #include "connection.h"
@@ -1973,6 +1974,9 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
             processed += last_processed;
         } while (last_processed != 0);
         processed += freeClientsInAsyncFreeQueue();
+#ifdef USE_RUST_IO
+        rustIoBeforePoll(0);
+#endif
         server.events_processed_while_blocked += processed;
         return;
     }
@@ -2138,6 +2142,9 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
 
     /* Don't sleep at all before the next beforeSleep() if needed (e.g. a
      * connection has pending data) */
+#ifdef USE_RUST_IO
+    if (rustIoBeforePoll(1)) dont_sleep = 1;
+#endif
     aeSetDontWait(server.el, dont_sleep);
 
     IOThreadsBeforeSleep(current_time);
@@ -2196,6 +2203,9 @@ void afterSleep(struct aeEventLoop *eventLoop, int numevents) {
     }
 
     IOThreadsAfterSleep(numevents);
+#ifdef USE_RUST_IO
+    rustIoAfterPoll();
+#endif
 }
 
 /* Callback invoked by the event loop after draining priority events.
@@ -2933,6 +2943,10 @@ int listenToPort(connListener *sfd) {
 void resetServerStats(void) {
     int j;
 
+#if defined(USE_RUST_IO) && defined(RUST_IO_TIMING)
+    ritReset();
+#endif
+
     server.stat_numcommands = 0;
     server.stat_numconnections = 0;
     server.stat_expiredkeys = 0;
@@ -3322,7 +3336,11 @@ void initListeners(void) {
     /* Setup listeners from server config for TCP/TLS/Unix */
     ConnectionType *ct;
     connListener *listener;
+#ifdef USE_RUST_IO
+    if (server.port != 0 && !rustIoTakesOverPort()) {
+#else
     if (server.port != 0) {
+#endif
         ct = connectionByType(CONN_TYPE_SOCKET);
         if (!ct) serverPanic("Failed finding connection listener of %s", getConnectionTypeName(CONN_TYPE_SOCKET));
         listener = &server.listeners[CONN_TYPE_SOCKET];
@@ -3391,6 +3409,10 @@ void initListeners(void) {
 
         listen_fds += listener->count;
     }
+
+#ifdef USE_RUST_IO
+    listen_fds += rustIoInitListeners();
+#endif
 
     if (listen_fds == 0) {
         serverLog(LL_WARNING, "Configured to not listen anywhere, exiting.");
@@ -4168,6 +4190,7 @@ int incrCommandStatsOnError(struct serverCommand *cmd, int flags) {
  */
 void call(client *c, int flags) {
     if (bgIteration_blockClientIfRequired(c)) return;
+    RUST_IO_TIMING_HOOK(c, RIT_CALL);
 
     server.in_call++;
 
@@ -4444,6 +4467,7 @@ void call(client *c, int flags) {
 
     server.executing_client = prev_client;
     server.in_call--;
+    RUST_IO_TIMING_HOOK(c, RIT_CALL_EXIT);
 }
 
 /* Used when a command that is ready for execution needs to be rejected, due to
@@ -4592,7 +4616,7 @@ uint64_t getCommandFlags(client *c) {
  * processing, including looking up the command, checking arity and calculating
  * cluster slot. This should be done before calling processCommand() and can be
  * done by I/O threads to offload the main-thread. */
-static void prepareCommandGeneric(robj **argv, int argc, int *read_flags, struct serverCommand **cmd, int *slot) {
+void prepareCommandGeneric(robj **argv, int argc, int *read_flags, struct serverCommand **cmd, int *slot) {
     if (!(*read_flags & READ_FLAGS_PARSING_COMPLETED) || argc == 0) return;
     /* Make sure we don't do this twice. */
     debugServerAssert(*cmd == NULL && !(*read_flags & READ_FLAGS_COMMAND_NOT_FOUND));
@@ -4644,118 +4668,26 @@ void unprepareCommand(client *c) {
  * If C_OK is returned the client is still alive and valid and
  * other operations can be performed by the caller. Otherwise
  * if C_ERR is returned the client was destroyed (i.e. after QUIT). */
-int processCommand(client *c) {
-    serverAssert(!c->flag.blocked && !c->flag.unblocked);
+/* The flags processCommand() derives once per command and both halves read. */
+typedef struct commandContext {
+    uint64_t cmd_flags;
+    int is_exec;
+    int is_read_command, is_write_command, is_denyoom_command, is_denystale_command, is_denyloading_command;
+    int is_may_replicate_command, is_deny_async_loading_command;
+    int obey_client, is_keyless;
+} commandContext;
 
-    if (!scriptIsTimedOut()) {
-        /* Both EXEC and scripts call call() directly so there should be
-         * no way in_exec or scriptIsRunning() is 1. */
-        serverAssert(!server.in_exec);
-        serverAssert(!scriptIsRunning());
-    }
-
-    /* in case we are starting to ProcessCommand and we already have a command we assume
-     * this is a reprocessing of this command, so we do not want to perform some of the actions again. */
-    int client_reprocessing_command = c->cmd ? 1 : 0;
-
-    /* only run command filter if not reprocessing command */
-    if (!client_reprocessing_command) {
-        moduleCallCommandFilters(c);
-        reqresAppendRequest(c);
-    }
-
-    /* If we're inside a module blocked context yielding that wants to avoid
-     * processing clients, postpone the command. */
-    if (server.busy_module_yield_flags != BUSY_MODULE_YIELD_NONE &&
-        !(server.busy_module_yield_flags & BUSY_MODULE_YIELD_CLIENTS)) {
-        blockPostponeClient(c);
-        return C_OK;
-    }
-
-    /* Now lookup the command and check ASAP about trivial error conditions
-     * such as wrong arity, bad command name and so forth.
-     * In case we are reprocessing a command after it was blocked,
-     * we do not have to repeat the same checks */
-    if (!client_reprocessing_command) {
-        struct serverCommand *cmd = c->parsed_cmd;
-        if (!cmd) {
-            /* Handle possible security attacks. */
-            if (!strcasecmp(objectGetVal(c->argv[0]), "host:") || !strcasecmp(objectGetVal(c->argv[0]), "post")) {
-                securityWarningCommand(c);
-                return C_ERR;
-            }
-            /* Check that the command lookup has been done before calling this
-             * function, by calling prepareCommand(). */
-            serverAssert(c->read_flags & READ_FLAGS_COMMAND_NOT_FOUND);
-        }
-        c->cmd = c->lastcmd = c->realcmd = cmd;
-
-        if (authRequired(c)) {
-            /* AUTH and HELLO and no auth commands are valid even in
-             * non-authenticated state. */
-            if (!c->cmd || !(c->cmd->flags & CMD_NO_AUTH)) {
-                rejectCommand(c, shared.noautherr, 0);
-                moduleFireCommandACLRejectedEvent(c, VALKEYMODULE_ACL_LOG_AUTH, -1);
-                return C_OK;
-            }
-        }
-
-        c->flag.buffered_reply = 0;
-        sds err;
-
-        if (!commandCheckExistence(c, &err)) {
-            rejectCommandSds(c, err, 1);
-            return C_OK;
-        }
-        if (c->read_flags & READ_FLAGS_BAD_ARITY) {
-            /* Already detected this, but do it again just to get the error message. */
-            serverAssert(!commandCheckArity(c->cmd, c->argc, &err));
-            rejectCommandSds(c, err, 1);
-            return C_OK;
-        }
-
-        /* Check if the command is marked as protected and the relevant configuration allows it */
-        if (c->cmd->flags & CMD_PROTECTED) {
-            if ((c->cmd->proc == debugCommand && !allowProtectedAction(server.enable_debug_cmd, c)) ||
-                (c->cmd->proc == moduleCommand && !allowProtectedAction(server.enable_module_cmd, c))) {
-                sds protected_err = sdscatprintf(
-                    sdsempty(),
-                    "%s command not allowed. If the %s option is set to \"local\", "
-                    "you can run it from a local connection, otherwise you need to set this option "
-                    "in the configuration file, and then restart the server.",
-                    c->cmd->proc == debugCommand ? "DEBUG" : "MODULE",
-                    c->cmd->proc == debugCommand ? "enable-debug-command" : "enable-module-command");
-                sdsmapchars(protected_err, "\r\n", "  ", 2);
-                rejectCommandSds(c, protected_err, 1);
-                return C_OK;
-            }
-        }
-    }
-
-    uint64_t cmd_flags = getCommandFlags(c);
-
-    int is_exec = (c->mstate && c->cmd->proc == execCommand);
-    int ms_flags = is_exec ? c->mstate->cmd_flags : 0;
-    int ms_inv_flags = is_exec ? c->mstate->cmd_inv_flags : 0;
-    int combined_flags = cmd_flags | ms_flags;
-    int combined_inv_flags = (~cmd_flags | ms_inv_flags);
-
-    int is_read_command = (combined_flags & CMD_READONLY);
-    int is_write_command = (combined_flags & CMD_WRITE);
-    int is_denyoom_command = (combined_flags & CMD_DENYOOM);
-    int is_denystale_command = (combined_inv_flags & CMD_STALE);
-    int is_denyloading_command = (combined_inv_flags & CMD_LOADING);
-    int is_may_replicate_command = (combined_flags & (CMD_WRITE | CMD_MAY_REPLICATE));
-    int is_deny_async_loading_command = (combined_flags & CMD_NO_ASYNC_LOADING);
-
-    const int obey_client = mustObeyClient(c);
+/* The checks a session-aware IO layer can run off the engine thread against
+ * a policy snapshot (rust-io precheck): NO_MULTI, ACL, cluster routing.
+ * Returns 0 when the command was rejected (the reply is queued). */
+static inline int processCommandChecks(client *c, const commandContext *x) {
 
     if (c->flag.multi && c->cmd->flags & CMD_NO_MULTI) {
         sds nomulti_err =
             sdscatprintf(sdsempty(), "Command '%s' not allowed inside a transaction", c->cmd->fullname);
         sdsmapchars(nomulti_err, "\r\n", "  ", 2);
         rejectCommandSds(c, nomulti_err, 1);
-        return C_OK;
+        return 0;
     }
 
     /* Check if the user can run this command according to the current
@@ -4776,15 +4708,14 @@ int processCommand(client *c) {
         default: acl_subevent = VALKEYMODULE_ACL_LOG_CMD; break;
         }
         moduleFireCommandACLRejectedEvent(c, acl_subevent, acl_errpos);
-        return C_OK;
+        return 0;
     }
 
     /* If cluster is enabled perform the cluster redirection here.
      * However we don't perform the redirection if:
      * 1) The sender of this command is our primary.
      * 2) The command has no key arguments. */
-    int is_keyless = (c->read_flags & READ_FLAGS_NO_KEYS) && c->cmd->proc != execCommand;
-    if (server.cluster_enabled && !obey_client && !is_keyless) {
+    if (server.cluster_enabled && !x->obey_client && !x->is_keyless) {
         int error_code;
         clusterNode *n = getNodeByQuery(c, &error_code);
         if (n == NULL || !clusterNodeIsMyself(n)) {
@@ -4797,17 +4728,25 @@ int processCommand(client *c) {
             c->duration = 0;
             c->cmd->rejected_calls++;
             moduleFireCommandRejectedEvent(c, NULL);
-            return C_OK;
+            return 0;
         }
     }
 
+    return 1;
+}
+
+/* Execute a prepared command: the live-state gates (redirect, OOM, disk
+ * errors, min-replicas, read-only replica, loading, busy script, pause,
+ * throttle), then MULTI queueing or call(). The #3381 durability bracket
+ * and a tiering gate belong here, right around call(). */
+static inline int processCommandExecute(client *c, const commandContext *x) {
     /* If the client has the redirect capability, redirect keyless
      * commands to the primary when this is a replica and the client
      * has not opted into replica reads with READONLY. EXEC with all-keyless
      * queued commands is also considered keyless (c->slot remains -1 as set
      * by prepareCommand when no keys are found). */
-    int is_keyless_exec = is_exec && c->slot == -1;
-    if (server.cluster_enabled && !obey_client && (is_keyless || is_keyless_exec) && (is_read_command || is_write_command) &&
+    int is_keyless_exec = x->is_exec && c->slot == -1;
+    if (server.cluster_enabled && !x->obey_client && (x->is_keyless || is_keyless_exec) && (x->is_read_command || x->is_write_command) &&
         (c->capa & CLIENT_CAPA_REDIRECT) && !c->flag.readonly) {
         clusterNode *myself = getMyClusterNode();
         if (clusterNodeIsReplica(myself)) {
@@ -4827,8 +4766,8 @@ int processCommand(client *c) {
         }
     }
 
-    if (clientSupportStandAloneRedirect(c) && !obey_client &&
-        (is_write_command || (is_read_command && !c->flag.readonly))) {
+    if (clientSupportStandAloneRedirect(c) && !x->obey_client &&
+        (x->is_write_command || (x->is_read_command && !c->flag.readonly))) {
         if (server.failover_state == FAILOVER_IN_PROGRESS) {
             /* During the FAILOVER process, when conditions are met (such as
              * when the force time is reached or the primary and replica offsets
@@ -4892,7 +4831,7 @@ int processCommand(client *c) {
          * in a replica, that may be the active client, to be freed. */
         if (server.current_client == NULL) return C_ERR;
 
-        if (out_of_memory && is_denyoom_command) {
+        if (out_of_memory && x->is_denyoom_command) {
             if (c->slot_migration_job != NULL) {
                 clusterHandleSlotMigrationClientOOM(c->slot_migration_job);
                 return C_ERR;
@@ -4918,8 +4857,8 @@ int processCommand(client *c) {
      * unless coming from our primary, in which case check the replica ignore
      * disk write error config to either log or crash. */
     int deny_write_type = writeCommandsDeniedByDiskError();
-    if (deny_write_type != DISK_ERROR_TYPE_NONE && (is_write_command || c->cmd->proc == pingCommand)) {
-        if (obey_client) {
+    if (deny_write_type != DISK_ERROR_TYPE_NONE && (x->is_write_command || c->cmd->proc == pingCommand)) {
+        if (x->obey_client) {
             if (!server.repl_ignore_disk_write_error && c->cmd->proc != pingCommand) {
                 serverPanic("Replica was unable to write command to disk.");
             } else {
@@ -4942,14 +4881,14 @@ int processCommand(client *c) {
 
     /* Don't accept write commands if there are not enough good replicas and
      * user configured the min-replicas-to-write option. */
-    if (is_write_command && !checkGoodReplicasStatus()) {
+    if (x->is_write_command && !checkGoodReplicasStatus()) {
         rejectCommand(c, shared.noreplicaserr, 1);
         return C_OK;
     }
 
     /* Don't accept write commands if this is a read only replica. But
      * accept write commands if this is our primary. */
-    if (server.primary_host && server.repl_replica_ro && !obey_client && is_write_command) {
+    if (server.primary_host && server.repl_replica_ro && !x->obey_client && x->is_write_command) {
         rejectCommand(c, shared.roreplicaerr, 1);
         return C_OK;
     }
@@ -4973,20 +4912,20 @@ int processCommand(client *c) {
      * when replica-serve-stale-data is no and we are a replica with a broken
      * link with primary. */
     if (server.primary_host && server.repl_state != REPL_STATE_CONNECTED && server.repl_serve_stale_data == 0 &&
-        is_denystale_command) {
+        x->is_denystale_command) {
         rejectCommand(c, shared.primarydownerr, 1);
         return C_OK;
     }
 
     /* Loading DB? Return an error if the command has not the
      * CMD_LOADING flag. */
-    if (server.loading && !server.async_loading && is_denyloading_command) {
+    if (server.loading && !server.async_loading && x->is_denyloading_command) {
         rejectCommand(c, shared.loadingerr, 1);
         return C_OK;
     }
 
     /* During async-loading, block certain commands. */
-    if (server.async_loading && is_deny_async_loading_command) {
+    if (server.async_loading && x->is_deny_async_loading_command) {
         rejectCommand(c, shared.loadingerr, 1);
         return C_OK;
     }
@@ -5016,7 +4955,7 @@ int processCommand(client *c) {
     /* Prevent a replica from sending commands that access the keyspace.
      * The main objective here is to prevent abuse of client pause check
      * from which replicas are exempt. */
-    if (c->flag.replica && (is_may_replicate_command || is_write_command || is_read_command)) {
+    if (c->flag.replica && (x->is_may_replicate_command || x->is_write_command || x->is_read_command)) {
         sds replica_err = sdsnew("Replica can't interact with the keyspace");
         rejectCommandSds(c, replica_err, 1);
         return C_OK;
@@ -5025,7 +4964,7 @@ int processCommand(client *c) {
     /* If the server is paused, block the client until the pause has ended. Replicas and slot
      * export clients are never paused to allow failover/slot migration to succeed. */
     if (!c->flag.replica && (!c->slot_migration_job || isImportSlotMigrationJob(c->slot_migration_job)) &&
-        ((isPausedActions(PAUSE_ACTION_CLIENT_ALL)) || ((isPausedActions(PAUSE_ACTION_CLIENT_WRITE)) && is_may_replicate_command))) {
+        ((isPausedActions(PAUSE_ACTION_CLIENT_ALL)) || ((isPausedActions(PAUSE_ACTION_CLIENT_WRITE)) && x->is_may_replicate_command))) {
         blockPostponeClient(c);
         return C_OK;
     }
@@ -5036,7 +4975,7 @@ int processCommand(client *c) {
     if (c->flag.multi && c->cmd->proc != execCommand && c->cmd->proc != discardCommand &&
         c->cmd->proc != quitCommand &&
         c->cmd->proc != resetCommand) {
-        queueMultiCommand(c, cmd_flags);
+        queueMultiCommand(c, x->cmd_flags);
         addReply(c, shared.queued);
     } else {
         int flags = CMD_CALL_FULL;
@@ -5044,6 +4983,130 @@ int processCommand(client *c) {
         if (listLength(server.ready_keys) && !isInsideYieldingLongCommand()) handleClientsBlockedOnKeys();
     }
     return C_OK;
+}
+
+
+int processCommand(client *c) {
+    RUST_IO_TIMING_HOOK(c, RIT_PROCESS);
+    serverAssert(!c->flag.blocked && !c->flag.unblocked);
+
+    if (!scriptIsTimedOut()) {
+        /* Both EXEC and scripts call call() directly so there should be
+         * no way in_exec or scriptIsRunning() is 1. */
+        serverAssert(!server.in_exec);
+        serverAssert(!scriptIsRunning());
+    }
+
+    /* in case we are starting to ProcessCommand and we already have a command we assume
+     * this is a reprocessing of this command, so we do not want to perform some of the actions again. */
+    int client_reprocessing_command = c->cmd ? 1 : 0;
+
+    /* rust-io precheck mode: the IO thread already ran the auth, lookup,
+     * arity, protected, NO_MULTI, ACL and cluster routing checks and the
+     * result is still valid. No module command filter is registered. */
+    int prechecked = 0;
+#ifdef USE_RUST_IO
+    if (!client_reprocessing_command) prechecked = rustPrecheckValidate(c);
+#endif
+
+    /* only run command filter if not reprocessing command */
+    if (!client_reprocessing_command) {
+        if (!prechecked) moduleCallCommandFilters(c);
+        reqresAppendRequest(c);
+    }
+
+    /* If we're inside a module blocked context yielding that wants to avoid
+     * processing clients, postpone the command. */
+    if (server.busy_module_yield_flags != BUSY_MODULE_YIELD_NONE &&
+        !(server.busy_module_yield_flags & BUSY_MODULE_YIELD_CLIENTS)) {
+        blockPostponeClient(c);
+        return C_OK;
+    }
+
+    /* Now lookup the command and check ASAP about trivial error conditions
+     * such as wrong arity, bad command name and so forth.
+     * In case we are reprocessing a command after it was blocked,
+     * we do not have to repeat the same checks */
+    if (prechecked) {
+        c->cmd = c->lastcmd = c->realcmd = c->parsed_cmd;
+        c->flag.buffered_reply = 0;
+    } else if (!client_reprocessing_command) {
+        struct serverCommand *cmd = c->parsed_cmd;
+        if (!cmd) {
+            /* Handle possible security attacks. */
+            if (!strcasecmp(objectGetVal(c->argv[0]), "host:") || !strcasecmp(objectGetVal(c->argv[0]), "post")) {
+                securityWarningCommand(c);
+                return C_ERR;
+            }
+            /* Check that the command lookup has been done before calling this
+             * function, by calling prepareCommand(). */
+            serverAssert(c->read_flags & READ_FLAGS_COMMAND_NOT_FOUND);
+        }
+        c->cmd = c->lastcmd = c->realcmd = cmd;
+
+        if (authRequired(c)) {
+            /* AUTH and HELLO and no auth commands are valid even in
+             * non-authenticated state. */
+            if (!c->cmd || !(c->cmd->flags & CMD_NO_AUTH)) {
+                rejectCommand(c, shared.noautherr, 0);
+                moduleFireCommandACLRejectedEvent(c, VALKEYMODULE_ACL_LOG_AUTH, -1);
+                return C_OK;
+            }
+        }
+
+        c->flag.buffered_reply = 0;
+        sds err;
+
+        if (!commandCheckExistence(c, &err)) {
+            rejectCommandSds(c, err, 1);
+            return C_OK;
+        }
+        if (c->read_flags & READ_FLAGS_BAD_ARITY) {
+            /* Already detected this, but do it again just to get the error message. */
+            serverAssert(!commandCheckArity(c->cmd, c->argc, &err));
+            rejectCommandSds(c, err, 1);
+            return C_OK;
+        }
+
+        /* Check if the command is marked as protected and the relevant configuration allows it */
+        if (c->cmd->flags & CMD_PROTECTED) {
+            if ((c->cmd->proc == debugCommand && !allowProtectedAction(server.enable_debug_cmd, c)) ||
+                (c->cmd->proc == moduleCommand && !allowProtectedAction(server.enable_module_cmd, c))) {
+                sds protected_err = sdscatprintf(
+                    sdsempty(),
+                    "%s command not allowed. If the %s option is set to \"local\", "
+                    "you can run it from a local connection, otherwise you need to set this option "
+                    "in the configuration file, and then restart the server.",
+                    c->cmd->proc == debugCommand ? "DEBUG" : "MODULE",
+                    c->cmd->proc == debugCommand ? "enable-debug-command" : "enable-module-command");
+                sdsmapchars(protected_err, "\r\n", "  ", 2);
+                rejectCommandSds(c, protected_err, 1);
+                return C_OK;
+            }
+        }
+    }
+
+    commandContext ctx;
+    ctx.cmd_flags = getCommandFlags(c);
+    ctx.is_exec = (c->mstate && c->cmd->proc == execCommand);
+    int ms_flags = ctx.is_exec ? c->mstate->cmd_flags : 0;
+    int ms_inv_flags = ctx.is_exec ? c->mstate->cmd_inv_flags : 0;
+    int combined_flags = ctx.cmd_flags | ms_flags;
+    int combined_inv_flags = (~ctx.cmd_flags | ms_inv_flags);
+
+    ctx.is_read_command = (combined_flags & CMD_READONLY);
+    ctx.is_write_command = (combined_flags & CMD_WRITE);
+    ctx.is_denyoom_command = (combined_flags & CMD_DENYOOM);
+    ctx.is_denystale_command = (combined_inv_flags & CMD_STALE);
+    ctx.is_denyloading_command = (combined_inv_flags & CMD_LOADING);
+    ctx.is_may_replicate_command = (combined_flags & (CMD_WRITE | CMD_MAY_REPLICATE));
+    ctx.is_deny_async_loading_command = (combined_flags & CMD_NO_ASYNC_LOADING);
+    ctx.obey_client = mustObeyClient(c);
+    ctx.is_keyless = (c->read_flags & READ_FLAGS_NO_KEYS) && c->cmd->proc != execCommand;
+
+    /* rust-io precheck mode ran processCommandChecks() on the IO thread. */
+    if (!prechecked && !processCommandChecks(c, &ctx)) return C_OK;
+    return processCommandExecute(c, &ctx);
 }
 
 /* ====================== Error lookup and execution ===================== */
@@ -5343,6 +5406,9 @@ int finishShutdown(void) {
     /* Best effort flush of replica output buffers, so that we hopefully
      * send them pending writes. */
     flushReplicasOutputBuffers();
+#ifdef USE_RUST_IO
+    rustIoFlushReplicas(1000);
+#endif
 
     /* Close the listening sockets. Apparently this allows faster restarts. */
     closeListeningSockets(1);
@@ -7215,6 +7281,21 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
         info = throttleRepl_sdscatInfoMetrics(info);
     }
 
+#ifdef USE_RUST_IO
+    /* rust-io precheck counters, only when asked for by name. */
+    if (dictFind(section_dict, "rust_io") != NULL) {
+        if (sections++) info = sdscat(info, "\r\n");
+        info = rustPrecheckCatInfo(info);
+        info = rustIoCatInfo(info);
+    }
+#ifdef RUST_IO_TIMING
+    if (dictFind(section_dict, "rust_io_timing") != NULL) {
+        if (sections++) info = sdscat(info, "\r\n");
+        info = ritCatInfo(info);
+    }
+#endif
+#endif
+
     /* Get info from modules.
      * Returned when the user asked for "everything", "modules", or a specific module section.
      * We're not aware of the module section names here, and we rather avoid the search when we can.
@@ -8235,6 +8316,9 @@ __attribute__((weak)) int main(int argc, char **argv) {
 
             serverLog(LL_NOTICE, "Ready to accept connections %s", getConnectionTypeName(listener->ct->get_type()));
         }
+#ifdef USE_RUST_IO
+        rustIoLogReady();
+#endif
 
         if (server.supervised_mode == SUPERVISED_SYSTEMD) {
             if (!server.primary_host) {

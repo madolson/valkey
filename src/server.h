@@ -81,6 +81,7 @@
 #include "expire.h"     /* Expiration public API */
 #include "rax.h"        /* Radix tree */
 #include "connection.h" /* Connection abstraction */
+#include "rust_io.h"   /* Rust IO layer bridge, USE_RUST_IO only */
 #include "memory_prefetch.h"
 #include "vset.h"
 #include "trace/trace.h"
@@ -1384,6 +1385,7 @@ typedef struct parsedCommand {
     size_t argv_len_sum;
     unsigned long long input_bytes;
     struct serverCommand *cmd;
+    unsigned long long rust_precheck; /* rust-io precheck token, see rust_io_precheck.h */
 } parsedCommand;
 
 /* Queue of parsed commands. */
@@ -1430,6 +1432,7 @@ typedef struct client {
     struct serverCommand *lastcmd;    /* Last command executed. */
     struct serverCommand *realcmd;    /* The original command that was executed by the client */
     struct serverCommand *parsed_cmd; /* The command that was parsed. */
+    unsigned long long rust_precheck; /* rust-io precheck token of the current command */
     time_t last_interaction;          /* Time of the last interaction, used for timeout */
     serverDb *db;                     /* Pointer to currently SELECTed DB. */
     /* Client state structs. */
@@ -3679,6 +3682,7 @@ int overMaxmemoryAfterAlloc(size_t moremem);
 uint64_t getCommandFlags(client *c);
 void prepareCommand(client *c);
 void prepareCommandQueue(client *c);
+void prepareCommandGeneric(robj **argv, int argc, int *read_flags, struct serverCommand **cmd, int *slot);
 void unprepareCommand(client *c);
 int processCommand(client *c);
 int processPendingCommandAndInputBuffer(client *c);

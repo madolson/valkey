@@ -561,6 +561,17 @@ void clusterCommandSyncSlotsEstablish(client *c) {
         return;
     }
 
+#ifdef USE_RUST_IO
+    /* An import job turns this client into a replicated client, whose
+     * offsets are computed from c->querybuf. Rust connections have no query
+     * buffer (commands arrive parsed), so the first applied command fails
+     * the reploff assertion in commandProcessed(). Fail the migration. */
+    if (c->conn && connIsExternal(c->conn)) {
+        addReplyError(c, "CLUSTER SYNCSLOTS ESTABLISH is not supported on a rust-io connection");
+        return;
+    }
+#endif
+
     if (!mustObeyClient(c) && validateSlotMigrationCanStartOrReply(c) == C_ERR) {
         return;
     }
