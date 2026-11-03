@@ -228,6 +228,7 @@ pub unsafe extern "C" fn vio_conn_pop_cmds(h: ConnRef<'_>, out: *mut VioCmd, max
             // SAFETY: i < n <= max, and the caller provides max slots.
             unsafe { out.add(i).write(sh.cmds.pop_front().unwrap()) };
         }
+        conn.ncmds.store(sh.cmds.len(), Ordering::Release);
         (n, sh.cmds.len())
     };
     global().adm.popped(n);
@@ -241,7 +242,7 @@ pub unsafe extern "C" fn vio_conn_pop_cmds(h: ConnRef<'_>, out: *mut VioCmd, max
 /// `h` must be a live handle.
 #[no_mangle]
 pub unsafe extern "C" fn vio_conn_pending_cmds(h: ConnRef<'_>) -> usize {
-    h.shared.lock().unwrap().cmds.len()
+    h.ncmds.load(Ordering::Acquire)
 }
 
 /// Bytes accepted from the engine and not yet written to the socket.
@@ -402,7 +403,11 @@ pub unsafe extern "C" fn vio_conn_close(h: ConnRef<'_>) {
     let conn = h.arc();
     /* Commands the engine will never pop: free them now instead of when
      * the output drains, so they stop counting against the queued budget. */
-    let dropped: Vec<VioCmd> = conn.shared.lock().unwrap().cmds.drain(..).collect();
+    let dropped: Vec<VioCmd> = {
+        let mut sh = conn.shared.lock().unwrap();
+        conn.ncmds.store(0, Ordering::Release);
+        sh.cmds.drain(..).collect()
+    };
     global().adm.popped(dropped.len());
     for cmd in dropped {
         if !cmd.argv.is_null() {

@@ -136,6 +136,11 @@ pub struct Conn {
     half_close: AtomicBool,
     /// Bytes accepted from the engine and not yet written to the socket.
     out_bytes: AtomicUsize,
+    /// `shared.cmds.len()`, stored under the lock by whoever changed it, so
+    /// the engine can ask for it without taking the lock. A stale zero is
+    /// harmless: commands queued after the engine's last pop announce
+    /// themselves with a new readiness (in_ready was cleared before the pop).
+    ncmds: AtomicUsize,
     /// Zero-copy write job in flight (engine pointer), 0 if none. Set by
     /// the engine thread, taken by the IO thread. At most one.
     job: AtomicUsize,
@@ -480,6 +485,7 @@ impl Worker {
             auth_required: AtomicBool::new(DEFAULT_AUTH_REQUIRED.load(Ordering::Relaxed)),
             parse_held: AtomicBool::new(false),
             half_close: AtomicBool::new(false),
+            ncmds: AtomicUsize::new(0),
             out_bytes: AtomicUsize::new(0),
             job: AtomicUsize::new(0),
             shared: Mutex::new(Shared { cmds: VecDeque::new(), out: Vec::new() }),
@@ -743,6 +749,7 @@ impl Worker {
                     timing::stamp(c.trace, timing::ST_ENQUEUED);
                 }
                 sh.cmds.extend(batch);
+                conn.ncmds.store(sh.cmds.len(), Ordering::Release);
                 sh.cmds.len()
             };
             g.adm.queued_add(n);
@@ -843,7 +850,7 @@ impl Worker {
             self.remove(idx);
             return;
         }
-        if conn.read_paused.load(Ordering::Acquire) && global().adm.may_resume(conn.shared.lock().unwrap().cmds.len()) {
+        if conn.read_paused.load(Ordering::Acquire) && global().adm.may_resume(conn.ncmds.load(Ordering::Acquire)) {
             conn.read_paused.store(false, Ordering::Release);
         }
         self.flush(idx);

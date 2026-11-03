@@ -169,6 +169,10 @@ static int rustIoPull(rustConnection *rc, client *c) {
         size_t n = vio_conn_pop_cmds(rc->h, cmds, want);
         if (n == 0) break;
         pulled += engineSubmit(c, (const engineCmd *)cmds, n, &rc->pending_err, &rc->pending_err_byte, &bytes);
+        /* Fewer than asked: the queue was empty. Asking again only takes the
+         * connection's lock to find it still empty (or newer commands, which
+         * the IO thread announces with another readiness). */
+        if (n < want) break;
     }
     rc->pulled += pulled;
     if (pulled) engineAccountRead(c, bytes);

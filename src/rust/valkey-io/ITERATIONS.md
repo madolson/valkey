@@ -278,3 +278,41 @@ miri 18 passed. unit/client-eviction aborted on its first input-side test
 in both modes; later gates skip the three input-side tests as iteration 1
 did. Verdict: KEEP.
 
+
+## Step 1b: fewer lock round trips per delivery
+
+Each delivery took the connection's `shared` mutex three times: one
+`vio_conn_pop_cmds()` that got the commands, a second one that found the
+queue empty (`rustIoPull()` looped until 0), and `vio_conn_pending_cmds()`
+right after (`rustIoDeliverPull()`). The line is written by the IO thread
+that queues commands, so each round trip is a likely cache miss on the
+engine thread. Change: `rustIoPull()` stops when a pop returns fewer than
+it asked for, and `Conn::ncmds` mirrors the queue length (stored under the
+lock), so `vio_conn_pending_cmds()` is one load.
+
+Prediction: two of three lock round trips go away per delivery. -P 16
+(16 commands per delivery): -2 to -5 ns/request main, RPS +0.5% to +1.5%
+at T=4 GET. -P 1 (one command per delivery): -4% to -8% main ns/request,
+RPS unchanged (client-bound).
+
+Result: the first `s1b` run had 3.3-6.1% spreads at T=4 (rep 3 slow in
+every cell, foreign load), so T=4 was rerun for both binaries back to back
+(`s1a-r`, `s1b-r`):
+
+| T | test | P | RPS s1a -> s1b | main ns/req s1a -> s1b |
+|---|---|---|---|---|
+| 4 | GET | 16 | 2,716,118 -> 2,728,972 (+0.5%) | 363 -> 349 (-3.8%) |
+| 4 | SET | 16 | 1,758,666 -> 1,833,623 (+4.3%) | 568 -> 545 (-4.0%) |
+| 4 | GET | 1 | 221,571 -> 221,955 (+0.2%) | 815 -> 802 (-1.6%) |
+| 4 | SET | 1 | 219,642 -> 220,905 (+0.6%) | 972 -> 951 (-2.2%) |
+| 8 | GET | 16 | 2,724,327 -> 2,741,906 (+0.6%) | 367 -> 364 (-0.9%) |
+| 8 | SET | 16 | 1,747,125 -> 1,774,440 (+1.6%) | 572 -> 564 (-1.4%) |
+
+Spreads 0.3-1.8% in the rerun. -P 16 beat the prediction in ns (-14 and
+-23 ns at T=4), but GET RPS moved only +0.5%: at 2.73M the main thread is
+at 95% and the three IO threads at 99% (`max_other_thread_pct` 98.8-99.1),
+so T=4 GET -P 16 is now IO-thread bound. -P 1 missed the prediction
+(-1.6%/-2.2%, predicted -4% to -8%). Gates (`gates/s1b/summary.txt`): the
+same as s1a; unit/client-eviction with the input-side tests skipped 8/8,
+unit/maxmemory 28/2 (input-buffer tests) in io and precheck, as in iteration
+1's copy mode. Verdict: KEEP.
