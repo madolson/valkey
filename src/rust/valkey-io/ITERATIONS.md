@@ -379,3 +379,81 @@ unit/client-eviction, unit/obuf-limits, with and without
 `SOAK EXIT 0`, `SERVER EXIT 0`, no `asan.*` report; 401,800 connections.
 Zero-copy engaged by default on that binary: three `GET` of a 200 KB value
 moved `rust_io_writes_submitted` 0 -> 3. Verdict: KEEP.
+
+## Step 3: call() reads zmalloc_used_memory() per command (upstreamable)
+
+Commit 8bb5292d7 here, cherry-picked from 18782f73d on branch
+`rust-io/iter3a-peak`, which is d80033654 (valkey-io/valkey unstable) plus
+that one commit. It also applies to the current upstream tip 7220c38f9
+(`git apply --check`). No Rust dependency.
+
+Change: `zmalloc_thread_used_memory()` returns the calling thread's own
+counter (one cache line it owns). call() runs the full
+`zmalloc_used_memory()` sum and peak update only when that counter grew
+since the thread's last peak update (`peak_thread_used`, thread-local).
+Growth on other threads alone is recorded by beforeSleep() and the cron, as
+before, and by getMaxmemoryState(), which already has the sum. New test in
+unit/info: SETRANGE of 50 MB and DEL in one write; without the call()
+update, `used_memory_peak` is 1,278,632 against the 41,297,016 it must
+exceed (pasted in the report).
+
+Prediction (stage 5b put the sum at 8% of C's main thread at 16 threads):
+GET -P 16 never grows the main thread's counter (argv are built and freed
+on IO threads, replies go into the fixed `c->buf`), and SET -P 16 at
+`-r 1000000` mostly overwrites (frees values the IO threads allocated), so
+the sum almost never runs per command. C io-threads: T=16 GET/SET -P 16
+main ns/req -6% to -8% (RPS +6% to +9%, the C main thread is the limit),
+T=8 -2% to -4%, T=4 -1% to -2%. Rust precheck: same order at T=16 (-4% to
+-7% main ns), within noise at T=4.
+
+Measurement. The first run (one server process per config, 3 reps) had
+4-17% spreads at T=8/16 with RPS falling from rep to rep in the same
+process (C T=16 GET 1.37M, 1.29M, 1.21M), so every step-3 cell was rerun
+with a fresh server per rep and the two binaries alternated
+(`tools/alt.sh`, 3 rounds, median). C = upstream d80033654 default builds
+without (`up-base`) and with (`up-peak`) the commit; Rust = s2 vs s3:
+
+| T | config | test | RPS before -> after | main ns/req before -> after | spreads |
+|---|---|---|---|---|---|
+| 4 | C io-threads | GET | 2,532,679 -> 2,597,552 (+2.6%) | 390 -> 377 | 5.2% / 5.1% |
+| 4 | C io-threads | SET | 1,760,008 -> 1,804,343 (+2.5%) | 568 -> 554 | 0.8% / 1.5% |
+| 8 | C io-threads | GET | 1,998,320 -> 2,134,670 (+6.8%) | 496 -> 462 | 18.3% / 11.8% |
+| 8 | C io-threads | SET | 1,686,666 -> 1,767,537 (+4.8%) | 592 -> 566 | 1.2% / 2.6% |
+| 16 | C io-threads | GET | 1,333,779 -> 1,420,022 (+6.5%) | 750 -> 704 | 4.4% / 1.5% |
+| 16 | C io-threads | SET | 1,094,239 -> 1,124,302 (+2.7%) | 914 -> 889 | 3.1% / 4.1% |
+| 4 | precheck | GET | 2,620,368 -> 2,580,033 (-1.5%) | 346 -> 355 | 2.3% / 3.2% |
+| 4 | precheck | SET | 1,775,762 -> 1,691,806 (-4.7%) | 559 -> 589 | 1.3% / 0.5% |
+| 8 | precheck | GET | 2,683,542 -> 2,640,858 (-1.6%) | 373 -> 379 | 1.5% / 2.6% |
+| 8 | precheck | SET | 1,752,608 -> 1,672,402 (-4.6%) | 571 -> 598 | 0.9% / 0.4% |
+| 16 | precheck | GET | 2,311,014 -> 2,427,956 (+5.1%) | 433 -> 411 | 0.9% / 2.6% |
+| 16 | precheck | SET | 1,600,016 -> 1,558,236 (-2.6%) | 624 -> 641 | 1.4% / 0.9% |
+
+C io-threads 16 GET -P 16 main-thread profile (`perf/s3-up-{base,peak}-c16-get-main.*`):
+`call` self 11.4% -> 5.0% and `zmalloc_used_memory` self 2.24% -> absent,
+so about 8.6% of main-thread samples go, as 5b found. RPS under the
+profiler did not rise (1.35M -> 1.28M, inside the per-process drift); the
+freed time reappears as memmove in reply building (28.1% -> 34.7%), so at
+16 threads C's main thread stalls on the IO threads' lines either way.
+
+Precheck SET regressed by 4.6-4.7%. A control binary `s3x` (this tree with
+call() back to an unconditional update, everything else as s3) was
+measured against s2 and s3, alternated: s3x vs s2 SET +4.1% (T=4) and
++2.5% (T=8); s3 vs s3x SET -5.5% (T=4) and -5.2% (T=16), GET T=16 +4.9% for
+s3. Main-thread `perf stat`, T=4 SET -P 16 (`tools/ipr.sh`):
+
+```
+s3:  instructions per_req=4727.6  cycles per_req=2044.5  branch-misses per_req=2.4
+s3x: instructions per_req=4761.0  cycles per_req=1868.3  branch-misses per_req=2.4
+s2:  instructions per_req=4767.4  cycles per_req=1953.2  branch-misses per_req=2.6
+```
+
+s3 retires 33-40 fewer instructions per SET (the sum it skips) and the
+same branch misses, but spends 4.7% more cycles than s2, while s2 and s3x
+run the same work and differ by 4.5% in cycles. I read that as a
+code-placement effect of the LTO build on the Rust SET path, not as cost
+of the gate, but I did not prove it (no frontend-stall counters were
+taken). Verdict: KEEP for the C commit (+2.5% to +6.8% on C io-threads,
+default-build tests unchanged: unit/info 33/0 with the new test,
+unit/memefficiency 36/0, unit/lazyfree 4/0, unit/other 56/0,
+unit/expire 85/0, unit/acl 127/0, unit/introspection 123/1 with the same
+failure on unmodified d80033654). The precheck SET -5% is open.
