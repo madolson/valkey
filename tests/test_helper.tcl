@@ -451,6 +451,22 @@ proc accept_test_clients {fd addr port} {
 #       ready to accept a new task.
 proc read_from_test_client fd {
     set bytes [gets $fd]
+    if {[eof $fd]} {
+        # The client died without sending a status. Report the task it was on,
+        # otherwise the missing byte count fails inside read and the run hangs
+        # until the inactivity timeout.
+        set task "unknown task"
+        if {[info exist ::active_clients_task($fd)]} {
+            set task $::active_clients_task($fd)
+        }
+        puts "\[[colorstr red exception]\]: test client died unexpectedly while running: $task"
+        if {[catch {write_test_failures} err]} {
+            puts "Warning: Failed to write test failures: $err"
+        }
+        kill_clients
+        force_kill_all_servers
+        exit 1
+    }
     set payload [read $fd $bytes]
     foreach {status data elapsed} $payload break
     set ::last_progress [clock seconds]
