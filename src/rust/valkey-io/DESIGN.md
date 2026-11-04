@@ -1,5 +1,8 @@
 # valkey-io: a Rust IO layer for valkey-server
 
+This file is the design history. The normative description of what exists is
+`design-docs/rust-io-layer-spec.md`; where the two disagree, the spec is right.
+
 Rust owns the client sockets, reads, RESP parsing and writes. Three cut
 points move more of the per-command path into the IO layer, and the modes
 are cumulative:
