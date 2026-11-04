@@ -171,7 +171,25 @@ void processUnblockedClients(void) {
 
         if (c->flag.module) {
             if (!c->flag.blocked) {
-                moduleCallCommandUnblockedHandler(c);
+                if (c->flag.pending_command) {
+                    /* The command never ran (BLOCKED_INUSE or BLOCKED_POSTPONE), so run it now
+                     * and hand the reply to the unblock handler, as unblockClientOnKey does. */
+                    client *old_client = server.current_client;
+                    server.current_client = c;
+                    enterExecutionUnit(1, 0);
+                    if (processCommandAndResetClient(c) == C_ERR) {
+                        exitExecutionUnit();
+                        server.current_client = old_client;
+                        continue;
+                    }
+                    if (!c->flag.blocked) moduleCallCommandUnblockedHandler(c);
+                    exitExecutionUnit();
+                    afterCommand(c);
+                    server.current_client = old_client;
+                    if (listLength(server.ready_keys)) handleClientsBlockedOnKeys();
+                } else {
+                    moduleCallCommandUnblockedHandler(c);
+                }
             }
             continue;
         }
