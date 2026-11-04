@@ -2008,6 +2008,16 @@ void addAuthErrReply(client *c, robj *err) {
     addReplyError(c, objectGetVal(err));
 }
 
+/* Subscriptions are kept when a client switches users, so disconnect the
+ * client if its new user can't access them, as when a user loses channel
+ * permissions. */
+void ACLKillPubsubClientIfUnauthorized(client *c) {
+    if (!c->flag.pubsub || ACLUserHasAllChannels(c->user)) return;
+    list *channels = ACLUserGetChannels(c->user);
+    if (ACLShouldKillPubsubClient(c, channels)) freeClientOrCloseLater(c, 1);
+    listRelease(channels);
+}
+
 /* This is like ACLCheckUserCredentials(), however if the user/pass
  * are correct, the connection is put in authenticated state and the
  * connection user reference is populated.
@@ -2019,6 +2029,7 @@ static int checkPasswordBasedAuth(client *c, robj *username, robj *password) {
     if (ACLCheckUserCredentials(username, password) == C_OK) {
         user *user = ACLGetUserByName(objectGetVal(username), sdslen(objectGetVal(username)));
         clientSetUser(c, user, 1);
+        ACLKillPubsubClientIfUnauthorized(c);
         moduleNotifyUserChanged(c);
         result = AUTH_OK;
     } else {
