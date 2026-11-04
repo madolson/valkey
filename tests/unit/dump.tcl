@@ -513,4 +513,23 @@ start_server {tags {"dump"}} {
         r debug set-skip-checksum-validation 0
         assert_match {*Bad data format*} $err
     } {} {needs:debug}
+
+    test {RESTORE rejects stream node exceeding stream-node-max-entries} {
+        # Build a dump with stream-node-max-entries 0 (unlimited) and
+        # stream-node-max-bytes 0 so 200 small entries land in one node,
+        # then try to restore it with the default entry limit of 100.
+        r config set stream-node-max-entries 0
+        r config set stream-node-max-bytes 0
+        r del _oversize_stream
+        for {set i 0} {$i < 200} {incr i} {
+            r xadd _oversize_stream * field value
+        }
+        set dump [r dump _oversize_stream]
+        r del _oversize_stream
+        r config set stream-node-max-entries 100
+        r config set stream-node-max-bytes 4096
+        catch {r restore _oversize_stream 0 $dump} err
+        assert_match {*Bad data format*} $err
+        assert_equal 0 [r exists _oversize_stream]
+    }
 }

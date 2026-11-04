@@ -4,6 +4,14 @@
 #include "rax.h"
 #include "listpack.h"
 
+/* Hard cap on stream listpack node size.  XADD rejects any single entry
+ * larger than this, so no node written by XADD exceeds this constant by
+ * more than a small fixed overhead.  Nodes larger than twice this value
+ * cannot have been written by a correctly behaving server; at 4 GiB a
+ * listpack overflows the uint32_t header and lpReplaceInteger() returns
+ * NULL, crashing on the next lpFirst() call. */
+#define STREAM_LISTPACK_MAX_SIZE (1 << 30)
+
 /* Stream item ID: a 128 bit number composed of a milliseconds time and
  * a sequence counter. IDs generated in the same millisecond (or in a past
  * millisecond if the clock jumped backward) will use the millisecond time
