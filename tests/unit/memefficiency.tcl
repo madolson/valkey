@@ -316,7 +316,17 @@ run_solo {defrag} {
                 # Make sure we had defrag hits during AOF loading.  Note that we don't worry about
                 # the actual fragmentation ratio here.  It will vary based on when defrag stopped
                 # mid-cycle.  Just check that we are defragging by the number of hits.
-                assert {[s active_defrag_hits] > 80000}
+                #
+                # We can't assert an absolute hit count.  During loading, defrag only runs from
+                # whileBlockedCron (src/server.c:1822 returns early unless a millisecond elapsed),
+                # and its duty cycle is a percentage of the elapsed wait (src/defrag.c:1071).  So
+                # the work defrag gets to do is bounded by the wall-clock duration of the replay,
+                # which is dominated by `key-load-delay` (src/aof.c:1705, src/debug.c:2619) and
+                # therefore by how expensive usleep(1) is on this machine.  A faster runner gets
+                # proportionally fewer hits without anything being wrong.
+                assert {[s total_active_defrag_time] > 0}
+                assert {[s active_defrag_hits] > 0}
+                assert {[s active_defrag_key_hits] > 0}
             }
             } ;# Active defrag - AOF loading
         }
