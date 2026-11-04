@@ -1764,6 +1764,17 @@ static int parseCommandTemplate(int argc, char **argv) {
         return 0;
     }
 
+    /* Dataset mode sends the whole template as one command per request, so a
+     * repeat count or ';' separator would reach the server as a literal
+     * argument while the client waits for one reply per parsed command. */
+    for (int i = 0; i < argc; i++) {
+        if ((i == 0 && sds_args[i][0] >= '1' && sds_args[i][0] <= '9') || !strcmp(sds_args[i], ";")) {
+            fprintf(stderr, "Error: Dataset mode does not support repeat counts or ';' separated commands\n");
+            sdsfreesplitres(sds_args, argc);
+            return 0;
+        }
+    }
+
     /* Detect field placeholders */
     config.has_field_placeholders = 0;
     for (int i = 0; i < argc; i++) {
