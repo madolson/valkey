@@ -553,15 +553,14 @@ static bool loadCaCertDir(SSL_CTX *ctx, const char *ca_cert_dir) {
         FILE *fp = fopen(full_path, "r");
         if (!fp) continue;
 
-        X509 *cert = PEM_read_X509(fp, NULL, NULL, NULL);
-        fclose(fp);
-
-        if (cert) {
+        X509 *cert;
+        while ((cert = PEM_read_X509(fp, NULL, NULL, NULL)) != NULL) {
             if (X509_STORE_add_cert(store, cert) != 1) {
                 unsigned long err = ERR_peek_last_error();
                 if (ERR_GET_REASON(err) != X509_R_CERT_ALREADY_IN_HASH_TABLE) {
                     serverLog(LL_WARNING, "Failed to add CA certificate from %s to store", full_path);
                     X509_free(cert);
+                    fclose(fp);
                     closedir(dir);
                     return false;
                 }
@@ -570,6 +569,9 @@ static bool loadCaCertDir(SSL_CTX *ctx, const char *ca_cert_dir) {
             X509_free(cert);
             loaded++;
         }
+        fclose(fp);
+        /* PEM_read_X509 leaves PEM_R_NO_START_LINE on the queue at EOF. */
+        ERR_clear_error();
     }
 
     closedir(dir);
