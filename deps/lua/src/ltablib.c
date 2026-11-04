@@ -15,6 +15,8 @@
 #include "lauxlib.h"
 #include "lualib.h"
 
+#include "ldebug.h"
+
 
 #define aux_getn(L,n)	(luaL_checktype(L, n, LUA_TTABLE), luaL_getn(L, n))
 
@@ -100,6 +102,7 @@ static int tinsert (lua_State *L) {
       pos = luaL_checkint(L, 2);  /* 2nd argument is the position */
       if (pos > e) e = pos;  /* `grow' array if necessary */
       for (i = e; i > pos; i--) {  /* move up elements */
+        luaG_countstep(L);
         lua_rawgeti(L, 1, i-1);
         lua_rawseti(L, 1, i);  /* t[i] = t[i-1] */
       }

@@ -19,6 +19,8 @@
 #include "lauxlib.h"
 #include "lualib.h"
 
+#include "ldebug.h"
+
 
 /* macro to `unsign' a character */
 #define uchar(c)        ((unsigned char)(c))
@@ -96,8 +98,10 @@ static int str_rep (lua_State *L) {
   const char *s = luaL_checklstring(L, 1, &l);
   int n = luaL_checkint(L, 2);
   luaL_buffinit(L, &b);
-  while (n-- > 0)
+  while (n-- > 0) {
+    luaG_countstep(L);
     luaL_addlstring(&b, s, l);
+  }
   luaL_pushresult(&b);
   return 1;
 }
@@ -363,6 +367,7 @@ static const char *match_capture (MatchState *ms, const char *s, int l) {
 
 
 static const char *match (MatchState *ms, const char *s, const char *p) {
+  luaG_countstep(ms->L);  /* backtracking can take exponential time */
   init: /* using goto's to optimize tail recursion */
   switch (*p) {
     case '(': {  /* start capture */
