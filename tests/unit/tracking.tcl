@@ -1134,4 +1134,49 @@ start_server {tags {"tracking network"}} {
     test {Coverage: Basic CLIENT GETREDIR} {
         r CLIENT GETREDIR
     } {-1}
+
+    test {CLIENT TRACKING REDIRECT rejects a client of another user} {
+        r ACL SETUSER tracker on nopass +@all ~* &*
+        set target [valkey_client]
+        set tracker [valkey_client]
+        $tracker AUTH tracker x
+        assert_error {*another user*} {$tracker CLIENT TRACKING on REDIRECT [$target CLIENT ID]}
+        $tracker close
+        $target close
+        r ACL DELUSER tracker
+    }
+
+    test {Tracking redirection breaks when the target authenticates as another user} {
+        r ACL SETUSER tracker on nopass +@all ~* &*
+        set target [valkey_client]
+        set tracker [valkey_client]
+        $tracker CLIENT TRACKING on BCAST REDIRECT [$target CLIENT ID]
+        $target AUTH tracker x
+        $target SUBSCRIBE __redis__:invalidate
+        r SET key1 1
+        assert_match {*broken_redirect*} [dict get [$tracker CLIENT TRACKINGINFO] flags]
+        $tracker close
+        $target close
+        r ACL DELUSER tracker
+    }
+
+    test {Tracking redirection stays broken after the tracking client authenticates back} {
+        r ACL SETUSER tracker on nopass +@all ~* &*
+        set target [valkey_deferring_client]
+        $target CLIENT ID
+        set target_id [$target read]
+        $target SUBSCRIBE __redis__:invalidate
+        $target read ; # Consume the SUBSCRIBE reply.
+        set tracker [valkey_client]
+        $tracker CLIENT TRACKING on BCAST REDIRECT $target_id
+        $tracker AUTH tracker x
+        r SET key1 1
+        $tracker AUTH default x
+        r SET key2 1
+        $target PING
+        assert_equal {pong {}} [$target read]
+        $tracker close
+        $target close
+        r ACL DELUSER tracker
+    }
 }

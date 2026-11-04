@@ -280,7 +280,11 @@ void sendTrackingMessage(client *c, char *keyname, size_t keylen, int proto) {
     int using_redirection = 0;
     if (c->pubsub_data->client_tracking_redirection) {
         client *redir = lookupClientByID(c->pubsub_data->client_tracking_redirection);
-        if (!redir || redir->flag.close_after_reply || redir->flag.close_asap) {
+        /* Either side may have re-authenticated since the redirection was set
+         * up, so check again that both belong to the same user. Once broken,
+         * stay broken: invalidations were already dropped. */
+        if (c->flag.tracking_broken_redir || !redir || redir->flag.close_after_reply || redir->flag.close_asap ||
+            redir->user != c->user) {
             c->flag.tracking_broken_redir = 1;
             /* We need to signal to the original connection that we
              * are unable to send invalidation messages to the redirected
