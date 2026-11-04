@@ -384,6 +384,7 @@ proc test_server_main {} {
     array set ::clients_start_time {}
     set ::clients_time_history {}
     set ::failed_tests {}
+    set ::timed_out_tests {}
     set ::ok_count 0
     set ::err_count 0
 
@@ -415,6 +416,9 @@ proc test_server_cron {} {
                         set file $::active_clients_file($fd)
                     }
                     lappend ::failed_tests "\[[colorstr red TIMEOUT]\]: $test_name in $file"
+                    # The display string above may carry ANSI color codes, so the
+                    # failures JSON writer gets the name and file separately.
+                    lappend ::timed_out_tests [list $test_name $file]
                     incr ::err_count
                 }
             }
@@ -660,6 +664,20 @@ proc write_test_failures {} {
         }
 
         lappend failures "\{\"test_name\":\"$test_name\",\"test_file\":\"$test_file\",\"status\":\"$status\",\"error\":\"$error_msg\"\}"
+    }
+
+    foreach timed_out $::timed_out_tests {
+        lassign $timed_out test_name test_file
+        if {$test_file eq ""} {
+            set test_file "unknown"
+        }
+        set error_msg "Test made no progress for $::timeout seconds and the run was aborted."
+
+        foreach var {test_name test_file error_msg} {
+            set $var [json_escape_string [set $var]]
+        }
+
+        lappend failures "\{\"test_name\":\"$test_name\",\"test_file\":\"$test_file\",\"status\":\"timeout\",\"error\":\"$error_msg\"\}"
     }
 
     set outdir [file dirname $::failures_output_file]
