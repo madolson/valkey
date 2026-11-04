@@ -34,7 +34,14 @@ pub struct CmdQueue(Mutex<Shared>);
 
 impl Default for CmdQueue {
     fn default() -> Self {
-        CmdQueue(Mutex::new(Shared { cmds: VecDeque::new(), out: Vec::new() }))
+        CmdQueue(Mutex::new(Shared {
+            cmds: VecDeque::new(),
+            cmds_input: 0,
+            cmds_argv: 0,
+            err_sample: Vec::new(),
+            err_input_len: 0,
+            out: Vec::new(),
+        }))
     }
 }
 
