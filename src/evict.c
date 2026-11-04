@@ -235,6 +235,23 @@ size_t freeMemoryGetNotCountedMemory(void) {
         overhead += clusterGetTotalSlotExportBufferMemory();
     }
 
+    /* Output sealed into a zero-copy write is released as soon as the IO
+     * thread has written it, like output that copy mode handed over. */
+    overhead += server.io_inflight_reply_bytes;
+
+    /* A client whose free was deferred (it is protected or has IO in flight,
+     * see freeClient()) gives its memory back once that completes. Evicting
+     * keys for it meanwhile is over-eviction: evictClients() already chose
+     * to free it. Replicas are covered by the replication buffer above. */
+    listIter li;
+    listNode *ln;
+    listRewind(server.clients_to_close, &li);
+    while ((ln = listNext(&li)) != NULL) {
+        client *c = listNodeValue(ln);
+        int type = getClientType(c);
+        if (type == CLIENT_TYPE_NORMAL || type == CLIENT_TYPE_PUBSUB) overhead += c->last_memory_usage;
+    }
+
     return overhead;
 }
 
@@ -268,7 +285,13 @@ int getMaxmemoryState(size_t *total, size_t *logical, size_t *tofree, float *lev
     /* Check if we are over the memory usage limit. If we are not, no need
      * to subtract the replicas output buffers. We can just return ASAP. */
     mem_reported = zmalloc_used_memory();
+#ifdef USE_RUST_IO
+    /* Client read buffers of the Rust IO layer (system allocator). */
+    mem_reported += rustIoHeldMemory();
+#endif
     if (total) *total = mem_reported;
+    /* call() skips the peak update when only other threads allocated. */
+    if (mem_reported > server.stat_peak_memory) server.stat_peak_memory = mem_reported;
 
     /* We may return ASAP if there is no need to compute the level. */
     if (!server.maxmemory) {

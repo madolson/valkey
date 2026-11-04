@@ -1,0 +1,239 @@
+   Compiling proc-macro2 v1.0.107
+   Compiling quote v1.0.47
+   Compiling unicode-ident v1.0.27
+   Compiling serde_core v1.0.229
+   Compiling zerocopy v0.8.63
+   Compiling libc v0.2.191
+   Compiling zmij v1.0.23
+   Compiling serde v1.0.229
+   Compiling cfg-if v1.0.5
+   Compiling autocfg v1.5.1
+   Compiling serde_json v1.0.154
+   Compiling syn v2.0.119
+   Compiling syn v3.0.9
+   Compiling num-traits v0.2.19
+   Compiling clap_lex v1.1.1
+   Compiling regex-syntax v0.8.11
+   Compiling either v1.19.0
+   Compiling itoa v1.0.18
+   Compiling serde_derive v1.0.229
+   Compiling memchr v2.8.3
+   Compiling zerocopy-derive v0.8.63
+   Compiling ciborium-io v0.2.2
+   Compiling anstyle v1.0.14
+   Compiling clap_builder v4.6.7
+   Compiling regex-automata v0.4.18
+   Compiling half v2.7.1
+   Compiling ciborium-ll v0.2.2
+   Compiling itertools v0.10.5
+   Compiling same-file v1.0.6
+   Compiling cast v0.3.0
+   Compiling criterion-plot v0.5.0
+   Compiling walkdir v2.5.0
+   Compiling tinytemplate v1.2.1
+   Compiling ciborium v0.2.2
+   Compiling regex v1.13.1
+   Compiling clap v4.6.7
+   Compiling is-terminal v0.4.17
+   Compiling once_cell v1.21.4
+   Compiling anes v0.1.6
+   Compiling oorandom v11.1.5
+   Compiling criterion v0.5.1
+   Compiling valkey-io v0.1.0 (/local/home/matolson/rust-io/wt/bench/src/rust/valkey-io)
+   Compiling valkey-io-benches v0.0.0 (/local/home/matolson/rust-io/wt/bench/src/rust/valkey-io/benches)
+    Finished `bench` profile [optimized + debuginfo] target(s) in 23.10s
+     Running benches/handoff.rs (target/release/deps/handoff-66e3fc78dd324daf)
+Benchmarking queue/push_pop_1
+Benchmarking queue/push_pop_1: Warming up for 3.0000 s
+Benchmarking queue/push_pop_1: Collecting 100 samples in estimated 5.0001 s (114M iterations)
+Benchmarking queue/push_pop_1: Analyzing
+queue/push_pop_1        time:   [40.459 ns 40.511 ns 40.582 ns]
+                        thrpt:  [24.642 Melem/s 24.685 Melem/s 24.716 Melem/s]
+Found 11 outliers among 100 measurements (11.00%)
+  3 (3.00%) high mild
+  8 (8.00%) high severe
+Benchmarking queue/push_pop_batch16
+Benchmarking queue/push_pop_batch16: Warming up for 3.0000 s
+Benchmarking queue/push_pop_batch16: Collecting 100 samples in estimated 5.0005 s (38M iterations)
+Benchmarking queue/push_pop_batch16: Analyzing
+queue/push_pop_batch16  time:   [140.52 ns 140.65 ns 140.79 ns]
+                        thrpt:  [113.65 Melem/s 113.76 Melem/s 113.87 Melem/s]
+Found 8 outliers among 100 measurements (8.00%)
+  1 (1.00%) low mild
+  4 (4.00%) high mild
+  3 (3.00%) high severe
+Benchmarking queue/reply_append_swap_5B
+Benchmarking queue/reply_append_swap_5B: Warming up for 3.0000 s
+Benchmarking queue/reply_append_swap_5B: Collecting 100 samples in estimated 5.0001 s (154M iterations)
+Benchmarking queue/reply_append_swap_5B: Analyzing
+queue/reply_append_swap_5B
+                        time:   [32.455 ns 32.564 ns 32.686 ns]
+                        thrpt:  [30.594 Melem/s 30.708 Melem/s 30.812 Melem/s]
+Found 14 outliers among 100 measurements (14.00%)
+  1 (1.00%) low severe
+  2 (2.00%) low mild
+  9 (9.00%) high mild
+  2 (2.00%) high severe
+
+Benchmarking handoff_round_trip_uncontended
+Benchmarking handoff_round_trip_uncontended: Warming up for 3.0000 s
+Benchmarking handoff_round_trip_uncontended: Collecting 100 samples in estimated 5.0283 s (359k iterations)
+Benchmarking handoff_round_trip_uncontended: Analyzing
+handoff_round_trip_uncontended
+                        time:   [13.932 µs 13.991 µs 14.055 µs]
+Found 7 outliers among 100 measurements (7.00%)
+  5 (5.00%) high mild
+  2 (2.00%) high severe
+
+Benchmarking handoff_round_trip_contended_2
+Benchmarking handoff_round_trip_contended_2: Warming up for 3.0000 s
+Benchmarking handoff_round_trip_contended_2: Collecting 100 samples in estimated 5.0048 s (268k iterations)
+Benchmarking handoff_round_trip_contended_2: Analyzing
+handoff_round_trip_contended_2
+                        time:   [18.332 µs 18.679 µs 19.128 µs]
+Found 7 outliers among 100 measurements (7.00%)
+  1 (1.00%) high mild
+  6 (6.00%) high severe
+
+     Running benches/resp.rs (target/release/deps/resp-dd6bb8be82023f66)
+Benchmarking resp/get
+Benchmarking resp/get: Warming up for 3.0000 s
+Benchmarking resp/get: Collecting 100 samples in estimated 5.0002 s (65M iterations)
+Benchmarking resp/get: Analyzing
+resp/get                time:   [76.490 ns 76.719 ns 77.002 ns]
+                        thrpt:  [12.987 Melem/s 13.035 Melem/s 13.074 Melem/s]
+Found 6 outliers among 100 measurements (6.00%)
+  1 (1.00%) high mild
+  5 (5.00%) high severe
+Benchmarking resp/set_64B
+Benchmarking resp/set_64B: Warming up for 3.0000 s
+Benchmarking resp/set_64B: Collecting 100 samples in estimated 5.0002 s (55M iterations)
+Benchmarking resp/set_64B: Analyzing
+resp/set_64B            time:   [91.624 ns 91.728 ns 91.843 ns]
+                        thrpt:  [10.888 Melem/s 10.902 Melem/s 10.914 Melem/s]
+Found 8 outliers among 100 measurements (8.00%)
+  1 (1.00%) low mild
+  4 (4.00%) high mild
+  3 (3.00%) high severe
+Benchmarking resp/set_1KB
+Benchmarking resp/set_1KB: Warming up for 3.0000 s
+Benchmarking resp/set_1KB: Collecting 100 samples in estimated 5.0002 s (52M iterations)
+Benchmarking resp/set_1KB: Analyzing
+resp/set_1KB            time:   [95.609 ns 95.727 ns 95.864 ns]
+                        thrpt:  [10.431 Melem/s 10.446 Melem/s 10.459 Melem/s]
+Found 8 outliers among 100 measurements (8.00%)
+  2 (2.00%) low mild
+  3 (3.00%) high mild
+  3 (3.00%) high severe
+Benchmarking resp/set_16KB
+Benchmarking resp/set_16KB: Warming up for 3.0000 s
+Benchmarking resp/set_16KB: Collecting 100 samples in estimated 5.0004 s (52M iterations)
+Benchmarking resp/set_16KB: Analyzing
+resp/set_16KB           time:   [96.271 ns 96.677 ns 97.284 ns]
+                        thrpt:  [10.279 Melem/s 10.344 Melem/s 10.387 Melem/s]
+Found 5 outliers among 100 measurements (5.00%)
+  1 (1.00%) high mild
+  4 (4.00%) high severe
+Benchmarking resp/pipeline16_get
+Benchmarking resp/pipeline16_get: Warming up for 3.0000 s
+Benchmarking resp/pipeline16_get: Collecting 100 samples in estimated 5.0030 s (4.5M iterations)
+Benchmarking resp/pipeline16_get: Analyzing
+resp/pipeline16_get     time:   [1.1145 µs 1.1226 µs 1.1345 µs]
+                        thrpt:  [14.104 Melem/s 14.253 Melem/s 14.357 Melem/s]
+Found 11 outliers among 100 measurements (11.00%)
+  7 (7.00%) high mild
+  4 (4.00%) high severe
+Benchmarking resp/inline_get
+Benchmarking resp/inline_get: Warming up for 3.0000 s
+Benchmarking resp/inline_get: Collecting 100 samples in estimated 5.0006 s (29M iterations)
+Benchmarking resp/inline_get: Analyzing
+resp/inline_get         time:   [171.49 ns 171.69 ns 171.90 ns]
+                        thrpt:  [5.8173 Melem/s 5.8245 Melem/s 5.8311 Melem/s]
+Found 6 outliers among 100 measurements (6.00%)
+  4 (4.00%) high mild
+  2 (2.00%) high severe
+Benchmarking resp/inline_set_64B
+Benchmarking resp/inline_set_64B: Warming up for 3.0000 s
+Benchmarking resp/inline_set_64B: Collecting 100 samples in estimated 5.0022 s (10M iterations)
+Benchmarking resp/inline_set_64B: Analyzing
+resp/inline_set_64B     time:   [495.49 ns 496.28 ns 497.31 ns]
+                        thrpt:  [2.0108 Melem/s 2.0150 Melem/s 2.0182 Melem/s]
+Found 4 outliers among 100 measurements (4.00%)
+  2 (2.00%) low mild
+  1 (1.00%) high mild
+  1 (1.00%) high severe
+Benchmarking resp/set_1KB_split_2_reads
+Benchmarking resp/set_1KB_split_2_reads: Warming up for 3.0000 s
+Benchmarking resp/set_1KB_split_2_reads: Collecting 100 samples in estimated 5.0005 s (36M iterations)
+Benchmarking resp/set_1KB_split_2_reads: Analyzing
+resp/set_1KB_split_2_reads
+                        time:   [103.60 ns 103.81 ns 104.05 ns]
+                        thrpt:  [9.6106 Melem/s 9.6331 Melem/s 9.6525 Melem/s]
+Found 7 outliers among 100 measurements (7.00%)
+  5 (5.00%) high mild
+  2 (2.00%) high severe
+Benchmarking resp/get_split_2_reads
+Benchmarking resp/get_split_2_reads: Warming up for 3.0000 s
+Benchmarking resp/get_split_2_reads: Collecting 100 samples in estimated 5.0000 s (44M iterations)
+Benchmarking resp/get_split_2_reads: Analyzing
+resp/get_split_2_reads  time:   [82.699 ns 82.813 ns 82.940 ns]
+                        thrpt:  [12.057 Melem/s 12.075 Melem/s 12.092 Melem/s]
+Found 10 outliers among 100 measurements (10.00%)
+  2 (2.00%) low mild
+  3 (3.00%) high mild
+  5 (5.00%) high severe
+
+     Running benches/syscalls.rs (target/release/deps/syscalls-2e3dad4dab32bf03)
+Benchmarking syscall/eventfd_write_read
+Benchmarking syscall/eventfd_write_read: Warming up for 3.0000 s
+Benchmarking syscall/eventfd_write_read: Collecting 100 samples in estimated 5.0004 s (3.9M iterations)
+Benchmarking syscall/eventfd_write_read: Analyzing
+syscall/eventfd_write_read
+                        time:   [1.2812 µs 1.2844 µs 1.2899 µs]
+Found 11 outliers among 100 measurements (11.00%)
+  4 (4.00%) high mild
+  7 (7.00%) high severe
+Benchmarking syscall/epoll_wait_0_timeout_idle
+Benchmarking syscall/epoll_wait_0_timeout_idle: Warming up for 3.0000 s
+Benchmarking syscall/epoll_wait_0_timeout_idle: Collecting 100 samples in estimated 5.0009 s (15M iterations)
+Benchmarking syscall/epoll_wait_0_timeout_idle: Analyzing
+syscall/epoll_wait_0_timeout_idle
+                        time:   [336.06 ns 336.41 ns 336.90 ns]
+Found 10 outliers among 100 measurements (10.00%)
+  4 (4.00%) high mild
+  6 (6.00%) high severe
+Benchmarking syscall/socketpair_write_64B
+Benchmarking syscall/socketpair_write_64B: Warming up for 3.0000 s
+Benchmarking syscall/socketpair_write_64B: Collecting 100 samples in estimated 5.0020 s (2.4M iterations)
+Benchmarking syscall/socketpair_write_64B: Analyzing
+syscall/socketpair_write_64B
+                        time:   [2.0464 µs 2.0489 µs 2.0524 µs]
+Found 8 outliers among 100 measurements (8.00%)
+  1 (1.00%) low mild
+  2 (2.00%) high mild
+  5 (5.00%) high severe
+Benchmarking syscall/socketpair_write_read_64B
+Benchmarking syscall/socketpair_write_read_64B: Warming up for 3.0000 s
+Benchmarking syscall/socketpair_write_read_64B: Collecting 100 samples in estimated 5.0051 s (2.4M iterations)
+Benchmarking syscall/socketpair_write_read_64B: Analyzing
+syscall/socketpair_write_read_64B
+                        time:   [2.0466 µs 2.0474 µs 2.0484 µs]
+Found 7 outliers among 100 measurements (7.00%)
+  2 (2.00%) high mild
+  5 (5.00%) high severe
+Benchmarking syscall/tcp_loopback_write_read_64B
+Benchmarking syscall/tcp_loopback_write_read_64B: Warming up for 3.0000 s
+Benchmarking syscall/tcp_loopback_write_read_64B: Collecting 100 samples in estimated 5.0293 s (798k iterations)
+Benchmarking syscall/tcp_loopback_write_read_64B: Analyzing
+syscall/tcp_loopback_write_read_64B
+                        time:   [6.3419 µs 6.3670 µs 6.3915 µs]
+Benchmarking syscall/getpid_floor
+Benchmarking syscall/getpid_floor: Warming up for 3.0000 s
+Benchmarking syscall/getpid_floor: Collecting 100 samples in estimated 5.0012 s (16M iterations)
+Benchmarking syscall/getpid_floor: Analyzing
+syscall/getpid_floor    time:   [318.38 ns 318.63 ns 318.91 ns]
+Found 4 outliers among 100 measurements (4.00%)
+  1 (1.00%) high mild
+  3 (3.00%) high severe
+
+EXIT 0

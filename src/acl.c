@@ -41,6 +41,11 @@
  * ==========================================================================*/
 
 rax *Users; /* Table mapping usernames to user structures. */
+
+/* Bumped by every function that mutates a user or role in place (ACLSetUser,
+ * ACLCopyUser, ACLFreeUser, command bit recompute). Readers outside the main
+ * thread (rust-io precheck) use it to validate a copy-on-write ACL snapshot. */
+unsigned long long acl_mutation_epoch = 0;
 rax *Roles; /* Table mapping role names to user structures (with USER_FLAG_ROLE). */
 
 user *DefaultUser; /* Global reference to the default user.
@@ -551,6 +556,7 @@ static void ACLCopyRoles(user *dst, user *src) {
 /* Release the memory used by the user structure. Note that this function
  * will not remove the user from the Users global radix tree. */
 void ACLFreeUser(user *u) {
+    acl_mutation_epoch++;
     ACLUserClearRoles(u);
     sdsfree(u->name);
     if (u->acl_string) {
@@ -599,7 +605,8 @@ void ACLFreeUserAndKillClients(user *u) {
 /* Copy the user ACL rules from the source user 'src' to the destination
  * user 'dst' so that at the end of the process they'll have exactly the
  * same rules (but the names will continue to be the original ones). */
-static void ACLCopyUser(user *dst, user *src) {
+void ACLCopyUser(user *dst, user *src) {
+    acl_mutation_epoch++;
     if (dst->passwords) listRelease(dst->passwords);
     listRelease(dst->selectors);
     dst->passwords = src->passwords ? listDup(src->passwords) : NULL;
@@ -1004,6 +1011,7 @@ static void ACLRecomputeCommandBitsFromCommandRulesInTable(rax *table) {
  * It uses the 'command_rules', a string representation of the ordered categories and commands,
  * to recompute the command bits. */
 void ACLRecomputeCommandBitsFromCommandRulesAllUsers(void) {
+    acl_mutation_epoch++;
     ACLRecomputeCommandBitsFromCommandRulesInTable(Users);
     ACLRecomputeCommandBitsFromCommandRulesInTable(Roles);
 }
@@ -1759,6 +1767,7 @@ static int ACLSetSelector(aclSelector *selector, const char *op, size_t oplen) {
  * ERANGE: A database ID provided with the db= rule is out of the supported range.
  */
 int ACLSetUser(user *u, const char *op, ssize_t oplen) {
+    acl_mutation_epoch++;
     /* as we are changing the ACL, the old generated string is now invalid */
     if (u->acl_string) {
         decrRefCount(u->acl_string);
@@ -3023,6 +3032,7 @@ static int ACLLoadConfiguredRoles(void) {
  * the new role of the same name, or drop them if it is gone. Called after the old
  * users are freed, so only such survivors are left on the old member lists. */
 static void ACLRemapSurvivingRoleMembers(rax *old_roles) {
+    acl_mutation_epoch++;
     raxIterator ri;
     raxStart(&ri, old_roles);
     raxSeek(&ri, "^", NULL, 0);

@@ -11,6 +11,9 @@
 #include "functions.h"
 #include "sds.h"
 #include "server.h"
+#ifdef USE_RUST_IO
+#include "engine_io.h"
+#endif
 
 #include <sys/wait.h>
 #include <fcntl.h>
@@ -879,6 +882,11 @@ slotMigrationJob *createSlotImportJob(client *c,
     }
     job->client->repl_data->read_reploff = sdslen(job->client->querybuf);
     job->client->repl_data->repl_applied_dbid = job->client->db->id;
+#ifdef USE_RUST_IO
+    /* Commands from an external IO layer arrive parsed; engine_io.c keeps
+     * the stream in querybuf from here on. */
+    if (job->client->conn && connIsExternal(job->client->conn)) engineReplicatedBackfill(job->client);
+#endif
 
     return job;
 }

@@ -5,6 +5,7 @@ start_server {tags {"repl network external:skip cluster:skip"} overrides {save "
         $replica replicaof [srv -1 host] [srv -1 port]
         wait_for_sync $replica
 
+        tags {needs:c-transport} {
         test {Primary link stays on the main thread with I/O threads enabled} {
             set reads_before [getInfoProperty [$replica info stats] io_threaded_reads_processed]
             set value [string repeat x 32768]
@@ -32,5 +33,6 @@ start_server {tags {"repl network external:skip cluster:skip"} overrides {save "
             set client_reads [getInfoProperty [$replica info stats] io_threaded_reads_processed]
             assert_morethan $client_reads $reads_after
         }
+        } ;# needs:c-transport
     }
 }

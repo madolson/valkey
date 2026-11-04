@@ -70,6 +70,19 @@ configEnum maxmemory_policy_enum[] = {
     {"noeviction", MAXMEMORY_NO_EVICTION},
     {NULL, 0}};
 
+#ifdef USE_RUST_IO
+extern configEnum rust_io_mode_enum[]; /* rust_io.c */
+/* The Rust parser gets these limits by value. */
+static int applyRustIoLimits(const char **err) {
+    UNUSED(err);
+    rustIoPublishLimits();
+    return 1;
+}
+#define RUST_IO_LIMITS_APPLY applyRustIoLimits
+#else
+#define RUST_IO_LIMITS_APPLY NULL
+#endif
+
 configEnum syslog_facility_enum[] = {
     {"user", LOG_USER},
     {"local0", LOG_LOCAL0},
@@ -2705,6 +2718,13 @@ static int updateHZ(const char **err) {
 }
 
 static int updatePort(const char **err) {
+#ifdef USE_RUST_IO
+    if (rustIoTakesOverPort()) {
+        if (rustIoListenerUnchanged()) return 1;
+        *err = "Changing bind or port is not supported with rust-io-takeover";
+        return 0;
+    }
+#endif
     connListener *listener = listenerByType(CONN_TYPE_SOCKET);
 
     serverAssert(listener != NULL);
@@ -2883,6 +2903,13 @@ int updateAppendFsync(const char **err) {
 
 /* applyBind affects both TCP and TLS (if enabled) together */
 static int applyBind(const char **err) {
+#ifdef USE_RUST_IO
+    if (rustIoTakesOverPort()) {
+        if (rustIoListenerUnchanged()) return 1;
+        *err = "Changing bind or port is not supported with rust-io-takeover";
+        return 0;
+    }
+#endif
     connListener *tcp_listener = listenerByType(CONN_TYPE_SOCKET);
     connListener *tls_listener = listenerByType(CONN_TYPE_TLS);
 
@@ -3647,7 +3674,7 @@ standardConfig static_configs[] = {
     createLongLongConfig("commandlog-request-larger-than", NULL, MODIFIABLE_CONFIG, -1, LLONG_MAX, server.commandlog[COMMANDLOG_TYPE_LARGE_REQUEST].threshold, 1024 * 1024, MEMORY_CONFIG | SIGNED_MEMORY_CONFIG, NULL, NULL),
     createLongLongConfig("commandlog-reply-larger-than", NULL, MODIFIABLE_CONFIG, -1, LLONG_MAX, server.commandlog[COMMANDLOG_TYPE_LARGE_REPLY].threshold, 1024 * 1024, MEMORY_CONFIG | SIGNED_MEMORY_CONFIG, NULL, NULL),
     createLongLongConfig("latency-monitor-threshold", NULL, MODIFIABLE_CONFIG, 0, LLONG_MAX, server.latency_monitor_threshold, 0, INTEGER_CONFIG, NULL, NULL),
-    createLongLongConfig("proto-max-bulk-len", NULL, DEBUG_CONFIG | MODIFIABLE_CONFIG, 1024 * 1024, LONG_MAX, server.proto_max_bulk_len, 512ll * 1024 * 1024, MEMORY_CONFIG, NULL, NULL), /* Bulk request max size */
+    createLongLongConfig("proto-max-bulk-len", NULL, DEBUG_CONFIG | MODIFIABLE_CONFIG, 1024 * 1024, LONG_MAX, server.proto_max_bulk_len, 512ll * 1024 * 1024, MEMORY_CONFIG, NULL, RUST_IO_LIMITS_APPLY), /* Bulk request max size */
     createLongLongConfig("stream-node-max-entries", NULL, MODIFIABLE_CONFIG, 0, LLONG_MAX, server.stream_node_max_entries, 100, INTEGER_CONFIG, NULL, NULL),
     createLongLongConfig("repl-backlog-size", NULL, MODIFIABLE_CONFIG, 1, LLONG_MAX, server.repl_backlog_size, 10 * 1024 * 1024, MEMORY_CONFIG, NULL, updateReplBacklogSize), /* Default: 10mb */
     createLongLongConfig("cluster-manual-failover-timeout", NULL, MODIFIABLE_CONFIG, 1, INT_MAX, server.cluster_mf_timeout, 5000, INTEGER_CONFIG, NULL, NULL),
@@ -3667,8 +3694,8 @@ standardConfig static_configs[] = {
     createSizeTConfig("stream-node-max-bytes", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.stream_node_max_bytes, 4096, MEMORY_CONFIG, NULL, NULL),
     createSizeTConfig("zset-max-listpack-value", "zset-max-ziplist-value", MODIFIABLE_CONFIG, 0, LONG_MAX, server.zset_max_listpack_value, 64, MEMORY_CONFIG, NULL, NULL),
     createSizeTConfig("hll-sparse-max-bytes", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.hll_sparse_max_bytes, 3000, MEMORY_CONFIG, NULL, NULL),
-    createSizeTConfig("tracking-table-max-keys", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.tracking_table_max_keys, 1000000, INTEGER_CONFIG, NULL, NULL),                                      /* Default: 1 million keys max. */
-    createSizeTConfig("client-query-buffer-limit", NULL, DEBUG_CONFIG | MODIFIABLE_CONFIG, 1024 * 1024, LONG_MAX, server.client_max_querybuf_len, 1024 * 1024 * 1024, MEMORY_CONFIG, NULL, NULL), /* Default: 1GB max query buffer. */
+    createSizeTConfig("tracking-table-max-keys", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.tracking_table_max_keys, 1000000, INTEGER_CONFIG, NULL, NULL),                                                      /* Default: 1 million keys max. */
+    createSizeTConfig("client-query-buffer-limit", NULL, DEBUG_CONFIG | MODIFIABLE_CONFIG, 1024 * 1024, LONG_MAX, server.client_max_querybuf_len, 1024 * 1024 * 1024, MEMORY_CONFIG, NULL, RUST_IO_LIMITS_APPLY), /* Default: 1GB max query buffer. */
     createSSizeTConfig("maxmemory-clients", NULL, MODIFIABLE_CONFIG, -100, SSIZE_MAX, server.maxmemory_clients, 0, MEMORY_CONFIG | PERCENT_CONFIG, NULL, applyClientMaxMemoryUsage),
     createSSizeTConfig("maxmemory-scripts", NULL, MODIFIABLE_CONFIG, -100, SSIZE_MAX, server.maxmemory_scripts, 0, MEMORY_CONFIG | PERCENT_CONFIG, NULL, updateMaxmemoryScripts),
     createSSizeTConfig("slot-migration-max-failover-repl-bytes", NULL, MODIFIABLE_CONFIG, -1, SSIZE_MAX, server.slot_migration_max_failover_repl_bytes, 0, MEMORY_CONFIG | SIGNED_MEMORY_CONFIG, NULL, NULL),
@@ -3715,6 +3742,14 @@ standardConfig static_configs[] = {
     createSpecialConfig("rdma-bind", NULL, MODIFIABLE_CONFIG | MULTI_ARG_CONFIG, setConfigRdmaBindOption, getConfigRdmaBindOption, rewriteConfigRdmaBindOption, applyRdmaBind),
     createSpecialConfig("replicaof", "slaveof", IMMUTABLE_CONFIG | MULTI_ARG_CONFIG, setConfigReplicaOfOption, getConfigReplicaOfOption, rewriteConfigReplicaOfOption, NULL),
     createSpecialConfig("latency-tracking-info-percentiles", NULL, MODIFIABLE_CONFIG | MULTI_ARG_CONFIG, setConfigLatencyTrackingInfoPercentilesOutputOption, getConfigLatencyTrackingInfoPercentilesOutputOption, rewriteConfigLatencyTrackingInfoPercentilesOutputOption, NULL),
+
+#ifdef USE_RUST_IO
+    createEnumConfig("rust-io-mode", NULL, IMMUTABLE_CONFIG, rust_io_mode_enum, rust_io_config.mode, RUST_IO_MODE_OFF, NULL, NULL),
+    createIntConfig("rust-io-port", NULL, IMMUTABLE_CONFIG, 0, 65535, rust_io_config.port, 0, INTEGER_CONFIG, NULL, NULL),
+    createIntConfig("rust-io-threads", NULL, IMMUTABLE_CONFIG, 1, 128, rust_io_config.threads, 1, INTEGER_CONFIG, NULL, NULL),
+    createBoolConfig("rust-io-takeover", NULL, IMMUTABLE_CONFIG, rust_io_config.takeover, 0, NULL, NULL),
+    createIntConfig("rust-io-zero-copy-min-bytes", NULL, MODIFIABLE_CONFIG, -1, INT_MAX, rust_io_config.zero_copy_min, 2048, INTEGER_CONFIG, NULL, NULL),
+#endif
 
     /* NULL Terminator, this is dropped when we convert to the runtime array. */
     {NULL},

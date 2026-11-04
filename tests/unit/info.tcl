@@ -796,3 +796,16 @@ start_server {tags {"info" "external:skip"} overrides {save "" forkless-infrastr
         waitForBgsave r
     }
 }
+
+start_server {tags {"info external:skip"}} {
+    test {used_memory_peak includes memory a later command in the same batch frees} {
+        set rd [valkey_deferring_client]
+        # One write, so both commands normally run before the next beforeSleep().
+        $rd write "*4\r\n\$8\r\nSETRANGE\r\n\$8\r\npeak-key\r\n\$8\r\n50000000\r\n\$1\r\nx\r\n*2\r\n\$3\r\nDEL\r\n\$8\r\npeak-key\r\n"
+        $rd flush
+        assert_equal 50000001 [$rd read]
+        assert_equal 1 [$rd read]
+        $rd close
+        assert_morethan [s used_memory_peak] [expr {[s used_memory] + 40000000}]
+    }
+}

@@ -429,6 +429,18 @@ ifeq ($(BUILD_RDMA),yes)
 	FINAL_LIBS += ../deps/libvalkey/lib/libvalkey_rdma.a $(RDMA_LIBS)
 endif
 
+# Rust IO layer (src/rust/valkey-io). Off by default.
+RUST_IO_LIB=rust/valkey-io/target/release/libvalkey_io.a
+CARGO?=$(shell command -v cargo 2>/dev/null || echo $(HOME)/.cargo/bin/cargo)
+ifeq ($(BUILD_RUST_IO),yes)
+	FINAL_CFLAGS+=-DUSE_RUST_IO
+ifeq ($(RUST_IO_TIMING),yes)
+	FINAL_CFLAGS+=-DRUST_IO_TIMING
+	RUST_IO_CARGO_FEATURES=--features timing
+endif
+	FINAL_LIBS := $(RUST_IO_LIB) $(FINAL_LIBS) -lpthread -ldl -lrt -lm -lgcc_s
+endif
+
 RDMA_MODULE=
 RDMA_MODULE_NAME:=valkey-rdma$(PROG_SUFFIX).so
 RDMA_MODULE_CFLAGS:=$(FINAL_CFLAGS)
@@ -737,6 +749,7 @@ persist-settings: distclean
 	echo BUILD_TLS=$(BUILD_TLS) >> .make-settings
 	echo OPENSSL_PREFIX=$(OPENSSL_PREFIX) >> .make-settings
 	echo BUILD_RDMA=$(BUILD_RDMA) >> .make-settings
+	echo BUILD_RUST_IO=$(BUILD_RUST_IO) >> .make-settings
 	echo BUILD_ZSTD=$(BUILD_ZSTD) >> .make-settings
 	echo ZSTD_PREFIX=$(ZSTD_PREFIX) >> .make-settings
 	echo USE_SYSTEMD=$(USE_SYSTEMD) >> .make-settings
@@ -766,6 +779,29 @@ endif
 
 ifneq ($(strip $(PREV_FINAL_LDFLAGS)), $(strip $(FINAL_LDFLAGS)))
 .make-prerequisites: persist-settings
+endif
+
+ifeq ($(BUILD_RUST_IO),yes)
+ENGINE_SERVER_OBJ += connection_external.o engine_io.o rust_io.o rust_io_precheck.o rust_io_timing.o
+$(SERVER_NAME): $(RUST_IO_LIB)
+# Always ask cargo; it is a no-op when the crate is up to date.
+$(RUST_IO_LIB): rust-io-cargo
+rust-io-cargo:
+	cd rust/valkey-io && $(CARGO) clippy --release --quiet $(RUST_IO_CARGO_FEATURES) -- -D warnings
+	cd rust/valkey-io && $(CARGO) build --release --quiet $(RUST_IO_CARGO_FEATURES)
+.PHONY: rust-io-cargo
+# include/valkey_io.h is generated from the crate; check it in. The output
+# goes through clang-format (CI's clang-format check covers src/**/*.h), so
+# CLANG_FORMAT must be the version CI pins (18.1.8).
+CLANG_FORMAT ?= clang-format
+RUST_HEADER_GEN = cbindgen --config cbindgen.toml --crate valkey-io -q | \
+	  $(CLANG_FORMAT) --assume-filename=include/valkey_io.h
+rust-header:
+	cd rust/valkey-io && $(RUST_HEADER_GEN) > /tmp/valkey_io.h.$$$$ && mv /tmp/valkey_io.h.$$$$ include/valkey_io.h
+check-rust-header:
+	cd rust/valkey-io && $(RUST_HEADER_GEN) > /tmp/valkey_io.h.$$$$ && \
+	  diff -u include/valkey_io.h /tmp/valkey_io.h.$$$$ && rm -f /tmp/valkey_io.h.$$$$
+.PHONY: rust-header check-rust-header
 endif
 
 # valkey-server

@@ -28,6 +28,7 @@
  */
 
 #include "server.h"
+#include "rust_io_timing.h"
 #include "cluster.h"
 #include "cluster_slot_stats.h"
 #include "cluster_migrateslots.h"
@@ -2198,6 +2199,7 @@ void freeClientOriginalArgv(client *c) {
 }
 
 void freeClientArgv(client *c) {
+    RUST_IO_TIMING_FREE_ARGV_BEGIN();
     if (c->flag.argv_borrowed && !c->original_argv) {
         /* Client does not own the argv, and there is no original argv, so just clear the fields. */
         goto clear;
@@ -2216,6 +2218,7 @@ clear:
     c->argv_len_sum = 0;
     c->argv_len = 0;
     c->argv = NULL;
+    RUST_IO_TIMING_FREE_ARGV_END();
 }
 
 /* Close all the replicas connections. This is useful in chained replication
@@ -4600,6 +4603,7 @@ static bool consumeCommandQueue(client *c) {
     c->net_input_bytes_curr_cmd = p->input_bytes;
     c->parsed_cmd = p->cmd;
     c->slot = p->slot;
+    c->rust_precheck = p->rust_precheck;
     c->qb_applied += p->input_bytes;
     if (queue->off == queue->len) {
         /* The queue is empty. Don't free it here, because if parsing is done in
@@ -5054,6 +5058,16 @@ sds catClientInfoString(sds s, client *client, int hide_user_data) {
         replBufBlock *cur = listNodeValue(client->repl_data->ref_repl_buf_node);
         used_blocks_of_repl_buf = last->id - cur->id + 1;
     }
+    size_t qbuf = client->querybuf ? sdslen(client->querybuf) : 0;
+    size_t qbuf_free = client->querybuf ? sdsavail(client->querybuf) : 0;
+#ifdef USE_RUST_IO
+    if (client->conn && connIsExternal(client->conn)) {
+        size_t rq, rf;
+        rustIoClientQbuf(client, &rq, &rf);
+        qbuf += rq;
+        qbuf_free += rf;
+    }
+#endif
     sds ret = sdscatfmt(
         s,
         FMTARGS(
@@ -5072,8 +5086,8 @@ sds catClientInfoString(sds s, client *client, int hide_user_data) {
             " ssub=%i", client->pubsub_data ? (int)hashtableSize(client->pubsub_data->pubsubshard_channels) : 0,
             " multi=%i", client->mstate ? client->mstate->count : -1,
             " watch=%i", client->mstate ? (int)listLength(&client->mstate->watched_keys) : 0,
-            " qbuf=%U", client->querybuf ? (unsigned long long)sdslen(client->querybuf) : 0,
-            " qbuf-free=%U", client->querybuf ? (unsigned long long)sdsavail(client->querybuf) : 0,
+            " qbuf=%U", (unsigned long long)qbuf,
+            " qbuf-free=%U", (unsigned long long)qbuf_free,
             " argv-mem=%U", (unsigned long long)client->argv_len_sum,
             " multi-mem=%U", client->mstate ? (unsigned long long)client->mstate->argv_len_sums : 0,
             " rbs=%U", (unsigned long long)client->buf_usable_size,
@@ -6686,6 +6700,12 @@ size_t getClientOutputBufferMemoryUsage(client *c) {
             repl_buf_size = last->repl_offset + last->size - cur->repl_offset;
             repl_node_num = last->id - cur->id + 1;
         }
+#ifdef USE_RUST_IO
+        /* Stream the Rust IO layer accepted (up to 1 MiB) and has not
+         * written: the replica has not received it, so it counts like the
+         * repl buffer behind the cursor. The limit checks on append see it. */
+        if (c->conn && connIsExternal(c->conn)) repl_buf_size += rustIoPendingOut(c);
+#endif
         /* A compressed batch keeps this cursor pinned until the staged output
          * drains, so repl_buf_size already represents all unsent data. */
         return repl_buf_size + (repl_node_size * repl_node_num);
@@ -6711,6 +6731,9 @@ size_t getClientMemoryUsage(client *c, size_t *output_buffer_mem_usage) {
 
     if (output_buffer_mem_usage != NULL) *output_buffer_mem_usage = mem;
     mem += c->querybuf ? sdsAllocSize(c->querybuf) : 0;
+#ifdef USE_RUST_IO
+    if (c->conn && connIsExternal(c->conn)) mem += rustIoClientMem(c);
+#endif
     mem += zmalloc_size(c);
     mem += c->buf_usable_size;
     /* Compression staging capacity is retained for reuse, so account it as

@@ -22,7 +22,7 @@ test {CONFIG SET port number} {
         $rd PING
         $rd close
     }
-} {} {external:skip}
+} {} {external:skip needs:c-transport}
 
 test {CONFIG SET bind address} {
     start_server {} {
@@ -35,7 +35,7 @@ test {CONFIG SET bind address} {
         $rd PING
         $rd close
     }
-} {} {external:skip}
+} {} {external:skip needs:c-transport}
 
 # Attempt to connect to host using a client bound to bindaddr,
 # and return a non-zero value if successful within specified
@@ -135,8 +135,9 @@ start_server {config "minimal.conf" tags {"external:skip"}} {
         assert_equal {OK} [valkeycli_exec 0 config set bind *]
         reconnect 0
         r ping
-    } {PONG}
+    } {PONG} {needs:c-transport}
 
+    tags {needs:c-transport} {
     test {Protected mode works as expected} {
         # Get a non-loopback address of this instance for this test.
         set myaddr [get_nonloopback_addr]
@@ -175,6 +176,7 @@ start_server {config "minimal.conf" tags {"external:skip"}} {
             $r2 close
         }
     }
+    } ;# needs:c-transport
 }
 
 start_server {config "minimal.conf" tags {"external:skip"} overrides {enable-debug-command {yes}}} {

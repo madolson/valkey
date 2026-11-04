@@ -67,6 +67,7 @@ int trySendClusterAcceptToIOThreads(connection *conn);
 int updateIOThreads(const char **err);
 long long getIOThreadActiveTimeMicroseconds(int id);
 int clientHasPendingIO(struct client *c);
+void ioThreadsEnterExternal(int on);
 int processIOThreadsResponses(void);
 int getCurTid(void);
 void sendToMainThread(void *data, int type);

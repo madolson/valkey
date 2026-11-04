@@ -6,6 +6,9 @@ extend-exclude = [
     "deps/",
     # crc16_slottable is primarily pre-generated random strings.
     "src/crc16_slottable.c",
+    # perf flamegraphs: generated, their text is kernel and libc symbol
+    # names (tcp_rto_*, filp), truncated to the frame width (Clien, Proce).
+    "src/rust/valkey-io/bench/baseline/prof/*.svg",
 ]
 ignore-hidden = false
 

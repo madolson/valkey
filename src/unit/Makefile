@@ -241,6 +241,17 @@ ifeq ($(BUILD_TLS),yes)
 	LD_LIBS += $(TLS_LIBS)
 endif
 
+# The Rust IO layer (BUILD_RUST_IO=yes): libvalkey.a's rust_io.o calls it,
+# and server.h's structs differ under USE_RUST_IO (listeners[CONN_TYPE_MAX]),
+# so the tests must see the same defines as the library.
+ifeq ($(BUILD_RUST_IO),yes)
+	TEST_CFLAGS += -DUSE_RUST_IO
+ifeq ($(RUST_IO_TIMING),yes)
+	TEST_CFLAGS += -DRUST_IO_TIMING
+endif
+	LD_LIBS += ../rust/valkey-io/target/release/libvalkey_io.a -ldl -lgcc_s
+endif
+
 # Compile C++ test files, recompile if generated_wrappers or compiler flags change
 %.o: %.cpp generated_wrappers.cpp .flags
 	$(CXX) -MD -MP -std=c++17 -faligned-new -Wno-write-strings -fpermissive $(GCC_FLAGS) $(OPT) $(DEBUG) $(TEST_CFLAGS) -Wall -Wno-deprecated-declarations -c \

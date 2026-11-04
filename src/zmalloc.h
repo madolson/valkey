@@ -131,6 +131,7 @@ void *ztrycalloc_usable(size_t size, size_t *usable);
 void *ztryrealloc_usable(void *ptr, size_t size, size_t *usable);
 __attribute__((malloc)) char *zstrdup(const char *s);
 size_t zmalloc_used_memory(void);
+size_t zmalloc_thread_used_memory(void);
 size_t zmalloc_used_external_memory(void);
 int zmalloc_increase_used_memory_external(size_t size);
 int zmalloc_decrease_used_memory_external(size_t size);

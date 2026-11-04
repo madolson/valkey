@@ -105,6 +105,7 @@ The following compatibility and capability tags are currently used:
 | `needs:reset`             | Uses `RESET` to reset client connections. |
 | `needs:save`              | Uses `SAVE` or `BGSAVE` to create an RDB file. |
 | `needs:other-server`      | Requires `--other-server-path`. |
+| `needs:c-transport`       | Asserts behavior of the C socket transport that the Rust IO layer (`rust-io-takeover yes`) intentionally changes: `CONFIG SET bind`/`port` and C IO thread use. See `design-docs/rust-io-layer-spec.md`. |
 | `compatible-redis`        | Tests that run against Redis (compatibility tests). |
 | `network`                 | Tests that require network operations. |
 | `singledb`                | Test runs as if `--singledb` was given. |

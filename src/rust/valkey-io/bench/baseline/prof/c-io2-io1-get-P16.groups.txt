@@ -1,0 +1,15 @@
+samples: 5989
+group                                          self%   incl%
+syscall:write                                   51.0    51.0
+other                                           12.5    12.5
+allocator: jemalloc (zmalloc)                   11.1    11.2
+syscall:read                                     7.5     7.5
+syscall:other                                    3.7    64.3
+argv build (create_argv: createStringObject)     3.1     6.8
+call() and command procs                         3.1     4.7
+syscall:epoll_wait                               2.2     2.2
+prepareCommand and lookup                        1.9     5.0
+reply building                                   1.8    54.9
+freeing argv                                     1.0     1.0
+clock reads (getMonotonicUs, ustime)             0.6     0.6
+memcpy/libc                                      0.5     0.7
