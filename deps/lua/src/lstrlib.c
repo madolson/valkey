@@ -167,7 +167,11 @@ static int str_dump (lua_State *L) {
 #define CAP_UNFINISHED	(-1)
 #define CAP_POSITION	(-2)
 
+/* maximum recursion depth for 'match', to avoid C stack overflow */
+#define MAXCCALLS	200
+
 typedef struct MatchState {
+  int matchdepth;  /* control for recursive depth (to avoid C stack overflow) */
   const char *src_init;  /* init of source string */
   const char *src_end;  /* end (`\0') of source string */
   lua_State *L;
@@ -362,7 +366,7 @@ static const char *match_capture (MatchState *ms, const char *s, int l) {
 }
 
 
-static const char *match (MatchState *ms, const char *s, const char *p) {
+static const char *do_match (MatchState *ms, const char *s, const char *p) {
   init: /* using goto's to optimize tail recursion */
   switch (*p) {
     case '(': {  /* start capture */
@@ -440,6 +444,15 @@ static const char *match (MatchState *ms, const char *s, const char *p) {
 }
 
 
+static const char *match (MatchState *ms, const char *s, const char *p) {
+  const char *res;
+  if (ms->matchdepth-- == 0)
+    luaL_error(ms->L, "pattern too complex");
+  res = do_match(ms, s, p);
+  ms->matchdepth++;
+  return res;
+}
+
 
 static const char *lmemfind (const char *s1, size_t l1,
                                const char *s2, size_t l2) {
@@ -516,6 +529,7 @@ static int str_find_aux (lua_State *L, int find) {
     ms.L = L;
     ms.src_init = s;
     ms.src_end = s+l1;
+    ms.matchdepth = MAXCCALLS;
     do {
       const char *res;
       ms.level = 0;
@@ -554,6 +568,7 @@ static int gmatch_aux (lua_State *L) {
   ms.L = L;
   ms.src_init = s;
   ms.src_end = s+ls;
+  ms.matchdepth = MAXCCALLS;
   for (src = s + (size_t)lua_tointeger(L, lua_upvalueindex(3));
        src <= ms.src_end;
        src++) {
@@ -658,6 +673,7 @@ static int str_gsub (lua_State *L) {
   ms.L = L;
   ms.src_init = src;
   ms.src_end = src+srcl;
+  ms.matchdepth = MAXCCALLS;
   while (n < max_s) {
     const char *e;
     ms.level = 0;

@@ -104,6 +104,7 @@ and our version:
 5. Support for readonly tables (`lua_enablereadonlytable` API) is added across `lapi.c`, `lvm.c`, `lobject.h`, and `ltable.c`.
 6. Protection of tables reachable from globals, with a globals whitelist.
 7. Multiple CVE security patches (CVE-2022-24834, CVE-2024-31449, CVE-2024-31227, CVE-2024-31228) in cjson, cmsgpack, and the parser.
+8. The pattern matcher in `lstrlib.c` limits its recursion depth (`MAXCCALLS`), backported from Lua 5.2.
 
 Hdr_Histogram
 ---
