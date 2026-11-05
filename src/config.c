@@ -3574,6 +3574,7 @@ standardConfig static_configs[] = {
     createEnumConfig("forkless-policy", NULL, MODIFIABLE_CONFIG, forkless_policy_enum, server.forkless_policy, FORKLESS_POLICY_REQUIRE_FORK, isValidForklessPolicy, updateForklessPolicy),
 
     /* Integer configs */
+    createIntConfig("chunky-instances", NULL, IMMUTABLE_CONFIG, 1, 64, server.chunky_instances, 1, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("databases", NULL, IMMUTABLE_CONFIG, 1, INT_MAX, server.config_databases, 16, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("cluster-databases", NULL, IMMUTABLE_CONFIG, 1, INT_MAX, server.config_databases_cluster, 1, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("port", NULL, MODIFIABLE_CONFIG, 0, 65535, server.port, 6379, INTEGER_CONFIG, NULL, updatePort),                                               /* TCP port. */
@@ -4003,6 +4004,12 @@ void configResetStatCommand(client *c) {
 void configRewriteCommand(client *c) {
     if (server.configfile == NULL) {
         addReplyError(c, "The server is running without a config file");
+        return;
+    }
+    if (server.chunky_index >= 0) {
+        /* The config file is shared by all instances, and this one's port,
+         * pidfile and dir were derived from it at startup. */
+        addReplyError(c, "CONFIG REWRITE is not supported on a chunky-instances child");
         return;
     }
     if (rewriteConfig(server.configfile, 0) == -1) {

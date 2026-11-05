@@ -1902,6 +1902,9 @@ struct valkeyServer {
     int activerehashing;                              /* Incremental rehash in serverCron() */
     int active_defrag_cpu_percent;                    /* Current desired CPU percentage for active defrag */
     char *pidfile;                                    /* PID file path */
+    int chunky_instances;                             /* Instances forked at startup (chunky-instances). */
+    int chunky_index;                                 /* This instance's index, -1 if not a chunky child. */
+    char *chunky_group;                               /* Id shared by all instances of one chunky node. */
     int arch_bits;                                    /* 32 or 64 depending on sizeof(long) */
     int cronloops;                                    /* Number of times the cron function run */
     char runid[CONFIG_RUN_ID_SIZE + 1];               /* ID always different at every exec. */

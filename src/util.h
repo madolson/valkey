@@ -118,6 +118,7 @@ size_t valkey_strlcat(char *dst, const char *src, size_t dsize);
 void getRandomSeedCString(char *buff, size_t len);
 void setRandomSeedCString(char *seed_str, size_t len);
 void getRandomHexChars(char *p, size_t len);
+void reseedRandom(void);
 void getRandomBytes(unsigned char *p, size_t len);
 int getSecureRandomHexChars(char *p, size_t len);
 int getSecureRandomBytes(unsigned char *p, size_t len);

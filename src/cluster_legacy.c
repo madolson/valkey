@@ -1449,6 +1449,12 @@ static void updateAvailabilityZone(clusterNode *node, char *value) {
     updateSdsExtensionField(&node->availability_zone, value);
 }
 
+/* True if both nodes are instances of the same chunky node, and so share a
+ * host: a replica there does not survive its primary's host failing. */
+static int clusterNodesShareChunkyGroup(clusterNode *a, clusterNode *b) {
+    return sdslen(a->chunky_group) && !strcmp(a->chunky_group, b->chunky_group);
+}
+
 static void updateAnnouncedClientIpV4(clusterNode *node, char *value) {
     updateSdsExtensionField(&node->announce_client_ipv4, value);
 }
@@ -1663,6 +1669,7 @@ void clusterInit(void) {
     clusterUpdateMyselfHostname();
     clusterUpdateMyselfHumanNodename();
     clusterUpdateMyselfAvailabilityZone();
+    if (server.chunky_group) updateSdsExtensionField(&myself->chunky_group, server.chunky_group);
     clusterUpdateMyselfReplicaPriority();
     resetClusterStats();
 }
@@ -2177,6 +2184,7 @@ clusterNode *createClusterNode(char *nodename, int flags) {
     node->hostname = sdsempty();
     node->human_nodename = sdsempty();
     node->availability_zone = sdsempty();
+    node->chunky_group = sdsempty();
     node->tcp_port = 0;
     node->cport = 0;
     node->tls_port = 0;
@@ -2418,6 +2426,7 @@ void freeClusterNode(clusterNode *n) {
     sdsfree(n->hostname);
     sdsfree(n->human_nodename);
     sdsfree(n->availability_zone);
+    sdsfree(n->chunky_group);
     sdsfree(n->announce_client_ipv4);
     sdsfree(n->announce_client_ipv6);
     raxFree(n->fail_reports);
@@ -3708,6 +3717,7 @@ static uint32_t writePingExtensions(clusterMsg *hdr, int gossipcount) {
         writePortPingExtIfNonzero(&totlen, &cursor, CLUSTERMSG_EXT_TYPE_CLIENT_TLS_PORT, myself->announce_client_tls_port);
     extensions +=
         writeSdsPingExtIfNonempty(&totlen, &cursor, CLUSTERMSG_EXT_TYPE_AVAILABILITY_ZONE, myself->availability_zone);
+    extensions += writeSdsPingExtIfNonempty(&totlen, &cursor, CLUSTERMSG_EXT_TYPE_CHUNKY_GROUP, myself->chunky_group);
 
 
     /* Gossip forgotten nodes */
@@ -3786,6 +3796,7 @@ int clusterProcessPingExtensions(clusterMsg *hdr, clusterLink *link) {
     char *ext_hostname = NULL;
     char *ext_humannodename = NULL;
     char *ext_availability_zone = NULL;
+    char *ext_chunky_group = NULL;
     char *ext_clientipv4 = NULL;
     char *ext_clientipv6 = NULL;
     int ext_clientport = 0;
@@ -3842,6 +3853,9 @@ int clusterProcessPingExtensions(clusterMsg *hdr, clusterLink *link) {
             clusterMsgPingExtAvailabilityZone *availability_zone_ext =
                 (clusterMsgPingExtAvailabilityZone *)&(ext->ext[0].availability_zone);
             ext_availability_zone = getLoadableStringExtension(availability_zone_ext->availability_zone);
+        } else if (type == CLUSTERMSG_EXT_TYPE_CHUNKY_GROUP) {
+            clusterMsgPingExtChunkyGroup *group_ext = (clusterMsgPingExtChunkyGroup *)&(ext->ext[0].chunky_group);
+            ext_chunky_group = getLoadableStringExtension(group_ext->chunky_group);
         } else if (type == CLUSTERMSG_EXT_TYPE_REPLICA_PRIORITY) {
             clusterMsgPingExtReplicaPriority *priority_ext = (clusterMsgPingExtReplicaPriority *)&(ext->ext[0].replica_priority);
             ext_replica_priority = ntohl(priority_ext->replica_priority);
@@ -3864,6 +3878,7 @@ int clusterProcessPingExtensions(clusterMsg *hdr, clusterLink *link) {
     updateAnnouncedClientPort(sender, ext_clientport);
     updateAnnouncedClientTlsPort(sender, ext_clienttlsport);
     updateAvailabilityZone(sender, ext_availability_zone);
+    updateSdsExtensionField(&sender->chunky_group, ext_chunky_group);
     /* Apply the sender's replica priority. ext_replica_priority defaults to 0,
      * so a node that doesn't advertise the extension (old version, reverted to
      * the default, or simply set to 0) is consistently treated as priority 0. */
@@ -6656,7 +6671,9 @@ void clusterHandleReplicaMigration(int max_replicas) {
         if (ok_replicas > 0) is_orphaned = 0;
 
         if (is_orphaned) {
-            if (!target && node->numslots > 0) target = node;
+            /* Skip orphans on my own chunky node: replicating there adds no
+             * protection against losing the host. */
+            if (!target && node->numslots > 0 && !clusterNodesShareChunkyGroup(node, myself)) target = node;
 
             /* Track the starting time of the orphaned condition for this
              * primary. */
@@ -8985,6 +9002,11 @@ int clusterCommandSpecial(client *c) {
         /* Can't replicate a replica. */
         if (nodeIsReplica(n)) {
             addReplyError(c, "I can only replicate a master, not a replica.");
+            return 1;
+        }
+
+        if (clusterNodesShareChunkyGroup(n, myself)) {
+            addReplyError(c, "Can't replicate a node in my own chunky group");
             return 1;
         }
 

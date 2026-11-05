@@ -263,7 +263,11 @@ void serverLogRaw(int level, const char *msg) {
         }
 
         case LOG_FORMAT_LEGACY:
-            fprintf(fp, "%d:%c %s %c %s\n", (int)getpid(), role_chars[role_index], buf, c[level], msg);
+            if (server.chunky_index >= 0)
+                fprintf(fp, "%d:%c%d %s %c %s\n", (int)getpid(), role_chars[role_index], server.chunky_index, buf,
+                        c[level], msg);
+            else
+                fprintf(fp, "%d:%c %s %c %s\n", (int)getpid(), role_chars[role_index], buf, c[level], msg);
             break;
         }
     }
@@ -2603,7 +2607,10 @@ int restartServer(client *c, int flags, mstime_t delay) {
     }
 
     /* Config rewriting. */
-    if (flags & RESTART_SERVER_CONFIG_REWRITE && server.configfile && rewriteConfig(server.configfile, 0) == -1) {
+    /* A chunky child derived its port, dir and pidfile from the shared config
+     * file; writing them back would shift every instance on the next start. */
+    if (flags & RESTART_SERVER_CONFIG_REWRITE && server.configfile && server.chunky_index < 0 &&
+        rewriteConfig(server.configfile, 0) == -1) {
         serverLog(LL_WARNING,
                   "Can't restart: configuration rewrite process "
                   "failed: %s",
@@ -6546,6 +6553,8 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "gcc_version:%s\r\n", GNUC_VERSION_STR,
                 "process_id:%I\r\n", (int64_t)getpid(),
                 "process_supervised:%s\r\n", supervised,
+                "chunky_instances:%i\r\n", server.chunky_instances,
+                "chunky_instance_index:%i\r\n", server.chunky_index,
                 "run_id:%s\r\n", server.runid,
                 "tcp_port:%i\r\n", server.port ? server.port : server.tls_port,
                 "server_time_usec:%I\r\n", (int64_t)server.ustime,
@@ -7362,6 +7371,184 @@ void createPidFile(void) {
     }
 }
 
+/* ---------------------------------------------------------------------------
+ * chunky-instances: one valkey-server forks N copies of itself at startup.
+ * Each child is a full, independent server (its own port, cluster bus port,
+ * working directory, pidfile). The parent only supervises.
+ * ------------------------------------------------------------------------ */
+
+#define CHUNKY_ENV_INDEX "VALKEY_CHUNKY_INSTANCE"
+#define CHUNKY_ENV_GROUP "VALKEY_CHUNKY_GROUP"
+#define CHUNKY_MAX_INSTANCES 64
+/* A child that crashes sooner than this after spawning is not restarted, so a
+ * broken config cannot turn into a fork loop. */
+#define CHUNKY_MIN_UPTIME_FOR_RESTART 5
+
+static volatile pid_t chunky_pids[CHUNKY_MAX_INSTANCES];
+static volatile sig_atomic_t chunky_shutdown_signal = 0;
+
+static void chunkyParentSignalHandler(int sig) {
+    chunky_shutdown_signal = sig;
+    for (int i = 0; i < server.chunky_instances; i++) {
+        if (chunky_pids[i] > 0) kill(chunky_pids[i], sig);
+    }
+}
+
+/* Turn this process into instance 'idx'. Runs in a freshly forked child, and
+ * again after DEBUG RESTART since execve() keeps the environment. */
+static void chunkyInstanceSetup(int idx, const char *group) {
+    char sub[32];
+
+    server.chunky_index = idx;
+    server.chunky_group = zstrdup(group);
+    if (server.port) server.port += idx;
+    if (server.tls_port) server.tls_port += idx;
+    if (server.cluster_port) server.cluster_port += idx;
+    if (server.unixsocket) {
+        sds s = sdscatprintf(sdsempty(), "%s-%d", server.unixsocket, idx);
+        zfree(server.unixsocket);
+        server.unixsocket = zstrdup(s);
+        sdsfree(s);
+    }
+    if (server.pidfile) {
+        sds s = sdscatprintf(sdsempty(), "%s-%d", server.pidfile, idx);
+        zfree(server.pidfile);
+        server.pidfile = zstrdup(s);
+        sdsfree(s);
+    }
+    /* A relative cluster-config-file lands in the instance dir below; an
+     * absolute one would be shared and its lock would stop all but one. */
+    if (server.cluster_configfile[0] == '/') {
+        sds s = sdscatprintf(sdsempty(), "%s-%d", server.cluster_configfile, idx);
+        zfree(server.cluster_configfile);
+        server.cluster_configfile = zstrdup(s);
+        sdsfree(s);
+    }
+    /* dbfilename and appenddirname are plain names, so a per-instance working
+     * directory separates RDB, AOF and (relative) nodes.conf and logfile. */
+    snprintf(sub, sizeof(sub), "chunky-%d", idx);
+    if (mkdir(sub, 0755) == -1 && errno != EEXIST) {
+        serverLog(LL_WARNING, "Can't create instance dir %s: %s", sub, strerror(errno));
+        exit(1);
+    }
+    if (chdir(sub) == -1) {
+        serverLog(LL_WARNING, "Can't chdir to instance dir %s: %s", sub, strerror(errno));
+        exit(1);
+    }
+    /* The parent talks to the supervisor; children must not. */
+    server.supervised = 0;
+    server.supervised_mode = SUPERVISED_NONE;
+    unsetenv("NOTIFY_SOCKET");
+}
+
+static pid_t chunkySpawn(int idx, const char *group) {
+    pid_t pid = fork();
+    if (pid == 0) {
+        char buf[16];
+        signal(SIGTERM, SIG_DFL);
+        struct timeval tv;
+        signal(SIGINT, SIG_DFL);
+#ifdef __linux__
+        /* Don't outlive a parent that was killed without forwarding. */
+        prctl(PR_SET_PDEATHSIG, SIGTERM);
+#endif
+        server.pid = getpid();
+        /* The parent already seeded every generator and drew the run id;
+         * without this all instances share node ids and replication ids. */
+        gettimeofday(&tv, NULL);
+        reseedRandom();
+        srand(time(NULL) ^ getpid() ^ tv.tv_usec);
+        srandom(time(NULL) ^ getpid() ^ tv.tv_usec);
+        init_genrand64(((long long)tv.tv_sec * 1000000 + tv.tv_usec) ^ getpid());
+        getRandomHexChars(server.runid, CONFIG_RUN_ID_SIZE);
+        snprintf(buf, sizeof(buf), "%d", idx);
+        setenv(CHUNKY_ENV_INDEX, buf, 1);
+        setenv(CHUNKY_ENV_GROUP, group, 1);
+        chunkyInstanceSetup(idx, group);
+    } else if (pid == -1) {
+        serverLog(LL_WARNING, "chunky: fork of instance %d failed: %s", idx, strerror(errno));
+    } else {
+        serverLog(LL_NOTICE, "chunky: instance %d started, pid %d", idx, (int)pid);
+    }
+    return pid;
+}
+
+/* Fork the instances and supervise them. Returns only in a child; the parent
+ * exits once every child has exited. */
+static void chunkyForkAndSupervise(int background) {
+    int n = server.chunky_instances;
+    time_t started[CHUNKY_MAX_INSTANCES];
+    char group[CONFIG_RUN_ID_SIZE + 1];
+    int alive = 0;
+    struct sigaction act;
+
+    /* Children derive their pidfile from this path, so fix it before forking. */
+    if (background && !server.pidfile) server.pidfile = zstrdup(CONFIG_DEFAULT_PID_FILE);
+    getRandomHexChars(group, CONFIG_RUN_ID_SIZE);
+    group[CONFIG_RUN_ID_SIZE] = '\0';
+
+    sigemptyset(&act.sa_mask);
+    act.sa_flags = 0; /* No SA_RESTART: waitpid() must see EINTR. */
+    act.sa_handler = chunkyParentSignalHandler;
+    sigaction(SIGTERM, &act, NULL);
+    sigaction(SIGINT, &act, NULL);
+
+    serverLog(LL_NOTICE, "chunky: starting %d instances, group %s", n, group);
+    for (int i = 0; i < n; i++) {
+        pid_t pid = chunkySpawn(i, group);
+        if (pid == 0) return;
+        chunky_pids[i] = pid;
+        started[i] = time(NULL);
+        if (pid > 0) alive++;
+    }
+    if (background || server.pidfile) createPidFile();
+    if (server.set_proc_title) {
+        char title[] = "chunky-parent";
+        serverSetProcTitle(title);
+    }
+    if (server.supervised_mode == SUPERVISED_SYSTEMD) {
+        /* Children were forked, not necessarily ready. */
+        serverCommunicateSystemd("STATUS=chunky instances started\n");
+        serverCommunicateSystemd("READY=1\n");
+    }
+
+    while (alive > 0) {
+        int status;
+        pid_t pid = waitpid(-1, &status, 0);
+        if (pid == -1) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        int idx = -1;
+        for (int i = 0; i < n; i++)
+            if (chunky_pids[i] == pid) idx = i;
+        if (idx == -1) continue;
+        chunky_pids[idx] = 0;
+        alive--;
+
+        int crashed = WIFSIGNALED(status) || (WIFEXITED(status) && WEXITSTATUS(status) != 0);
+        if (WIFSIGNALED(status))
+            serverLog(LL_WARNING, "chunky: instance %d (pid %d) killed by signal %d", idx, (int)pid, WTERMSIG(status));
+        else
+            serverLog(crashed ? LL_WARNING : LL_NOTICE, "chunky: instance %d (pid %d) exited with code %d", idx,
+                      (int)pid, WEXITSTATUS(status));
+
+        if (crashed && !chunky_shutdown_signal && time(NULL) - started[idx] >= CHUNKY_MIN_UPTIME_FOR_RESTART) {
+            serverLog(LL_WARNING, "chunky: restarting instance %d", idx);
+            pid_t npid = chunkySpawn(idx, group);
+            if (npid == 0) return;
+            if (npid > 0) {
+                chunky_pids[idx] = npid;
+                started[idx] = time(NULL);
+                alive++;
+            }
+        }
+    }
+    serverLog(LL_NOTICE, "chunky: all instances exited, parent exiting");
+    if (server.pidfile) unlink(server.pidfile);
+    exit(0);
+}
+
 void daemonize(void) {
     int fd;
 
@@ -7982,6 +8169,7 @@ __attribute__((weak)) int main(int argc, char **argv) {
     server.sentinel_mode = checkForSentinelMode(argc, argv, exec_name);
     initServerConfig();
     server.pid = getpid();
+    server.chunky_index = -1;
     ACLInit(); /* The ACL subsystem must be initialized ASAP because the
                   basic networking code and client creation depends on it. */
     moduleInitModulesSystem();
@@ -8172,12 +8360,20 @@ __attribute__((weak)) int main(int argc, char **argv) {
 
     /* Daemonize if needed */
     server.supervised = serverIsSupervised(server.supervised_mode);
-    int background = server.daemonize && !server.supervised;
+    const char *chunky_index = getenv(CHUNKY_ENV_INDEX);
+    const char *chunky_group = getenv(CHUNKY_ENV_GROUP);
+    int background = server.daemonize && !server.supervised && !chunky_index;
     if (background) {
         /* We need to reset server.pid after daemonize(); otherwise, the
          * log printing role will always be the child. */
         daemonize();
         server.pid = getpid();
+    }
+    if (chunky_index && chunky_group) {
+        /* Re-exec of a chunky child (DEBUG RESTART). */
+        chunkyInstanceSetup(atoi(chunky_index), chunky_group);
+    } else if (server.chunky_instances > 1 && !server.sentinel_mode) {
+        chunkyForkAndSupervise(background);
     }
 
     serverLog(LL_NOTICE, "oO0OoO0OoO0Oo Valkey is starting oO0OoO0OoO0Oo");
