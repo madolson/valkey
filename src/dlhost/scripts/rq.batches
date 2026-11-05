@@ -1,0 +1,79 @@
+# One RQ 1.16 job, from round one's per-command counts per 2000 jobs
+# (~/chunky/data/mixed-pipelines/workloads/rq.txt): HSET 18, EXPIRE 9, ZADD 3,
+# ZREM/HINCRBY/HINCRBYFLOAT/HDEL/SADD/SMEMBERS/EXISTS/XADD/WATCH/PERSIST/HGETALL/
+# RPUSH/LMOVE/LREM 1 each, MULTI/EXEC 4 each. Batch shape from the counters:
+# 4 transactions holding 27 commands, 17 single-command round trips. Which
+# command sits in which transaction is inferred from RQ's code paths, not
+# captured. Not replayed: CLIENT SETINFO on each new connection.
+MULTI
+HSET rq:job:__ID__ status queued origin default data __V200__ created_at 2026-11-05T00:00:00Z description add(1,1) timeout 180 enqueued_at 2026-11-05T00:00:00Z
+RPUSH rq:queue:default __ID__
+SADD rq:queues rq:queue:default
+EXEC
+
+SMEMBERS rq:queues
+
+LMOVE rq:queue:default rq:queue:default:intermediate LEFT RIGHT
+
+EXISTS rq:job:__ID__
+
+HGETALL rq:job:__ID__
+
+WATCH rq:job:__ID__
+
+HSET rq:worker:__W__ state busy
+
+HSET rq:worker:__W__ last_heartbeat 2026-11-05T00:00:00Z
+
+EXPIRE rq:worker:__W__ 480
+
+MULTI
+HSET rq:job:__ID__ status started
+HSET rq:job:__ID__ started_at 2026-11-05T00:00:00Z
+HSET rq:job:__ID__ worker_name w__W__
+HSET rq:worker:__W__ current_job __ID__
+HSET rq:worker:__W__ last_heartbeat 2026-11-05T00:00:00Z
+ZADD rq:wip:default 1700000180 __ID__
+EXPIRE rq:job:__ID__ 600
+EXPIRE rq:worker:__W__ 480
+EXPIRE rq:wip:default 600
+EXEC
+
+HSET rq:job:__ID__ last_heartbeat 2026-11-05T00:00:00Z
+
+HSET rq:worker:__W__ last_heartbeat 2026-11-05T00:00:00Z
+
+HSET rq:job:__ID__ ended_at 2026-11-05T00:00:01Z
+
+HSET rq:job:__ID__ status finished
+
+MULTI
+HSET rq:job:__ID__ status finished
+HSET rq:job:__ID__ ended_at 2026-11-05T00:00:01Z
+ZREM rq:wip:default __ID__
+ZADD rq:finished:default 1700000500 __ID__
+EXPIRE rq:job:__ID__ 500
+EXPIRE rq:finished:default 500
+EXPIRE rq:results:__ID__ 500
+XADD rq:results:__ID__ MAXLEN ~ 10 * type 1 result __V20__
+HINCRBY rq:worker:__W__ successful_job_count 1
+HINCRBYFLOAT rq:worker:__W__ total_working_time 0.01
+HDEL rq:worker:__W__ current_job
+PERSIST rq:job:__ID__
+EXEC
+
+LREM rq:queue:default:intermediate 1 __ID__
+
+ZADD rq:workers:default 1700000500 rq:worker:__W__
+
+HSET rq:worker:__W__ state idle
+
+HSET rq:worker:__W__ last_heartbeat 2026-11-05T00:00:02Z
+
+EXPIRE rq:worker:__W__ 420
+
+MULTI
+HSET rq:worker:__W__ last_heartbeat 2026-11-05T00:00:02Z
+HSET rq:worker:__W__ state idle
+EXPIRE rq:worker:__W__ 420
+EXEC

@@ -1,0 +1,29 @@
+# One Celery task (kombu 5.2 redis transport + redis result backend), from the
+# per-command counts round one measured (~/chunky/data/mixed-pipelines/workloads/celery.txt):
+# per task LPUSH, BRPOP, 3 MULTI/EXEC pairs, GET x2. Batch shape: 15013 multi-command
+# batches = the 15009 transactions, 4 commands each; everything else is one command
+# per round trip. Not replayed: SUBSCRIBE/UNSUBSCRIBE/PUBLISH outside MULTI (pubsub
+# replies are not request/response), BRPOP (replaced by RPOP: closed-loop, no
+# consumer to wait for), connection setup (PING, INFO, CLIENT SETINFO, SELECT).
+LPUSH celery __V600__
+
+RPOP celery
+
+MULTI
+ZADD unacked_index 1700000000.5 __ID__
+HSET unacked __ID__ __V600__
+EXEC
+
+MULTI
+SETEX celery-task-meta-__ID__ 86400 __V150__
+PUBLISH celery-task-meta-__ID__ __V150__
+EXEC
+
+MULTI
+ZREM unacked_index __ID__
+HDEL unacked __ID__
+EXEC
+
+GET celery-task-meta-__ID__
+
+GET celery-task-meta-__ID__
