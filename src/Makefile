@@ -772,6 +772,18 @@ endif
 $(SERVER_NAME): $(ENGINE_SERVER_OBJ) $(LUA_MODULE)
 	$(SERVER_LD) -o $@ $(ENGINE_SERVER_OBJ) ../deps/libvalkey/lib/libvalkey.a ../deps/hdr_histogram/libhdrhistogram.a ../deps/fpconv/libfpconv.a ../deps/lz4/liblz4.a $(FINAL_LIBS) $(LUA_LDFLAGS)
 
+# dlmopen host experiment: valkey-server as a shared object plus a host
+# that loads N copies of it. Build with CFLAGS=-fPIC so every object is PIC.
+DLHOST_ENGINE_OBJ=$(filter-out server.o,$(ENGINE_SERVER_OBJ)) dlhost/server_dlhost.o dlhost/dlhost_engine.o
+dlhost/server_dlhost.o: server.c .make-prerequisites
+	$(SERVER_CC) -fPIC -DVALKEY_DLHOST -o $@ -c $<
+dlhost/dlhost_engine.o: dlhost_engine.c dlhost/dlhost.h .make-prerequisites
+	$(SERVER_CC) -fPIC -DVALKEY_DLHOST -o $@ -c $<
+libvalkey-engine.so: $(DLHOST_ENGINE_OBJ)
+	$(SERVER_LD) -shared -Wl,-Bsymbolic -o $@ $(DLHOST_ENGINE_OBJ) ../deps/libvalkey/lib/libvalkey.a ../deps/hdr_histogram/libhdrhistogram.a ../deps/fpconv/libfpconv.a ../deps/lz4/liblz4.a $(FINAL_LIBS)
+valkey-dlhost: dlhost/host.c dlhost/dlhost.h crc16.c
+	$(CC) -O2 -g -Wall -std=gnu11 -o $@ dlhost/host.c crc16.c -ldl -lpthread
+
 # Valkey static library, used to compile against for unit testing
 $(ENGINE_LIB_NAME): $(ENGINE_SERVER_OBJ)
 	@rm -f $@
