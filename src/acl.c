@@ -658,7 +658,11 @@ struct aclSnapshot {
 };
 
 static _Atomic(aclSnapshot *) acl_snapshot_current;
-static _Atomic(aclSnapshot *) acl_snapshot_hazard[IO_THREADS_MAX_NUM];
+/* One cache line per IO thread: each writes its slot twice per read job. */
+static struct {
+    _Atomic(aclSnapshot *) s;
+    char pad[CACHE_LINE_SIZE - sizeof(aclSnapshot *)];
+} acl_snapshot_hazard[IO_THREADS_MAX_NUM] __attribute__((aligned(CACHE_LINE_SIZE)));
 static aclSnapshot *acl_snapshot_retired;
 
 static aclSnapshot *ACLSnapshotBuild(void) {
@@ -706,7 +710,7 @@ void ACLSnapshotPublish(void) {
     while (*pp) {
         aclSnapshot *s = *pp;
         int held = 0;
-        for (int i = 1; i < server.io_threads_num && !held; i++) held = atomic_load(&acl_snapshot_hazard[i]) == s;
+        for (int i = 1; i < server.io_threads_num && !held; i++) held = atomic_load(&acl_snapshot_hazard[i].s) == s;
         if (held) {
             pp = &s->next;
         } else {
@@ -723,13 +727,13 @@ aclSnapshot *ACLSnapshotPin(int tid) {
     aclSnapshot *s;
     do {
         s = atomic_load(&acl_snapshot_current);
-        atomic_store(&acl_snapshot_hazard[tid], s);
+        atomic_store(&acl_snapshot_hazard[tid].s, s);
     } while (s != atomic_load(&acl_snapshot_current));
     return s;
 }
 
 void ACLSnapshotUnpin(int tid) {
-    atomic_store(&acl_snapshot_hazard[tid], NULL);
+    atomic_store(&acl_snapshot_hazard[tid].s, NULL);
 }
 
 uint64_t ACLSnapshotEpoch(aclSnapshot *s) {
