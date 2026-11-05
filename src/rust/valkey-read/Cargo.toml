@@ -1,0 +1,18 @@
+[package]
+name = "valkey-read"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["staticlib"]
+
+[build-dependencies]
+bindgen = { version = "0.70", default-features = false, features = ["runtime"] }
+
+[profile.release]
+opt-level = 3
+debug = 1
+panic = "abort"
+codegen-units = 1
+lto = true

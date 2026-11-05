@@ -429,6 +429,15 @@ ifeq ($(BUILD_RDMA),yes)
 	FINAL_LIBS += ../deps/libvalkey/lib/libvalkey_rdma.a $(RDMA_LIBS)
 endif
 
+# Rust read path (src/rust/valkey-read). Off by default; the default build
+# never invokes cargo.
+RUST_READ_LIB=rust/valkey-read/target/release/libvalkey_read.a
+CARGO?=$(shell command -v cargo 2>/dev/null || echo $(HOME)/.cargo/bin/cargo)
+ifeq ($(BUILD_RUST_IO),yes)
+	FINAL_CFLAGS+=-DUSE_RUST_IO
+	FINAL_LIBS := $(RUST_READ_LIB) $(FINAL_LIBS) -lpthread -ldl -lm
+endif
+
 RDMA_MODULE=
 RDMA_MODULE_NAME:=valkey-rdma$(PROG_SUFFIX).so
 RDMA_MODULE_CFLAGS:=$(FINAL_CFLAGS)
@@ -737,6 +746,7 @@ persist-settings: distclean
 	echo BUILD_TLS=$(BUILD_TLS) >> .make-settings
 	echo OPENSSL_PREFIX=$(OPENSSL_PREFIX) >> .make-settings
 	echo BUILD_RDMA=$(BUILD_RDMA) >> .make-settings
+	echo BUILD_RUST_IO=$(BUILD_RUST_IO) >> .make-settings
 	echo BUILD_ZSTD=$(BUILD_ZSTD) >> .make-settings
 	echo ZSTD_PREFIX=$(ZSTD_PREFIX) >> .make-settings
 	echo USE_SYSTEMD=$(USE_SYSTEMD) >> .make-settings
@@ -766,6 +776,16 @@ endif
 
 ifneq ($(strip $(PREV_FINAL_LDFLAGS)), $(strip $(FINAL_LDFLAGS)))
 .make-prerequisites: persist-settings
+endif
+
+ifeq ($(BUILD_RUST_IO),yes)
+$(SERVER_NAME): $(RUST_READ_LIB)
+# Always ask cargo; it is a no-op when the crate is up to date. bindgen reads
+# server.h with the same -I/-D flags as the C build so the layouts agree.
+$(RUST_READ_LIB): rust-read-cargo
+rust-read-cargo: .make-prerequisites
+	cd rust/valkey-read && VALKEY_BINDGEN_CFLAGS="$(FINAL_CFLAGS)" $(CARGO) build --release --quiet
+.PHONY: rust-read-cargo
 endif
 
 # valkey-server
