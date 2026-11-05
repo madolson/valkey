@@ -1943,6 +1943,9 @@ static bool processPendingReplStreamDecode(void) {
  *
  * The most important is freeClientsInAsyncFreeQueue but we also
  * call some other low-risk functions. */
+#ifdef VALKEY_DLHOST
+void dlhostEngineBeforeSleep(void);
+#endif
 void beforeSleep(struct aeEventLoop *eventLoop) {
     UNUSED(eventLoop);
 
@@ -2141,6 +2144,10 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
     aeSetDontWait(server.el, dont_sleep);
 
     IOThreadsBeforeSleep(current_time);
+
+#ifdef VALKEY_DLHOST
+    dlhostEngineBeforeSleep(); /* hand this iteration's replies to the host */
+#endif
 
     /* Before we are going to sleep, let the threads access the dataset by
      * releasing the GIL. The server main thread will not touch anything at this
@@ -7944,6 +7951,10 @@ void serverInitThreadAttribute(pthread_attr_t *attr) {
 }
 
 /* Main is marked as weak so that unit tests can use their own main function. */
+#ifdef VALKEY_DLHOST
+void dlhostEngineReady(void);
+#define main valkey_engine_main
+#endif
 __attribute__((weak)) int main(int argc, char **argv) {
     struct timeval tv;
     int j;
@@ -8276,6 +8287,9 @@ __attribute__((weak)) int main(int argc, char **argv) {
     serverSetCpuAffinity(server.server_cpulist);
     setOOMScoreAdj(-1);
 
+#ifdef VALKEY_DLHOST
+    dlhostEngineReady();
+#endif
     aeMain(server.el);
     aeDeleteEventLoop(server.el);
     return 0;
