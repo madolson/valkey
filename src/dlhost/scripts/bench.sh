@@ -36,11 +36,31 @@ cluster)
 dlhost)
   N=$1; M=$2; shift 2
   RUN=$W/run; mkdir -p $RUN
-  taskset -c $SCPU /tmp/chunky-dlmopen/src/valkey-dlhost --so /tmp/chunky-dlmopen/src/libvalkey-engine.so --engines $N --io-threads $M --port 10100 --rundir $RUN "$@" > $D/host.log 2>&1 &
+  taskset -c $SCPU ${DLHOST_DIR:-/tmp/chunky-dlmopen/src}/valkey-dlhost --so ${DLHOST_DIR:-/tmp/chunky-dlmopen/src}/libvalkey-engine.so --engines $N --io-threads $M --port 10100 --rundir $RUN "$@" > $D/host.log 2>&1 &
   PIDS+=($!); waitping -p 10100; BARGS=(${CLUSTERCLIENT:+--cluster} -p 10100); TARGET=10100 ;;
 esac
 echo "${PIDS[@]}" >> /tmp/chunky-dlmopen-pids
 echo "$LABEL $KIND $* pids=${PIDS[*]} $(date -u +%FT%TZ)" > $D/meta.txt
+if [ -n "${PERFSTAT:-}" ]; then
+  # Per-request main-thread CPU: perf stat on the engine main threads
+  # (dlhost: threads named engineN; processes: the main thread, tid == pid).
+  TIDS=""
+  for p in "${PIDS[@]}"; do
+    if [ $KIND = dlhost ]; then
+      for t in /proc/$p/task/*; do grep -q '^engine[0-9]*$' $t/comm && TIDS="$TIDS,${t##*/}"; done
+    else TIDS="$TIDS,$p"; fi
+  done
+  TIDS=${TIDS#,}
+  for T in set get; do
+    CMD="taskset -c $CCPU $BENCH ${BARGS[*]} -c 400 -d 64 -r 1000000 -n 20000000 -P 16 --threads $CTHR -t $T --csv"
+    echo "$CMD" > $D/perfstat-$T.txt
+    echo "main threads: $TIDS" >> $D/perfstat-$T.txt
+    perf stat -e task-clock,cycles:u,instructions:u,context-switches -t $TIDS -- $CMD >> $D/perfstat-$T.txt 2>&1
+  done
+  for p in "${PIDS[@]}"; do kill $p 2>/dev/null; done
+  for p in "${PIDS[@]}"; do timeout 10 tail --pid=$p -f /dev/null || kill -9 $p 2>/dev/null; done
+  exit 0
+fi
 cputicks() { local t=0; for p in "${PIDS[@]}"; do t=$((t + $(awk '{print $14+$15}' /proc/$p/stat))); done; echo $t; }
 for P in 1 16; do
   if [ $P = 1 ]; then NREQ=${NREQ1:-4000000}; else NREQ=${NREQ16:-20000000}; fi

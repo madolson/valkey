@@ -794,6 +794,10 @@ int main(int argc, char **argv) {
      * Those threads never ran this libc's __ctype_init, and arena_get2()
      * parses /sys with isspace() via get_nprocs() unless arena_max is set. */
     mallopt(M_ARENA_MAX, 2 * MAXIO);
+    /* Every libc copy caches the program break in its own __curbrk, so two
+     * copies growing their main arena with brk shrink each other's heap.
+     * No copy may use brk; this one included. */
+    __morecore = failingMorecore;
     /* Engines chdir() to their --dir, and the cwd is process-wide. */
     static char so_abs[4096];
     if (!realpath(so_path, so_abs)) {
