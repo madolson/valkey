@@ -1267,11 +1267,11 @@ void hincrbyCommand(client *c) {
     signalModifiedKey(c, c->db, c->argv[1]);
     /* In case we overitten an expired field, we need to act as if it was just expired */
     if (expired_overwritten) {
-        server.stat_expiredfields++;
+        inst->stat_expiredfields++;
         notifyKeyspaceEvent(NOTIFY_HASH, "hexpired", c->argv[1], c->db->id);
     }
     notifyKeyspaceEvent(NOTIFY_HASH, "hincrby", c->argv[1], c->db->id);
-    server.dirty++;
+    inst->dirty++;
     addReplyLongLong(c, value);
 
     /* Always replicate HINCRBY as an HSET or HSETEX command with the final value
@@ -1351,11 +1351,11 @@ void hincrbyfloatCommand(client *c) {
     signalModifiedKey(c, c->db, c->argv[1]);
     /* In case we overitten an expired field, we need to act as if it was just expired */
     if (expired_overwritten) {
-        server.stat_expiredfields++;
+        inst->stat_expiredfields++;
         notifyKeyspaceEvent(NOTIFY_HASH, "hexpired", c->argv[1], c->db->id);
     }
     notifyKeyspaceEvent(NOTIFY_HASH, "hincrbyfloat", c->argv[1], c->db->id);
-    server.dirty++;
+    inst->dirty++;
     addReplyBulkCBuffer(c, buf, len);
 
     /* Always replicate HINCRBYFLOAT as an HSET or HSETEX command with the final value
@@ -1538,7 +1538,7 @@ void hdelCommand(client *c) {
         signalModifiedKey(c, c->db, c->argv[1]);
         notifyKeyspaceEvent(NOTIFY_HASH, "hdel", c->argv[1], c->db->id);
         if (keyremoved) notifyKeyspaceEvent(NOTIFY_GENERIC, "del", c->argv[1], c->db->id);
-        server.dirty += deleted;
+        inst->dirty += deleted;
     }
     addReplyLongLong(c, deleted);
 }
@@ -1615,7 +1615,7 @@ void hgetdelCommand(client *c) {
         signalModifiedKey(c, c->db, c->argv[1]);
         notifyKeyspaceEvent(NOTIFY_HASH, "hdel", c->argv[1], c->db->id);
         if (keyremoved) notifyKeyspaceEvent(NOTIFY_GENERIC, "del", c->argv[1], c->db->id);
-        server.dirty += deleted;
+        inst->dirty += deleted;
     }
 
     commitDeferredReplyBuffer(c, 1);
@@ -1671,11 +1671,11 @@ void hsetnxCommand(client *c) {
         signalModifiedKey(c, c->db, c->argv[1]);
         /* In case we overitten an expired field, we need to act as if it was just expired */
         if (expired_overwritten) {
-            server.stat_expiredfields++;
+            inst->stat_expiredfields++;
             notifyKeyspaceEvent(NOTIFY_HASH, "hexpired", c->argv[1], c->db->id);
         }
         notifyKeyspaceEvent(NOTIFY_HASH, "hset", c->argv[1], c->db->id);
-        server.dirty++;
+        inst->dirty++;
         /* we always have to propagate the effect of the command when we have volatile items,
          * since on the replica side it might find that the fields was expired */
         if (has_volatile_fields) {
@@ -1711,11 +1711,11 @@ void hsetCommand(client *c) {
     signalModifiedKey(c, c->db, c->argv[1]);
     /* In case we overitten an expired field, we need to act as if it was just expired */
     if (expired_overwritten) {
-        server.stat_expiredfields += expired_overwritten;
+        inst->stat_expiredfields += expired_overwritten;
         notifyKeyspaceEvent(NOTIFY_HASH, "hexpired", c->argv[1], c->db->id);
     }
     notifyKeyspaceEvent(NOTIFY_HASH, "hset", c->argv[1], c->db->id);
-    server.dirty += (c->argc - 2) / 2;
+    inst->dirty += (c->argc - 2) / 2;
 
     /* HMSET (deprecated) and HSET return value is different. */
     char *cmdname = objectGetVal(c->argv[0]);
@@ -1912,7 +1912,7 @@ void hsetexCommand(client *c) {
                 changes++;
             }
             /* we treat this case exactly as active expiration. */
-            server.stat_expiredfields++;
+            inst->stat_expiredfields++;
             hashTypeIgnoreTTL(o, false, NULL);
         } else {
             bool expired;
@@ -1949,7 +1949,7 @@ void hsetexCommand(client *c) {
 
         /* In case we overwritten fields which were expired we need to act as if we actively expired them */
         if (expired_overwritten > 0) {
-            server.stat_expiredfields += expired_overwritten;
+            inst->stat_expiredfields += expired_overwritten;
             notifyKeyspaceEvent(NOTIFY_HASH, "hexpired", c->argv[1], c->db->id);
             /* Propagate deletions for expired/non-existent fields in batches.
              * When KEEPTTL is used the replica has noway telling if, at the time the primary was executing the command,
@@ -1972,7 +1972,7 @@ void hsetexCommand(client *c) {
         }
 
         signalModifiedKey(c, c->db, c->argv[1]);
-        server.dirty += changes;
+        inst->dirty += changes;
     } else {
         /* If no changes were done we still need to free the new argv array and the refcount of the first argument. */
         if (set_expired)
@@ -2130,7 +2130,7 @@ void hgetexCommand(client *c) {
         if (o && set_expired) {
             changed = hashTypeDelete(o, objectGetVal(c->argv[i]));
             /* we treat this case exactly as active expiration. */
-            if (changed) server.stat_expiredfields++;
+            if (changed) inst->stat_expiredfields++;
         } else if (set_expiry) {
             changed = hashTypeSetExpire(o, objectGetVal(c->argv[i]), when, 0) == EXPIRATION_MODIFICATION_SUCCESSFUL;
         } else if (persist) {
@@ -2164,7 +2164,7 @@ void hgetexCommand(client *c) {
         if (milliseconds_obj) decrRefCount(milliseconds_obj);
         if (numitems_obj) decrRefCount(numitems_obj);
 
-        server.dirty += changes;
+        inst->dirty += changes;
         signalModifiedKey(c, c->db, c->argv[1]);
 
         if (has_volatile_fields != hashTypeHasVolatileFields(o)) {
@@ -2459,7 +2459,7 @@ void hexpireGenericCommand(client *c, mstime_t basetime, int unit) {
             new_argv[new_argc++] = c->argv[fields_index + i];
             incrRefCount(c->argv[fields_index + i]);
             /* we treat this case exactly as active expiration. */
-            server.stat_expiredfields++;
+            inst->stat_expiredfields++;
             expired++;
         } else if (has_volatile_fields && result == EXPIRATION_MODIFICATION_NOT_EXIST && !skipped) {
             skipped = fields_index + i;
@@ -2500,7 +2500,7 @@ void hexpireGenericCommand(client *c, mstime_t basetime, int unit) {
             }
             notifyKeyspaceEvent(NOTIFY_HASH, "hexpire", c->argv[1], c->db->id);
         }
-        server.dirty += (expired + updated); // in case there was a change increment the dirty
+        inst->dirty += (expired + updated); // in case there was a change increment the dirty
         signalModifiedKey(c, c->db, c->argv[1]);
         /* Delete the object in case it was left empty */
         if (hashTypeLength(obj) == 0) {
@@ -2585,7 +2585,7 @@ void hpersistCommand(client *c) {
                 new_argv[new_argc++] = c->argv[fields_index];
                 incrRefCount(c->argv[fields_index]);
             }
-            server.dirty++;
+            inst->dirty++;
             changes++;
         } else if (has_volatile_fields && result == EXPIRATION_MODIFICATION_NOT_EXIST && !skipped) {
             skipped = fields_index;
@@ -3077,7 +3077,7 @@ static int hashTypeExpireEntry(void *entry, void *c) {
     if (deleted) {
         if (ctx->fields)
             ctx->fields[ctx->n_fields++] = createStringObjectFromSds(entryGetField(entry));
-        server.stat_expiredfields++;
+        inst->stat_expiredfields++;
         entryFree(entry);
         return 1;
     }
@@ -3111,7 +3111,7 @@ size_t hashTypeDeleteExpiredFields(robj *o, mstime_t now, unsigned long max_fiel
                  * instead of restarting, keeping the reap linear. */
                 zl = lpDeleteRangeWithEntry(zl, &fptr, 2);
                 objectSetVal(o, zl);
-                server.stat_expiredfields++;
+                inst->stat_expiredfields++;
                 expired_count++;
                 p = fptr;
                 continue;

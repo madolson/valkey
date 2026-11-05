@@ -123,7 +123,7 @@ void addReplyCommandInfo(client *c, struct serverCommand *cmd);
 /*============================ Utility functions ============================ */
 
 /* This macro tells if we are in the context of loading an AOF. */
-#define isAOFLoadingContext() ((server.current_client && server.current_client->id == CLIENT_ID_AOF) ? 1 : 0)
+#define isAOFLoadingContext() ((inst->current_client && inst->current_client->id == CLIENT_ID_AOF) ? 1 : 0)
 
 /* We use a private localtime implementation which is fork-safe. The logging
  * function of the server may be called from other threads. */
@@ -348,9 +348,9 @@ mstime_t commandTimeSnapshot(void) {
      * pretend that time freezes. This way a key can expire only the first time
      * it is accessed and not in the middle of the script execution, making
      * propagation to replicas / AOF consistent. See issue #1525 for more info.
-     * Note that we cannot use the cached server.mstime because it can change
+     * Note that we cannot use the cached inst->mstime because it can change
      * in processEventsWhileBlocked etc. */
-    return server.cmd_time_snapshot;
+    return inst->cmd_time_snapshot;
 }
 
 /* After an RDB dump or AOF rewrite we exit from children using _exit() instead of
@@ -937,7 +937,7 @@ int isMutuallyExclusiveChildType(int type) {
 
 /* Returns true when we're inside a long command that yielded to the event loop. */
 int isInsideYieldingLongCommand(void) {
-    return scriptIsTimedOut() || server.busy_module_yield_flags;
+    return scriptIsTimedOut() || inst->busy_module_yield_flags;
 }
 
 /* Return true if this instance has persistence completely turned off:
@@ -956,16 +956,16 @@ int allPersistenceDisabled(void) {
  * current_base - The divisor
  * */
 void trackInstantaneousMetric(int metric, long long current_value, long long current_base, long long factor) {
-    if (server.inst_metric[metric].last_sample_base > 0) {
-        long long base = current_base - server.inst_metric[metric].last_sample_base;
-        long long value = current_value - server.inst_metric[metric].last_sample_value;
+    if (inst->inst_metric[metric].last_sample_base > 0) {
+        long long base = current_base - inst->inst_metric[metric].last_sample_base;
+        long long value = current_value - inst->inst_metric[metric].last_sample_value;
         long long avg = base > 0 ? (value * factor / base) : 0;
-        server.inst_metric[metric].samples[server.inst_metric[metric].idx] = avg;
-        server.inst_metric[metric].idx++;
-        server.inst_metric[metric].idx %= STATS_METRIC_SAMPLES;
+        inst->inst_metric[metric].samples[inst->inst_metric[metric].idx] = avg;
+        inst->inst_metric[metric].idx++;
+        inst->inst_metric[metric].idx %= STATS_METRIC_SAMPLES;
     }
-    server.inst_metric[metric].last_sample_base = current_base;
-    server.inst_metric[metric].last_sample_value = current_value;
+    inst->inst_metric[metric].last_sample_base = current_base;
+    inst->inst_metric[metric].last_sample_value = current_value;
 }
 
 /* Return the mean of all the samples. */
@@ -973,7 +973,7 @@ long long getInstantaneousMetric(int metric) {
     int j;
     long long sum = 0;
 
-    for (j = 0; j < STATS_METRIC_SAMPLES; j++) sum += server.inst_metric[metric].samples[j];
+    for (j = 0; j < STATS_METRIC_SAMPLES; j++) sum += inst->inst_metric[metric].samples[j];
     return sum / STATS_METRIC_SAMPLES;
 }
 
@@ -1354,7 +1354,7 @@ long long clientsTimeProc(struct aeEventLoop *eventLoop, long long id, void *cli
     clientsCron(clients_this_cycle);
 
     server.clients_hz = 1000 / delay_ms;
-    server.el_cron_duration += elapsedUs(start_time);
+    inst->el_cron_duration += elapsedUs(start_time);
     return delay_ms;
 }
 
@@ -1401,7 +1401,7 @@ void databasesCron(void) {
         if (dbs_per_call > server.dbnum) dbs_per_call = server.dbnum;
 
         for (j = 0; j < dbs_per_call; j++) {
-            serverDb *db = server.db[resize_db % server.dbnum];
+            serverDb *db = inst->db[resize_db % server.dbnum];
             resize_db++;
             if (db == NULL) continue;
             kvstoreTryResizeHashtables(db->keys, CRON_DICTS_PER_DB);
@@ -1414,7 +1414,7 @@ void databasesCron(void) {
             uint64_t elapsed_us = 0;
             uint64_t threshold_us = 1 * 1000000 / server.hz / 100;
             for (j = 0; j < dbs_per_call; j++) {
-                serverDb *db = server.db[rehash_db % server.dbnum];
+                serverDb *db = inst->db[rehash_db % server.dbnum];
                 if (db != NULL) {
                     elapsed_us += kvstoreIncrementallyRehash(db->keys, threshold_us - elapsed_us);
                     if (elapsed_us >= threshold_us) break;
@@ -1434,10 +1434,10 @@ void databasesCron(void) {
 }
 
 static inline void updateCachedTimeWithUs(int update_daylight_info, const ustime_t ustime) {
-    server.ustime = ustime;
-    server.mstime = server.ustime / 1000;
-    server.unixtime = server.mstime / 1000;
-    lrulfu_updateClockAndPolicy(server.mstime, (server.maxmemory_policy & MAXMEMORY_FLAG_LFU) != 0);
+    inst->ustime = ustime;
+    inst->mstime = inst->ustime / 1000;
+    server.unixtime = inst->mstime / 1000;
+    lrulfu_updateClockAndPolicy(inst->mstime, (server.maxmemory_policy & MAXMEMORY_FLAG_LFU) != 0);
 
     /* To get information about daylight saving time, we need to call
      * localtime_r and cache the result. However calling localtime_r in this
@@ -1474,17 +1474,17 @@ void updateCachedTime(int update_daylight_info) {
  * update_cached_time - if 0, will not update the cached time even if required.
  * us - if not zero, use this time for cached time; otherwise, get current time. */
 void enterExecutionUnit(int update_cached_time, ustime_t us) {
-    if (server.execution_nesting++ == 0 && update_cached_time) {
+    if (inst->execution_nesting++ == 0 && update_cached_time) {
         if (us == 0) {
             us = ustime();
         }
         updateCachedTimeWithUs(0, us);
-        server.cmd_time_snapshot = server.mstime;
+        inst->cmd_time_snapshot = inst->mstime;
     }
 }
 
 void exitExecutionUnit(void) {
-    --server.execution_nesting;
+    --inst->execution_nesting;
 }
 
 void checkChildrenDone(void) {
@@ -1616,7 +1616,7 @@ long long serverCron(struct aeEventLoop *eventLoop, long long id, void *clientDa
     run_with_period(100) {
         monotime current_time = getMonotonicUs();
         long long factor = 1000000; // us
-        trackInstantaneousMetric(STATS_METRIC_COMMAND, server.stat_numcommands, current_time, factor);
+        trackInstantaneousMetric(STATS_METRIC_COMMAND, inst->stat_numcommands, current_time, factor);
         trackInstantaneousMetric(STATS_METRIC_NET_INPUT, server.stat_net_input_bytes + server.stat_net_repl_input_bytes + server.bio_stat_net_repl_input_bytes + server.stat_net_cluster_slot_import_bytes,
                                  current_time, factor);
         trackInstantaneousMetric(STATS_METRIC_NET_OUTPUT,
@@ -1626,10 +1626,10 @@ long long serverCron(struct aeEventLoop *eventLoop, long long id, void *clientDa
                                  factor);
         trackInstantaneousMetric(STATS_METRIC_NET_OUTPUT_REPLICATION, server.stat_net_repl_output_bytes, current_time,
                                  factor);
-        trackInstantaneousMetric(STATS_METRIC_EL_CYCLE, server.duration_stats[EL_DURATION_TYPE_EL].cnt, current_time,
+        trackInstantaneousMetric(STATS_METRIC_EL_CYCLE, inst->duration_stats[EL_DURATION_TYPE_EL].cnt, current_time,
                                  factor);
-        trackInstantaneousMetric(STATS_METRIC_EL_DURATION, server.duration_stats[EL_DURATION_TYPE_EL].sum,
-                                 server.duration_stats[EL_DURATION_TYPE_EL].cnt, 1);
+        trackInstantaneousMetric(STATS_METRIC_EL_DURATION, inst->duration_stats[EL_DURATION_TYPE_EL].sum,
+                                 inst->duration_stats[EL_DURATION_TYPE_EL].cnt, 1);
     }
 
     cronUpdateMemoryStats();
@@ -1650,7 +1650,7 @@ long long serverCron(struct aeEventLoop *eventLoop, long long id, void *clientDa
 
         if (prepareForShutdown(NULL, shutdownFlags) == C_OK) exit(0);
     } else if (isShutdownInitiated()) {
-        if (server.mstime >= server.shutdown_mstime || isReadyToShutdown()) {
+        if (inst->mstime >= server.shutdown_mstime || isReadyToShutdown()) {
             if (finishShutdown() == C_OK) exit(0);
             /* Shutdown failed. Continue running. An error has been logged. */
         }
@@ -1660,13 +1660,13 @@ long long serverCron(struct aeEventLoop *eventLoop, long long id, void *clientDa
     if (server.verbosity <= LL_VERBOSE) {
         run_with_period(5000) {
             for (j = 0; j < server.dbnum; j++) {
-                serverDb *db = server.db[j];
+                serverDb *db = inst->db[j];
                 if (db == NULL) continue;
                 long long size, used, vkeys;
 
-                size = kvstoreBuckets(server.db[j]->keys) * hashtableEntriesPerBucket();
-                used = kvstoreSize(server.db[j]->keys);
-                vkeys = kvstoreSize(server.db[j]->expires);
+                size = kvstoreBuckets(inst->db[j]->keys) * hashtableEntriesPerBucket();
+                used = kvstoreSize(inst->db[j]->keys);
+                vkeys = kvstoreSize(inst->db[j]->expires);
                 if (used || vkeys) {
                     serverLog(LL_VERBOSE, "DB %d: %lld keys (%lld volatile) in %lld slots HT.", j, used, vkeys, size);
                 }
@@ -1718,7 +1718,7 @@ long long serverCron(struct aeEventLoop *eventLoop, long long id, void *clientDa
              * the given amount of seconds, and if the latest bgsave was
              * successful or if, in case of an error, at least
              * CONFIG_BGSAVE_RETRY_DELAY seconds already elapsed. */
-            if (server.dirty >= sp->changes && server.unixtime - server.lastsave > sp->seconds &&
+            if (inst->dirty >= sp->changes && server.unixtime - server.lastsave > sp->seconds &&
                 (server.unixtime - server.lastbgsave_try > CONFIG_BGSAVE_RETRY_DELAY ||
                  server.lastbgsave_status == C_OK)) {
                 serverLog(LL_NOTICE, "%d changes in %d seconds. Saving...", sp->changes, (int)sp->seconds);
@@ -1793,10 +1793,10 @@ long long serverCron(struct aeEventLoop *eventLoop, long long id, void *clientDa
      * command execution, but we want to be sure that if the last command
      * executed changes the value via CONFIG SET, the server will perform
      * the operation even if completely idle. */
-    if (server.tracking_clients) trackingLimitUsedSlots();
+    if (inst->tracking_clients) trackingLimitUsedSlots();
 
     /* Reclaim dead client IDs from the tracking table. NOT gated on
-     * server.tracking_clients: dead IDs can linger in inner RAXes after every
+     * inst->tracking_clients: dead IDs can linger in inner RAXes after every
      * tracking client has disconnected, so tracking_clients may be zero while
      * stale items remain. The sweep schedules itself on an adaptive period
      * and time-budgets each step, so calling it every tick is cheap. */
@@ -1833,24 +1833,24 @@ long long serverCron(struct aeEventLoop *eventLoop, long long id, void *clientDa
     ValkeyModuleCronLoopV1 ei = {VALKEYMODULE_CRON_LOOP_VERSION, server.hz};
     moduleFireServerEvent(VALKEYMODULE_EVENT_CRON_LOOP, 0, &ei);
 
-    server.cronloops++;
+    inst->cronloops++;
 
-    server.el_cron_duration += elapsedUs(cron_start);
+    inst->el_cron_duration += elapsedUs(cron_start);
 
     return 1000 / server.hz;
 }
 
 
 void blockingOperationStarts(void) {
-    if (!server.blocking_op_nesting++) {
+    if (!inst->blocking_op_nesting++) {
         updateCachedTime(0);
-        server.blocked_last_cron = server.mstime;
+        inst->blocked_last_cron = inst->mstime;
     }
 }
 
 void blockingOperationEnds(void) {
-    if (!(--server.blocking_op_nesting)) {
-        server.blocked_last_cron = 0;
+    if (!(--inst->blocking_op_nesting)) {
+        inst->blocked_last_cron = 0;
     }
 }
 
@@ -1865,18 +1865,18 @@ void whileBlockedCron(void) {
 
     /* Since this function depends on a call to blockingOperationStarts, let's
      * make sure it was done. */
-    serverAssert(server.blocked_last_cron);
+    serverAssert(inst->blocked_last_cron);
 
     /* In case we were called too soon, leave right away. This way one time
      * jobs after the loop below don't need an if. and we don't bother to start
      * latency monitor if this function is called too often. */
-    if (server.blocked_last_cron >= server.mstime) return;
+    if (inst->blocked_last_cron >= inst->mstime) return;
 
-    /* Increment server.cronloops so that run_with_period works. */
+    /* Increment inst->cronloops so that run_with_period works. */
     long hz_ms = 1000 / server.hz;
-    int cronloops = (server.mstime - server.blocked_last_cron + (hz_ms - 1)) / hz_ms; // rounding up
-    server.blocked_last_cron += cronloops * hz_ms;
-    server.cronloops += cronloops;
+    int cronloops = (inst->mstime - inst->blocked_last_cron + (hz_ms - 1)) / hz_ms; // rounding up
+    inst->blocked_last_cron += cronloops * hz_ms;
+    inst->cronloops += cronloops;
 
     mstime_t latency;
     latencyStartMonitor(latency);
@@ -1973,22 +1973,22 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
             processed += last_processed;
         } while (last_processed != 0);
         processed += freeClientsInAsyncFreeQueue();
-        server.events_processed_while_blocked += processed;
+        inst->events_processed_while_blocked += processed;
         return;
     }
 
     /* We should handle pending reads clients ASAP after event loop. */
     int io_responses = processIOThreadsResponses();
-    if (io_responses > 0) server.el_iteration_active = true;
+    if (io_responses > 0) inst->el_iteration_active = true;
 
     /* Handle pending data(typical TLS). (must be done before flushAppendOnlyFile) */
     int conn_pending = connTypeProcessPendingData();
-    if (conn_pending > 0) server.el_iteration_active = true;
+    if (conn_pending > 0) inst->el_iteration_active = true;
 
     /* If any connection type(typical TLS) still has pending unread data don't sleep at all. */
     int dont_sleep = connTypeHasPendingData();
     if (processPendingReplStreamDecode()) {
-        server.el_iteration_active = true;
+        inst->el_iteration_active = true;
         if (replStreamHasPendingDecode()) dont_sleep = 1;
     }
 
@@ -2043,8 +2043,8 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
     /* Since we rely on current_client to send scheduled invalidation messages
      * we have to flush them after each command, so when we get here, the list
      * must be empty. */
-    serverAssert(listLength(server.tracking_pending_keys) == 0);
-    serverAssert(listLength(server.pending_push_messages) == 0);
+    serverAssert(listLength(inst->tracking_pending_keys) == 0);
+    serverAssert(listLength(inst->pending_push_messages) == 0);
 
     /* Send the invalidation messages to clients participating to the
      * client side caching protocol in broadcasting (BCAST) mode. */
@@ -2081,13 +2081,13 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
 
     /* Handle writes with pending output buffers. */
     int client_writes = handleClientsWithPendingWrites();
-    if (client_writes > 0) server.el_iteration_active = true;
+    if (client_writes > 0) inst->el_iteration_active = true;
 
     /* Try to process more IO reads that are ready to be processed. */
     if (server.aof_fsync != AOF_FSYNC_ALWAYS) {
         int io_responses_after = processIOThreadsResponses();
         if (io_responses_after > 0) {
-            server.el_iteration_active = true;
+            inst->el_iteration_active = true;
 
             /* Any responses that failed to enqueue to IO threads need to be handled now */
             handleClientsWithPendingWrites();
@@ -2111,34 +2111,34 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
     monotime duration_after_write = current_time - cron_start_time_after_write;
 
     /* Record eventloop latency. */
-    if (server.el_start > 0) {
-        monotime el_duration = current_time - server.el_start;
+    if (inst->el_start > 0) {
+        monotime el_duration = current_time - inst->el_start;
         durationAddSample(EL_DURATION_TYPE_EL, el_duration);
         latencyTraceIfNeeded(server, eventloop, el_duration);
 
         /* Accumulate time only for active cycles */
-        if (server.el_iteration_active) {
-            server.stat_active_time += el_duration;
+        if (inst->el_iteration_active) {
+            inst->stat_active_time += el_duration;
         } else {
             /* Count expiration time as active CPU time for all event loops. */
-            server.stat_active_time += expire_cycle_time;
+            inst->stat_active_time += expire_cycle_time;
         }
     }
-    server.el_cron_duration += duration_before_aof + duration_after_write;
-    durationAddSample(EL_DURATION_TYPE_CRON, server.el_cron_duration);
-    latencyTraceIfNeeded(server, eventloop_cron, server.el_cron_duration);
-    server.el_cron_duration = 0;
+    inst->el_cron_duration += duration_before_aof + duration_after_write;
+    durationAddSample(EL_DURATION_TYPE_CRON, inst->el_cron_duration);
+    latencyTraceIfNeeded(server, eventloop_cron, inst->el_cron_duration);
+    inst->el_cron_duration = 0;
     /* Record max command count per cycle. */
-    if (server.stat_numcommands > server.el_cmd_cnt_start) {
-        long long el_command_cnt = server.stat_numcommands - server.el_cmd_cnt_start;
-        if (el_command_cnt > server.el_cmd_cnt_max) {
-            server.el_cmd_cnt_max = el_command_cnt;
+    if (inst->stat_numcommands > inst->el_cmd_cnt_start) {
+        long long el_command_cnt = inst->stat_numcommands - inst->el_cmd_cnt_start;
+        if (el_command_cnt > inst->el_cmd_cnt_max) {
+            inst->el_cmd_cnt_max = el_command_cnt;
         }
     }
 
     /* Don't sleep at all before the next beforeSleep() if needed (e.g. a
      * connection has pending data) */
-    aeSetDontWait(server.el, dont_sleep);
+    aeSetDontWait(inst->el, dont_sleep);
 
     IOThreadsBeforeSleep(current_time);
 
@@ -2177,11 +2177,11 @@ void afterSleep(struct aeEventLoop *eventLoop, int numevents) {
             latencyTraceIfNeeded(server, module_acquire_gil, latency);
         }
         /* Set the eventloop start time. */
-        server.el_start = getMonotonicUs();
+        inst->el_start = getMonotonicUs();
         /* Reset iteration work flag */
-        server.el_iteration_active = (numevents > 0);
+        inst->el_iteration_active = (numevents > 0);
         /* Set the eventloop command count at start. */
-        server.el_cmd_cnt_start = server.stat_numcommands;
+        inst->el_cmd_cnt_start = inst->stat_numcommands;
     }
 
     /* Update the time cache. Skip the (relatively expensive) daylight-saving
@@ -2192,7 +2192,7 @@ void afterSleep(struct aeEventLoop *eventLoop, int numevents) {
      * e.g. somehow used by module timers. Don't update it while yielding to a
      * blocked command, call() will handle that and restore the original time. */
     if (!ProcessingEventsWhileBlocked) {
-        server.cmd_time_snapshot = server.mstime;
+        inst->cmd_time_snapshot = inst->mstime;
     }
 
     IOThreadsAfterSleep(numevents);
@@ -2203,13 +2203,13 @@ void afterSleep(struct aeEventLoop *eventLoop, int numevents) {
 static void qosStatsCallback(struct aeEventLoop *el, uint64_t duration_us) {
     UNUSED(el);
     durationAddSample(EL_DURATION_TYPE_PRIORITY_EL, duration_us);
-    unsigned long long priority_cmds = server.duration_stats[EL_DURATION_TYPE_PRIORITY_CMD].cnt;
-    if (priority_cmds > (unsigned long long)server.priority_el_cmd_cnt_prev) {
-        long long el_cmd_cnt = priority_cmds - server.priority_el_cmd_cnt_prev;
-        if (el_cmd_cnt > server.priority_el_cmd_cnt_max) {
-            server.priority_el_cmd_cnt_max = el_cmd_cnt;
+    unsigned long long priority_cmds = inst->duration_stats[EL_DURATION_TYPE_PRIORITY_CMD].cnt;
+    if (priority_cmds > (unsigned long long)inst->priority_el_cmd_cnt_prev) {
+        long long el_cmd_cnt = priority_cmds - inst->priority_el_cmd_cnt_prev;
+        if (el_cmd_cnt > inst->priority_el_cmd_cnt_max) {
+            inst->priority_el_cmd_cnt_max = el_cmd_cnt;
         }
-        server.priority_el_cmd_cnt_prev = priority_cmds;
+        inst->priority_el_cmd_cnt_prev = priority_cmds;
     }
 }
 
@@ -2433,7 +2433,7 @@ void initServerConfig(void) {
 
     initConfigValues();
     updateCachedTime(1);
-    server.cmd_time_snapshot = server.mstime;
+    inst->cmd_time_snapshot = inst->mstime;
     getRandomHexChars(server.runid, CONFIG_RUN_ID_SIZE);
     server.runid[CONFIG_RUN_ID_SIZE] = '\0';
     changeReplicationId();
@@ -2451,7 +2451,7 @@ void initServerConfig(void) {
     memset(server.listeners, 0x00, sizeof(server.listeners));
     server.active_expire_enabled = 1;
     server.forkless_infrastructure_enabled = 0;
-    server.lazy_expire_disabled = 0;
+    inst->lazy_expire_disabled = 0;
     server.skip_checksum_validation = 0;
     server.loading = 0;
     server.async_loading = 0;
@@ -2475,15 +2475,15 @@ void initServerConfig(void) {
     server.active_defrag_cpu_percent = 0;
     server.active_defrag_configuration_changed = 0;
     server.notify_keyspace_events = 0;
-    server.blocked_clients = 0;
-    memset(server.blocked_clients_by_type, 0, sizeof(server.blocked_clients_by_type));
+    inst->blocked_clients = 0;
+    memset(inst->blocked_clients_by_type, 0, sizeof(inst->blocked_clients_by_type));
     server.shutdown_asap = 0;
     server.shutdown_flags = 0;
     server.shutdown_mstime = 0;
     server.cluster_module_flags = CLUSTER_MODULE_FLAG_NONE;
     atomic_store_explicit(&server.cluster_config_save_status, C_OK, memory_order_relaxed);
     atomic_store_explicit(&server.cluster_config_last_save_time, time(NULL), memory_order_relaxed);
-    server.migrate_cached_sockets = dictCreate(&migrateCacheDictType);
+    inst->migrate_cached_sockets = dictCreate(&migrateCacheDictType);
     server.next_client_id = 1; /* Client IDs, start from 1 .*/
     server.page_size = sysconf(_SC_PAGESIZE);
     server.extended_redis_compat = 0;
@@ -2859,9 +2859,9 @@ int createSocketAcceptHandler(connListener *sfd, aeFileProc *accept_handler) {
     int j;
 
     for (j = 0; j < sfd->count; j++) {
-        if (aeCreateFileEvent(server.el, sfd->fd[j], AE_READABLE, accept_handler, sfd) == AE_ERR) {
+        if (aeCreateFileEvent(inst->el, sfd->fd[j], AE_READABLE, accept_handler, sfd) == AE_ERR) {
             /* Rollback */
-            for (j = j - 1; j >= 0; j--) aeDeleteFileEvent(server.el, sfd->fd[j], AE_READABLE);
+            for (j = j - 1; j >= 0; j--) aeDeleteFileEvent(inst->el, sfd->fd[j], AE_READABLE);
             return C_ERR;
         }
     }
@@ -2933,28 +2933,28 @@ int listenToPort(connListener *sfd) {
 void resetServerStats(void) {
     int j;
 
-    server.stat_numcommands = 0;
+    inst->stat_numcommands = 0;
     server.stat_numconnections = 0;
-    server.stat_expiredkeys = 0;
-    server.stat_expiredfields = 0;
-    server.stat_expired_keys_stale_perc = 0;
-    server.stat_expired_keys_with_vola_stale_perc = 0;
-    server.stat_expired_time_cap_reached_count = 0;
-    server.stat_expire_cycle_time_used = 0;
-    server.stat_evictedkeys = 0;
+    inst->stat_expiredkeys = 0;
+    inst->stat_expiredfields = 0;
+    inst->stat_expired_keys_stale_perc = 0;
+    inst->stat_expired_keys_with_vola_stale_perc = 0;
+    inst->stat_expired_time_cap_reached_count = 0;
+    inst->stat_expire_cycle_time_used = 0;
+    inst->stat_evictedkeys = 0;
     server.stat_evictedclients = 0;
-    server.stat_evictedscripts = 0;
-    server.stat_total_eviction_exceeded_time = 0;
-    server.stat_last_eviction_exceeded_time = 0;
-    server.stat_keyspace_misses = 0;
-    server.stat_keyspace_hits = 0;
-    server.stat_active_defrag_hits = 0;
-    server.stat_active_defrag_misses = 0;
-    server.stat_active_defrag_key_hits = 0;
-    server.stat_active_defrag_key_misses = 0;
-    server.stat_active_defrag_scanned = 0;
-    server.stat_total_active_defrag_time = 0;
-    server.stat_last_active_defrag_time = 0;
+    inst->stat_evictedscripts = 0;
+    inst->stat_total_eviction_exceeded_time = 0;
+    inst->stat_last_eviction_exceeded_time = 0;
+    inst->stat_keyspace_misses = 0;
+    inst->stat_keyspace_hits = 0;
+    inst->stat_active_defrag_hits = 0;
+    inst->stat_active_defrag_misses = 0;
+    inst->stat_active_defrag_key_hits = 0;
+    inst->stat_active_defrag_key_misses = 0;
+    inst->stat_active_defrag_scanned = 0;
+    inst->stat_total_active_defrag_time = 0;
+    inst->stat_last_active_defrag_time = 0;
     server.stat_fork_time = 0;
     server.stat_fork_rate = 0;
     server.stat_total_forks = 0;
@@ -2979,10 +2979,10 @@ void resetServerStats(void) {
     server.stat_client_qbuf_limit_disconnections = 0;
     server.stat_client_outbuf_limit_disconnections = 0;
     for (j = 0; j < STATS_METRIC_COUNT; j++) {
-        server.inst_metric[j].idx = 0;
-        server.inst_metric[j].last_sample_base = 0;
-        server.inst_metric[j].last_sample_value = 0;
-        memset(server.inst_metric[j].samples, 0, sizeof(server.inst_metric[j].samples));
+        inst->inst_metric[j].idx = 0;
+        inst->inst_metric[j].last_sample_base = 0;
+        inst->inst_metric[j].last_sample_value = 0;
+        memset(inst->inst_metric[j].samples, 0, sizeof(inst->inst_metric[j].samples));
     }
     server.stat_aof_rewrites = 0;
     server.stat_rdb_saves = 0;
@@ -2994,9 +2994,9 @@ void resetServerStats(void) {
     server.stat_net_repl_output_bytes = 0;
     server.stat_net_cluster_slot_export_bytes = 0;
     server.stat_net_cluster_slot_import_bytes = 0;
-    server.stat_unexpected_error_replies = 0;
-    server.stat_total_error_replies = 0;
-    server.stat_dump_payload_sanitizations = 0;
+    inst->stat_unexpected_error_replies = 0;
+    inst->stat_total_error_replies = 0;
+    inst->stat_dump_payload_sanitizations = 0;
     server.aof_delayed_fsync = 0;
     server.stat_reply_buffer_shrinks = 0;
     server.stat_cluster_threaded_reads_processed = 0;
@@ -3004,14 +3004,14 @@ void resetServerStats(void) {
     server.stat_cluster_threaded_accepts_processed = 0;
     server.stat_cluster_io_main_thread_fallbacks = 0;
     server.stat_reply_buffer_expands = 0;
-    memset(server.duration_stats, 0, sizeof(durationStats) * EL_DURATION_TYPE_NUM);
-    server.el_cmd_cnt_max = 0;
-    server.priority_el_cmd_cnt_max = 0;
-    server.priority_el_cmd_cnt_prev = 0;
-    server.stat_active_time = 0;
-    server.el_iteration_active = false;
-    server.stat_total_prefetch_batches = 0;
-    server.stat_total_prefetch_entries = 0;
+    memset(inst->duration_stats, 0, sizeof(durationStats) * EL_DURATION_TYPE_NUM);
+    inst->el_cmd_cnt_max = 0;
+    inst->priority_el_cmd_cnt_max = 0;
+    inst->priority_el_cmd_cnt_prev = 0;
+    inst->stat_active_time = 0;
+    inst->el_iteration_active = false;
+    inst->stat_total_prefetch_batches = 0;
+    inst->stat_total_prefetch_entries = 0;
     server.acl_info.invalid_cmd_accesses = 0;
     server.acl_info.invalid_key_accesses = 0;
     server.acl_info.user_auth_failures = 0;
@@ -3031,7 +3031,7 @@ void makeThreadKillable(void) {
 
 /* Return non-zero if the database is empty  */
 int dbHasNoKeys(int dbid) {
-    return dbid < 0 || dbid >= server.dbnum || !server.db[dbid] || kvstoreSize(server.db[dbid]->keys) == 0;
+    return dbid < 0 || dbid >= server.dbnum || !inst->db[dbid] || kvstoreSize(inst->db[dbid]->keys) == 0;
 }
 
 bool dbsHaveNoKeys(void) {
@@ -3067,10 +3067,10 @@ serverDb *createDatabase(int id) {
 }
 
 serverDb *createDatabaseIfNeeded(int id) {
-    if (server.db[id] == NULL) {
-        server.db[id] = createDatabase(id);
+    if (inst->db[id] == NULL) {
+        inst->db[id] = createDatabase(id);
     }
-    return server.db[id];
+    return inst->db[id];
 }
 
 void initServer(void) {
@@ -3096,9 +3096,9 @@ void initServer(void) {
     server.slot_migration_pipe_read = -1;
     server.slot_migration_child_exit_pipe = -1;
     server.main_thread_id = pthread_self();
-    server.current_client = NULL;
-    server.errors = raxNew();
-    server.execution_nesting = 0;
+    inst->current_client = NULL;
+    inst->errors = raxNew();
+    inst->execution_nesting = 0;
     server.clients = listCreate();
     server.clients_index = raxNew();
     server.clients_to_close = listCreate();
@@ -3107,22 +3107,22 @@ void initServer(void) {
     server.replicas_waiting_psync = raxNew();
     server.wait_before_rdb_client_free = DEFAULT_WAIT_BEFORE_RDB_CLIENT_FREE;
     server.clients_pending_write = listCreate();
-    server.clients_timeout_table = raxNew();
-    server.replication_allowed = 1;
+    inst->clients_timeout_table = raxNew();
+    inst->replication_allowed = 1;
     server.replicas_eldb = -1; /* Force to emit the first SELECT command. */
-    server.unblocked_clients = listCreate();
-    server.ready_keys = listCreate();
-    server.tracking_pending_keys = listCreate();
-    server.pending_push_messages = listCreate();
+    inst->unblocked_clients = listCreate();
+    inst->ready_keys = listCreate();
+    inst->tracking_pending_keys = listCreate();
+    inst->pending_push_messages = listCreate();
     server.clients_waiting_acks = listCreate();
     server.get_ack_from_replicas = 0;
     server.paused_actions = 0;
     memset(server.client_pause_per_purpose, 0, sizeof(server.client_pause_per_purpose));
-    server.postponed_clients = listCreate();
-    server.events_processed_while_blocked = 0;
+    inst->postponed_clients = listCreate();
+    inst->events_processed_while_blocked = 0;
     server.system_memory_size = zmalloc_get_memory_size();
-    server.blocked_last_cron = 0;
-    server.blocking_op_nesting = 0;
+    inst->blocked_last_cron = 0;
+    inst->blocking_op_nesting = 0;
     server.thp_enabled = 0;
     server.cluster_drop_packet_filter = -1;
     server.debug_cluster_disable_random_ping = 0;
@@ -3156,19 +3156,19 @@ void initServer(void) {
     adjustOpenFilesLimit();
     const char *clk_msg = monotonicInit();
     serverLog(LL_NOTICE, "monotonic clock: %s", clk_msg);
-    server.el = aeCreateEventLoop(server.maxclients + CONFIG_FDSET_INCR);
-    if (server.el == NULL) {
+    inst->el = aeCreateEventLoop(server.maxclients + CONFIG_FDSET_INCR);
+    if (inst->el == NULL) {
         serverLog(LL_WARNING, "Failed creating the event loop. Error message: '%s'", strerror(errno));
         exit(1);
     }
     /* Setup QoS event loop if multiplexer backend supports secondary polling.
      * If secondary polling is unsupported (e.g. evport, select), gracefully fallback to standard event processing without QoS. */
-    if (aeActuateQoSEventLoopIfSupported(server.el, server.priority_preemptive_poll_interval_us, qosStatsCallback) == AE_ERR) {
+    if (aeActuateQoSEventLoopIfSupported(inst->el, server.priority_preemptive_poll_interval_us, qosStatsCallback) == AE_ERR) {
         serverLog(LL_NOTICE, "QoS event prioritization not supported on %s multiplexer, falling back to standard event processing",
                   aeGetApiName());
     }
     server.dbnum = server.cluster_enabled ? server.config_databases_cluster : server.config_databases;
-    server.db = zcalloc(sizeof(serverDb *) * server.dbnum);
+    inst->db = zcalloc(sizeof(serverDb *) * server.dbnum);
 
     /* Set object metadata size before creating any database key objects */
     if (server.forkless_infrastructure_enabled) {
@@ -3183,20 +3183,20 @@ void initServer(void) {
 
     evictionPoolAlloc(); /* Initialize the LRU keys pool. */
     /* Note that server.pubsub_channels was chosen to be a kvstore (with only one dict, which
-     * seems odd) just to make the code cleaner by making it be the same type as server.pubsubshard_channels
+     * seems odd) just to make the code cleaner by making it be the same type as inst->pubsubshard_channels
      * (which has to be kvstore), see pubsubtype.serverPubSubChannels */
     server.pubsub_channels = kvstoreCreate(&kvstoreChannelHashtableType, 0, KVSTORE_ALLOCATE_HASHTABLES_ON_DEMAND);
     server.pubsub_patterns = dictCreate(&objToHashtableDictType);
-    server.pubsubshard_channels = kvstoreCreate(&kvstoreChannelHashtableType, server.cluster_enabled ? CLUSTER_SLOT_MASK_BITS : 0,
-                                                KVSTORE_ALLOCATE_HASHTABLES_ON_DEMAND | KVSTORE_FREE_EMPTY_HASHTABLES);
+    inst->pubsubshard_channels = kvstoreCreate(&kvstoreChannelHashtableType, server.cluster_enabled ? CLUSTER_SLOT_MASK_BITS : 0,
+                                               KVSTORE_ALLOCATE_HASHTABLES_ON_DEMAND | KVSTORE_FREE_EMPTY_HASHTABLES);
     server.pubsub_clients = 0;
-    server.watching_clients = 0;
-    server.cronloops = 0;
-    server.in_exec = 0;
-    server.in_call = 0;
-    server.busy_module_yield_flags = BUSY_MODULE_YIELD_NONE;
-    server.busy_module_yield_reply = NULL;
-    server.client_pause_in_transaction = 0;
+    inst->watching_clients = 0;
+    inst->cronloops = 0;
+    inst->in_exec = 0;
+    inst->in_call = 0;
+    inst->busy_module_yield_flags = BUSY_MODULE_YIELD_NONE;
+    inst->busy_module_yield_reply = NULL;
+    inst->client_pause_in_transaction = 0;
     server.child_pid = -1;
     server.child_type = CHILD_TYPE_NONE;
     server.rdb_write_target = RDB_WRITE_TARGET_NONE;
@@ -3216,7 +3216,7 @@ void initServer(void) {
     server.rdb_save_time_start = -1;
     server.rdb_last_load_keys_expired = 0;
     server.rdb_last_load_keys_loaded = 0;
-    server.dirty = 0;
+    inst->dirty = 0;
     server.crashed = 0;
     resetServerStats();
     /* A few stats we don't want to reset: server startup time, and peak mem. */
@@ -3253,27 +3253,27 @@ void initServer(void) {
 
     /* Create the timer callback, this is our way to process many background
      * operations incrementally, like eviction of unaccessed expired keys, etc. */
-    if (aeCreateTimeEvent(server.el, 1, serverCron, NULL, NULL) == AE_ERR) {
+    if (aeCreateTimeEvent(inst->el, 1, serverCron, NULL, NULL) == AE_ERR) {
         serverPanic("Can't create serverCron timer.");
         exit(1);
     }
     /* A separate timer for client maintenance.  Runs at a variable speed depending
      * on the client count. */
-    if (aeCreateTimeEvent(server.el, 1, clientsTimeProc, NULL, NULL) == AE_ERR) {
+    if (aeCreateTimeEvent(inst->el, 1, clientsTimeProc, NULL, NULL) == AE_ERR) {
         serverPanic("Can't create event clientsTimeProc timer.");
         exit(1);
     }
 
     /* Register a readable event for the pipe used to awake the event loop
      * from module threads. */
-    if (aeCreateFileEvent(server.el, server.module_pipe[0], AE_READABLE, modulePipeReadable, NULL) == AE_ERR) {
+    if (aeCreateFileEvent(inst->el, inst->module_pipe[0], AE_READABLE, modulePipeReadable, NULL) == AE_ERR) {
         serverPanic("Error registering the readable event for the module pipe.");
     }
 
     /* Register before and after sleep handlers (note this needs to be done
      * before loading persistence since it is used by processEventsWhileBlocked. */
-    aeSetBeforeSleepProc(server.el, beforeSleep);
-    aeSetAfterSleepProc(server.el, afterSleep);
+    aeSetBeforeSleepProc(inst->el, beforeSleep);
+    aeSetAfterSleepProc(inst->el, afterSleep);
 
     /* 32 bit instances are limited to 4GB of address space, so if there is
      * no explicit limit in the user provided configuration we set a limit
@@ -3643,8 +3643,8 @@ void resetCommandTableStats(hashtable *commands) {
 }
 
 void resetErrorTableStats(void) {
-    freeErrorsRadixTreeAsync(server.errors);
-    server.errors = raxNew();
+    freeErrorsRadixTreeAsync(inst->errors);
+    inst->errors = raxNew();
 }
 
 /* ========================== OP Array API ============================ */
@@ -3797,7 +3797,7 @@ bool clientSupportStandAloneRedirect(client *c) {
 }
 
 static int shouldPropagate(int target) {
-    if (!server.replication_allowed || target == PROPAGATE_NONE || server.loading) return 0;
+    if (!inst->replication_allowed || target == PROPAGATE_NONE || server.loading) return 0;
 
     if (target & PROPAGATE_AOF) {
         if (server.aof_state != AOF_OFF) return 1;
@@ -3849,8 +3849,8 @@ static void propagateNow(int dbid, robj **argv, int argc, int target, int slot) 
      *    In this case, primary lost a slot during the pausing.
      * 3) The primary was paused by CLIENT PAUSE, and lost a slot during the
      *    pausing. */
-    serverAssert(!isPausedActions(PAUSE_ACTION_REPLICA) || server.client_pause_in_transaction ||
-                 server.server_del_keys_in_slot);
+    serverAssert(!isPausedActions(PAUSE_ACTION_REPLICA) || inst->client_pause_in_transaction ||
+                 inst->server_del_keys_in_slot);
 
     int propagate_to_aof = server.aof_state != AOF_OFF && target & PROPAGATE_AOF;
 
@@ -3888,11 +3888,11 @@ static void propagateToBgIteration(int dbid, int argc, robj **argv, int target) 
     if (dbid >= 0) {
         // Called from alsoPropagate() to replicate a command
         if (target & PROPAGATE_REPL && bgIteration_iterationActive()) {
-            if (!sentMultiToBgIterator && (scriptIsRunning() || server.in_exec)) {
+            if (!sentMultiToBgIterator && (scriptIsRunning() || inst->in_exec)) {
                 /* For a script or multi/exec, we should be sending the MULTI at
                  * the beginning of the execution unit.  There shouldn't be any
                  * commands in the propagation queue yet. */
-                serverAssert(server.also_propagate.numops == 0);
+                serverAssert(inst->also_propagate.numops == 0);
                 /* If this is the first propagated command of a script or multi,
                  * make it a transaction.  It may turn out that there is only 1
                  * command in the MULTI block, but we can't know that now.
@@ -3952,9 +3952,9 @@ void alsoPropagate(int dbid, robj **argv, int argc, int target, int slot) {
      *
      * However, if we need to propagate to AOF, we should still do that. */
     bool propagate_aof = (target & PROPAGATE_AOF) && server.aof_state != AOF_OFF;
-    client *cc = server.current_client;
+    client *cc = inst->current_client;
     if (cc != NULL && cc->slot_migration_job && isImportSlotMigrationJob(cc->slot_migration_job) &&
-        server.executing_client != NULL) {
+        inst->executing_client != NULL) {
         if (!propagate_aof) return;
         /* Disable propagation to replication (just do the AOF) */
         target &= ~PROPAGATE_REPL;
@@ -3965,7 +3965,7 @@ void alsoPropagate(int dbid, robj **argv, int argc, int target, int slot) {
         argvcopy[j] = argv[j];
         incrRefCount(argv[j]);
     }
-    serverOpArrayAppend(&server.also_propagate, dbid, argvcopy, argc, target, slot);
+    serverOpArrayAppend(&inst->also_propagate, dbid, argvcopy, argc, target, slot);
 }
 
 /* It is possible to call the function forceCommandPropagation() inside a
@@ -4010,13 +4010,13 @@ void updateCommandLatencyHistogram(struct hdr_histogram **latency_histogram, int
  * multiple separated commands. Note that alsoPropagate() is not affected
  * by CLIENT_PREVENT_PROP flag. */
 static void propagatePendingCommands(void) {
-    /* This is done before the check on server.also_propagate.numops.  Numops
+    /* This is done before the check on inst->also_propagate.numops.  Numops
      * might be zero if there is no replica but we might be running bgIteration
      * for something other than replication.  If we sent the multi (to
      * bgIteration), we need to send the matching exec. */
     propagateToBgIteration(-1, 0, NULL, 0);
 
-    if (server.also_propagate.numops == 0) return;
+    if (inst->also_propagate.numops == 0) return;
 
     int j;
     serverOp *rop;
@@ -4024,13 +4024,13 @@ static void propagatePendingCommands(void) {
     /* If we got here it means we have finished an execution-unit.
      * If that unit has caused propagation of multiple commands, they
      * should be propagated as a transaction */
-    int transaction = server.also_propagate.numops > 1;
+    int transaction = inst->also_propagate.numops > 1;
 
     /* In case a command that may modify random keys was run *directly*
      * (i.e. not from within a script, MULTI/EXEC, RM_Call, etc.) we want
      * to avoid using a transaction (much like active-expire) */
-    if (server.current_client && server.current_client->cmd &&
-        server.current_client->cmd->flags & CMD_TOUCHES_ARBITRARY_KEYS) {
+    if (inst->current_client && inst->current_client->cmd &&
+        inst->current_client->cmd->flags & CMD_TOUCHES_ARBITRARY_KEYS) {
         transaction = 0;
     }
 
@@ -4040,8 +4040,8 @@ static void propagatePendingCommands(void) {
         propagateNow(-1, &shared.multi, 1, PROPAGATE_AOF | PROPAGATE_REPL, -1);
     }
 
-    for (j = 0; j < server.also_propagate.numops; j++) {
-        rop = &server.also_propagate.ops[j];
+    for (j = 0; j < inst->also_propagate.numops; j++) {
+        rop = &inst->also_propagate.ops[j];
         serverAssert(rop->target);
         propagateNow(rop->dbid, rop->argv, rop->argc, rop->target, rop->slot);
     }
@@ -4051,7 +4051,7 @@ static void propagatePendingCommands(void) {
         propagateNow(-1, &shared.exec, 1, PROPAGATE_AOF | PROPAGATE_REPL, -1);
     }
 
-    serverOpArrayFree(&server.also_propagate);
+    serverOpArrayFree(&inst->also_propagate);
 }
 
 /* Whether any of the module-jobs / propagation / module-yield post-execution-
@@ -4066,7 +4066,7 @@ static void propagatePendingCommands(void) {
  * Must stay an OR of every condition below - never drop one as an
  * optimization, since that would silently skip real pending work. */
 static inline int hasPostExecutionUnitPendingWork(void) {
-    return moduleHasPostExecUnitJobs() || server.also_propagate.numops || server.busy_module_yield_flags;
+    return moduleHasPostExecUnitJobs() || inst->also_propagate.numops || inst->busy_module_yield_flags;
 }
 
 /* Performs operations that should be performed after an execution unit ends.
@@ -4084,7 +4084,7 @@ static inline int hasPostExecutionUnitPendingWork(void) {
  * be other considerations. So we basically want the `postUnitOperations` to trigger
  * after the entire chain finished. */
 void postExecutionUnitOperations(void) {
-    if (server.execution_nesting) return;
+    if (inst->execution_nesting) return;
 
     /* Combined pending-work gate: in the overwhelming majority of calls
      * (e.g. after a plain read-only command like GET) none of the three
@@ -4123,7 +4123,7 @@ int incrCommandStatsOnError(struct serverCommand *cmd, int flags) {
     static long long prev_err_count = 0;
     int res = 0;
     if (cmd) {
-        if ((server.stat_total_error_replies - prev_err_count) > 0) {
+        if ((inst->stat_total_error_replies - prev_err_count) > 0) {
             if (flags & ERROR_COMMAND_REJECTED) {
                 cmd->rejected_calls++;
                 res = 1;
@@ -4133,7 +4133,7 @@ int incrCommandStatsOnError(struct serverCommand *cmd, int flags) {
             }
         }
     }
-    prev_err_count = server.stat_total_error_replies;
+    prev_err_count = inst->stat_total_error_replies;
     return res;
 }
 
@@ -4175,14 +4175,14 @@ int incrCommandStatsOnError(struct serverCommand *cmd, int flags) {
 void call(client *c, int flags) {
     if (bgIteration_blockClientIfRequired(c)) return;
 
-    server.in_call++;
+    inst->in_call++;
 
     long long dirty;
     struct ClientFlags client_old_flags = c->flag;
 
     struct serverCommand *real_cmd = c->realcmd;
-    client *prev_client = server.executing_client;
-    server.executing_client = c;
+    client *prev_client = inst->executing_client;
+    inst->executing_client = c;
 
     /* When call() is issued during loading the AOF we don't want commands called
      * from module, exec or LUA to go into the commandlog or to populate statistics. */
@@ -4216,7 +4216,7 @@ void call(client *c, int flags) {
      * In that case, the module is in charge of propagation. */
 
     /* Call the command. */
-    dirty = server.dirty;
+    dirty = inst->dirty;
     long long old_primary_repl_offset = server.primary_repl_offset;
     incrCommandStatsOnError(NULL, 0);
 
@@ -4292,7 +4292,7 @@ void call(client *c, int flags) {
 
     valkey_commands_trace(valkey_commands, command_call, connGetType(c->conn), getClientPeerId(c), getClientSockname(c), real_cmd->declared_name, duration);
     c->duration += duration;
-    dirty = server.dirty - dirty;
+    dirty = inst->dirty - dirty;
     if (dirty < 0) dirty = 0;
 
     /* Update failed command calls if required. */
@@ -4332,7 +4332,7 @@ void call(client *c, int flags) {
         } else {
             latencyTraceIfNeeded(server, command, duration);
         }
-        if (server.execution_nesting == 0) {
+        if (inst->execution_nesting == 0) {
             durationAddSample(EL_DURATION_TYPE_CMD, duration);
             /* Attribute command execution latency for high-priority client connections. */
             if (connIsPriority(c->conn)) {
@@ -4415,19 +4415,19 @@ void call(client *c, int flags) {
         /* We use the tracking flag of the original external client that
          * triggered the command, but we take the keys from the actual command
          * being executed. */
-        if (server.current_client && (server.current_client->flag.tracking) &&
-            !(server.current_client->flag.tracking_bcast)) {
-            trackingRememberKeys(server.current_client, c);
+        if (inst->current_client && (inst->current_client->flag.tracking) &&
+            !(inst->current_client->flag.tracking_bcast)) {
+            trackingRememberKeys(inst->current_client, c);
         }
     }
 
     if (!c->flag.blocked) {
-        /* Modules may call commands in cron, in which case server.current_client
+        /* Modules may call commands in cron, in which case inst->current_client
          * is not set. */
-        if (server.current_client) {
-            server.current_client->commands_processed++;
+        if (inst->current_client) {
+            inst->current_client->commands_processed++;
         }
-        server.stat_numcommands++;
+        inst->stat_numcommands++;
     }
 
     /* Record peak memory after each command and before the eviction that runs
@@ -4444,12 +4444,12 @@ void call(client *c, int flags) {
 
     /* Client pause takes effect after a transaction has finished. This needs
      * to be located after everything is propagated. */
-    if (!server.in_exec && server.client_pause_in_transaction) {
-        server.client_pause_in_transaction = 0;
+    if (!inst->in_exec && inst->client_pause_in_transaction) {
+        inst->client_pause_in_transaction = 0;
     }
 
-    server.executing_client = prev_client;
-    server.in_call--;
+    inst->executing_client = prev_client;
+    inst->in_call--;
 }
 
 /* Used when a command that is ready for execution needs to be rejected, due to
@@ -4517,9 +4517,9 @@ void afterCommand(client *c) {
      * intentionally excluded from the gate: it is not deferred/queued
      * work, it must run for every command whenever slot-stats accounting
      * is enabled. */
-    if (server.execution_nesting == 0 &&
+    if (inst->execution_nesting == 0 &&
         unlikely(hasPostExecutionUnitPendingWork() || trackingHasPendingKeyInvalidations() ||
-                 listLength(server.pending_push_messages))) {
+                 listLength(inst->pending_push_messages))) {
         /* Should be done before trackingHandlePendingKeyInvalidations so that we
          * reply to client before invalidating cache (makes more sense) */
         postExecutionUnitOperations();
@@ -4529,7 +4529,7 @@ void afterCommand(client *c) {
 
         /* Flush other pending push messages. Not interleaved with
          * transaction response since we're already outside nesting here. */
-        listJoin(c->reply, server.pending_push_messages);
+        listJoin(c->reply, inst->pending_push_messages);
     }
 
     clusterSlotStatsAddNetworkBytesOutForUserClient(c);
@@ -4656,7 +4656,7 @@ int processCommand(client *c) {
     if (!scriptIsTimedOut()) {
         /* Both EXEC and scripts call call() directly so there should be
          * no way in_exec or scriptIsRunning() is 1. */
-        serverAssert(!server.in_exec);
+        serverAssert(!inst->in_exec);
         serverAssert(!scriptIsRunning());
     }
 
@@ -4672,8 +4672,8 @@ int processCommand(client *c) {
 
     /* If we're inside a module blocked context yielding that wants to avoid
      * processing clients, postpone the command. */
-    if (server.busy_module_yield_flags != BUSY_MODULE_YIELD_NONE &&
-        !(server.busy_module_yield_flags & BUSY_MODULE_YIELD_CLIENTS)) {
+    if (inst->busy_module_yield_flags != BUSY_MODULE_YIELD_NONE &&
+        !(inst->busy_module_yield_flags & BUSY_MODULE_YIELD_CLIENTS)) {
         blockPostponeClient(c);
         return C_OK;
     }
@@ -4874,7 +4874,7 @@ int processCommand(client *c) {
      * before key eviction, after the last command was executed and consumed
      * some client output buffer memory. */
     evictClients();
-    if (server.current_client == NULL) {
+    if (inst->current_client == NULL) {
         /* If we evicted ourself then abort processing the command */
         return C_ERR;
     }
@@ -4896,7 +4896,7 @@ int processCommand(client *c) {
 
         /* performEvictions may flush replica output buffers. This may result
          * in a replica, that may be the active client, to be freed. */
-        if (server.current_client == NULL) return C_ERR;
+        if (inst->current_client == NULL) return C_ERR;
 
         if (out_of_memory && is_denyoom_command) {
             if (c->slot_migration_job != NULL) {
@@ -4913,12 +4913,12 @@ int processCommand(client *c) {
          * arguments might interfere. We need to save it for EXEC and module
          * calls too, since these can call EVAL, but avoid saving it during an
          * interrupted / yielding busy script / module. */
-        server.pre_command_oom_state = out_of_memory;
+        inst->pre_command_oom_state = out_of_memory;
     }
 
     /* Make sure to use a reasonable amount of memory for client side
      * caching metadata. */
-    if (server.tracking_clients) trackingLimitUsedSlots();
+    if (inst->tracking_clients) trackingLimitUsedSlots();
 
     /* Don't accept write commands if there are problems persisting on disk
      * unless coming from our primary, in which case check the replica ignore
@@ -4931,8 +4931,8 @@ int processCommand(client *c) {
             } else {
                 static mstime_t last_log_time_ms = 0;
                 const mstime_t log_interval_ms = 10000;
-                if (server.mstime > last_log_time_ms + log_interval_ms) {
-                    last_log_time_ms = server.mstime;
+                if (inst->mstime > last_log_time_ms + log_interval_ms) {
+                    last_log_time_ms = inst->mstime;
                     serverLog(LL_WARNING, "Replica is applying a command even though "
                                           "it is unable to write to disk.");
                 }
@@ -5005,11 +5005,11 @@ int processCommand(client *c) {
      * condition resolves, and the bottom-half of the transaction gets
      * executed, see Github PR #7022. */
     if (isInsideYieldingLongCommand() && !(c->cmd->flags & CMD_ALLOW_BUSY)) {
-        if (server.busy_module_yield_flags && server.busy_module_yield_reply) {
-            sds busy_err = sdscatprintf(sdsempty(), "-BUSY %s", server.busy_module_yield_reply);
+        if (inst->busy_module_yield_flags && inst->busy_module_yield_reply) {
+            sds busy_err = sdscatprintf(sdsempty(), "-BUSY %s", inst->busy_module_yield_reply);
             sdsmapchars(busy_err, "\r\n", "  ", 2);
             rejectCommandSds(c, busy_err, 1);
-        } else if (server.busy_module_yield_flags) {
+        } else if (inst->busy_module_yield_flags) {
             rejectCommand(c, shared.slowmoduleerr, 1);
         } else if (scriptIsEval()) {
             rejectCommand(c, shared.slowevalerr, 1);
@@ -5047,7 +5047,7 @@ int processCommand(client *c) {
     } else {
         int flags = CMD_CALL_FULL;
         call(c, flags);
-        if (listLength(server.ready_keys) && !isInsideYieldingLongCommand()) handleClientsBlockedOnKeys();
+        if (listLength(inst->ready_keys) && !isInsideYieldingLongCommand()) handleClientsBlockedOnKeys();
     }
     return C_OK;
 }
@@ -5056,10 +5056,10 @@ int processCommand(client *c) {
 
 void incrementErrorCount(const char *fullerr, size_t namelen) {
     void *result;
-    if (!raxFind(server.errors, (unsigned char *)fullerr, namelen, &result)) {
+    if (!raxFind(inst->errors, (unsigned char *)fullerr, namelen, &result)) {
         struct serverError *error = zmalloc(sizeof(*error));
         error->count = 1;
-        raxInsert(server.errors, (unsigned char *)fullerr, namelen, error, NULL);
+        raxInsert(inst->errors, (unsigned char *)fullerr, namelen, error, NULL);
     } else {
         struct serverError *error = result;
         error->count++;
@@ -5148,7 +5148,7 @@ int prepareForShutdown(client *c, int flags) {
     /* If we have any replicas, let them catch up the replication offset before
      * we shut down, to avoid data loss. */
     if (!(flags & SHUTDOWN_NOW) && server.shutdown_timeout != 0 && !isReadyToShutdown()) {
-        server.shutdown_mstime = server.mstime + server.shutdown_timeout * 1000;
+        server.shutdown_mstime = inst->mstime + server.shutdown_timeout * 1000;
         if (!isPausedActions(PAUSE_ACTION_REPLICA)) sendGetackToReplicas();
         pauseActions(PAUSE_DURING_SHUTDOWN, LLONG_MAX, PAUSE_ACTIONS_CLIENT_WRITE_SET);
         serverLog(LL_NOTICE, "Waiting for replicas before shutting down.");
@@ -5440,7 +5440,7 @@ void echoCommand(client *c) {
 void timeCommand(client *c) {
     addReplyArrayLen(c, 2);
     addReplyBulkLongLong(c, server.unixtime);
-    addReplyBulkLongLong(c, server.ustime - ((long long)server.unixtime) * 1000000);
+    addReplyBulkLongLong(c, inst->ustime - ((long long)server.unixtime) * 1000000);
 }
 
 typedef struct replyFlagNames {
@@ -6471,10 +6471,10 @@ void totalNumberOfStatefulKeys(unsigned long *blocking_keys,
                                unsigned long *watched_keys) {
     unsigned long bkeys = 0, bkeys_on_nokey = 0, wkeys = 0;
     for (int j = 0; j < server.dbnum; j++) {
-        if (server.db[j] == NULL) continue;
-        bkeys += dictSize(server.db[j]->blocking_keys);
-        bkeys_on_nokey += dictSize(server.db[j]->blocking_keys_unblock_on_nokey);
-        wkeys += dictSize(server.db[j]->watched_keys);
+        if (inst->db[j] == NULL) continue;
+        bkeys += dictSize(inst->db[j]->blocking_keys);
+        bkeys_on_nokey += dictSize(inst->db[j]->blocking_keys_unblock_on_nokey);
+        wkeys += dictSize(inst->db[j]->watched_keys);
     }
     if (blocking_keys) *blocking_keys = bkeys;
     if (blocking_keys_on_nokey) *blocking_keys_on_nokey = bkeys_on_nokey;
@@ -6548,7 +6548,7 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "process_supervised:%s\r\n", supervised,
                 "run_id:%s\r\n", server.runid,
                 "tcp_port:%i\r\n", server.port ? server.port : server.tls_port,
-                "server_time_usec:%I\r\n", (int64_t)server.ustime,
+                "server_time_usec:%I\r\n", (int64_t)inst->ustime,
                 "uptime_in_seconds:%I\r\n", (int64_t)uptime,
                 "uptime_in_days:%I\r\n", (int64_t)(uptime / (3600 * 24)),
                 "hz:%i\r\n", server.hz,
@@ -6637,11 +6637,11 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "maxclients:%u\r\n", server.maxclients,
                 "client_recent_max_input_buffer:%zu\r\n", maxin,
                 "client_recent_max_output_buffer:%zu\r\n", maxout,
-                "blocked_clients:%d\r\n", server.blocked_clients,
-                "tracking_clients:%d\r\n", server.tracking_clients,
+                "blocked_clients:%d\r\n", inst->blocked_clients,
+                "tracking_clients:%d\r\n", inst->tracking_clients,
                 "pubsub_clients:%d\r\n", server.pubsub_clients,
-                "watching_clients:%d\r\n", server.watching_clients,
-                "clients_in_timeout_table:%llu\r\n", (unsigned long long)raxSize(server.clients_timeout_table),
+                "watching_clients:%d\r\n", inst->watching_clients,
+                "clients_in_timeout_table:%llu\r\n", (unsigned long long)raxSize(inst->clients_timeout_table),
                 "total_watched_keys:%lu\r\n", watched_keys,
                 "total_blocking_keys:%lu\r\n", blocking_keys,
                 "total_blocking_keys_on_nokey:%lu\r\n", blocking_keys_on_nokey,
@@ -6787,7 +6787,7 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "current_fork_perc:%.2f\r\n", save_perc,
                 "current_save_keys_processed:%zu\r\n", server.stat_current_save_keys_processed,
                 "current_save_keys_total:%zu\r\n", server.stat_current_save_keys_total,
-                "rdb_changes_since_last_save:%lld\r\n", server.dirty,
+                "rdb_changes_since_last_save:%lld\r\n", inst->dirty,
                 "rdb_bgsave_in_progress:%d\r\n", isSaveInProgress(),
                 "rdb_current_bgsave_type:%s\r\n", current_bgsave_type,
                 "rdb_last_bgsave_type:%s\r\n", last_bgsave_type,
@@ -6867,16 +6867,16 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
     /* Stats */
     if (all_sections || (dictFind(section_dict, "stats") != NULL)) {
         ustime_t current_eviction_exceeded_time =
-            server.stat_last_eviction_exceeded_time ? (ustime_t)elapsedUs(server.stat_last_eviction_exceeded_time) : 0;
+            inst->stat_last_eviction_exceeded_time ? (ustime_t)elapsedUs(inst->stat_last_eviction_exceeded_time) : 0;
         ustime_t current_active_defrag_time =
-            server.stat_last_active_defrag_time ? (ustime_t)elapsedUs(server.stat_last_active_defrag_time) : 0;
+            inst->stat_last_active_defrag_time ? (ustime_t)elapsedUs(inst->stat_last_active_defrag_time) : 0;
 
         if (sections++) info = sdscat(info, "\r\n");
         info = sdscatprintf(
             info,
             "# Stats\r\n" FMTARGS(
                 "total_connections_received:%lld\r\n", server.stat_numconnections,
-                "total_commands_processed:%lld\r\n", server.stat_numcommands,
+                "total_commands_processed:%lld\r\n", inst->stat_numcommands,
                 "instantaneous_ops_per_sec:%lld\r\n", getInstantaneousMetric(STATS_METRIC_COMMAND),
                 "total_net_input_bytes:%lld\r\n", server.stat_net_input_bytes + server.stat_net_repl_input_bytes + server.bio_stat_net_repl_input_bytes + server.stat_net_cluster_slot_import_bytes,
                 "total_net_output_bytes:%lld\r\n", server.stat_net_output_bytes + server.stat_net_repl_output_bytes + server.stat_net_cluster_slot_export_bytes,
@@ -6893,22 +6893,22 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "sync_full:%lld\r\n", server.stat_sync_full,
                 "sync_partial_ok:%lld\r\n", server.stat_sync_partial_ok,
                 "sync_partial_err:%lld\r\n", server.stat_sync_partial_err,
-                "expired_keys:%lld\r\n", server.stat_expiredkeys,
-                "expired_fields:%lld\r\n", server.stat_expiredfields,
-                "expired_stale_perc:%.2f\r\n", server.stat_expired_keys_stale_perc * 100,
-                "expired_keys_with_volatile_items_stale_perc:%.2f\r\n", server.stat_expired_keys_with_vola_stale_perc * 100,
-                "expired_time_cap_reached_count:%lld\r\n", server.stat_expired_time_cap_reached_count,
-                "expire_cycle_cpu_milliseconds:%lld\r\n", server.stat_expire_cycle_time_used / 1000,
-                "evicted_keys:%lld\r\n", server.stat_evictedkeys,
+                "expired_keys:%lld\r\n", inst->stat_expiredkeys,
+                "expired_fields:%lld\r\n", inst->stat_expiredfields,
+                "expired_stale_perc:%.2f\r\n", inst->stat_expired_keys_stale_perc * 100,
+                "expired_keys_with_volatile_items_stale_perc:%.2f\r\n", inst->stat_expired_keys_with_vola_stale_perc * 100,
+                "expired_time_cap_reached_count:%lld\r\n", inst->stat_expired_time_cap_reached_count,
+                "expire_cycle_cpu_milliseconds:%lld\r\n", inst->stat_expire_cycle_time_used / 1000,
+                "evicted_keys:%lld\r\n", inst->stat_evictedkeys,
                 "evicted_clients:%lld\r\n", server.stat_evictedclients,
-                "evicted_scripts:%lld\r\n", server.stat_evictedscripts,
-                "total_eviction_exceeded_time:%lld\r\n", (server.stat_total_eviction_exceeded_time + current_eviction_exceeded_time) / 1000,
+                "evicted_scripts:%lld\r\n", inst->stat_evictedscripts,
+                "total_eviction_exceeded_time:%lld\r\n", (inst->stat_total_eviction_exceeded_time + current_eviction_exceeded_time) / 1000,
                 "current_eviction_exceeded_time:%lld\r\n", current_eviction_exceeded_time / 1000,
-                "keyspace_hits:%lld\r\n", server.stat_keyspace_hits,
-                "keyspace_misses:%lld\r\n", server.stat_keyspace_misses,
+                "keyspace_hits:%lld\r\n", inst->stat_keyspace_hits,
+                "keyspace_misses:%lld\r\n", inst->stat_keyspace_misses,
                 "pubsub_channels:%llu\r\n", kvstoreSize(server.pubsub_channels),
                 "pubsub_patterns:%zu\r\n", dictSize(server.pubsub_patterns),
-                "pubsubshard_channels:%llu\r\n", kvstoreSize(server.pubsubshard_channels),
+                "pubsubshard_channels:%llu\r\n", kvstoreSize(inst->pubsubshard_channels),
                 "latest_fork_usec:%lld\r\n", server.stat_fork_time,
                 "total_forks:%lld\r\n", server.stat_total_forks,
                 "forkless_fallbacks_module:%lld\r\n", server.stat_forkless_fallbacks_module,
@@ -6917,20 +6917,20 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "forkless_fallbacks_missing_inband_repl:%lld\r\n", server.stat_forkless_fallbacks_missing_inband_repl,
                 "forkless_fallbacks_compression:%lld\r\n", server.stat_forkless_fallbacks_compression,
                 "forkless_fallbacks_old_rdb_version:%lld\r\n", server.stat_forkless_fallbacks_old_rdb_version,
-                "migrate_cached_sockets:%zu\r\n", dictSize(server.migrate_cached_sockets),
+                "migrate_cached_sockets:%zu\r\n", dictSize(inst->migrate_cached_sockets),
                 "slave_expires_tracked_keys:%zu\r\n", getReplicaKeyWithExpireCount(),
-                "active_defrag_hits:%lld\r\n", server.stat_active_defrag_hits,
-                "active_defrag_misses:%lld\r\n", server.stat_active_defrag_misses,
-                "active_defrag_key_hits:%lld\r\n", server.stat_active_defrag_key_hits,
-                "active_defrag_key_misses:%lld\r\n", server.stat_active_defrag_key_misses,
-                "total_active_defrag_time:%lld\r\n", (server.stat_total_active_defrag_time + current_active_defrag_time) / 1000,
+                "active_defrag_hits:%lld\r\n", inst->stat_active_defrag_hits,
+                "active_defrag_misses:%lld\r\n", inst->stat_active_defrag_misses,
+                "active_defrag_key_hits:%lld\r\n", inst->stat_active_defrag_key_hits,
+                "active_defrag_key_misses:%lld\r\n", inst->stat_active_defrag_key_misses,
+                "total_active_defrag_time:%lld\r\n", (inst->stat_total_active_defrag_time + current_active_defrag_time) / 1000,
                 "current_active_defrag_time:%lld\r\n", current_active_defrag_time / 1000,
                 "tracking_total_keys:%lld\r\n", (unsigned long long)trackingGetTotalKeys(),
                 "tracking_total_items:%lld\r\n", (unsigned long long)trackingGetTotalItems(),
                 "tracking_total_prefixes:%lld\r\n", (unsigned long long)trackingGetTotalPrefixes(),
-                "unexpected_error_replies:%lld\r\n", server.stat_unexpected_error_replies,
-                "total_error_replies:%lld\r\n", server.stat_total_error_replies,
-                "dump_payload_sanitizations:%lld\r\n", server.stat_dump_payload_sanitizations,
+                "unexpected_error_replies:%lld\r\n", inst->stat_unexpected_error_replies,
+                "total_error_replies:%lld\r\n", inst->stat_total_error_replies,
+                "dump_payload_sanitizations:%lld\r\n", inst->stat_dump_payload_sanitizations,
                 "total_reads_processed:%lld\r\n", server.stat_total_reads_processed,
                 "total_writes_processed:%lld\r\n", server.stat_total_writes_processed,
                 "io_threaded_reads_processed:%lld\r\n", server.stat_io_reads_processed,
@@ -6938,20 +6938,20 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "io_threaded_freed_objects:%lld\r\n", server.stat_io_freed_objects,
                 "io_threaded_accept_processed:%lld\r\n", server.stat_io_accept_offloaded,
                 "io_threaded_poll_processed:%lld\r\n", server.stat_poll_processed_by_io_threads,
-                "io_threaded_total_prefetch_batches:%lld\r\n", server.stat_total_prefetch_batches,
-                "io_threaded_total_prefetch_entries:%lld\r\n", server.stat_total_prefetch_entries,
+                "io_threaded_total_prefetch_batches:%lld\r\n", inst->stat_total_prefetch_batches,
+                "io_threaded_total_prefetch_entries:%lld\r\n", inst->stat_total_prefetch_entries,
                 "client_query_buffer_limit_disconnections:%lld\r\n", server.stat_client_qbuf_limit_disconnections,
                 "client_output_buffer_limit_disconnections:%lld\r\n", server.stat_client_outbuf_limit_disconnections,
                 "reply_buffer_shrinks:%lld\r\n", server.stat_reply_buffer_shrinks,
                 "reply_buffer_expands:%lld\r\n", server.stat_reply_buffer_expands,
-                "eventloop_cycles:%llu\r\n", server.duration_stats[EL_DURATION_TYPE_EL].cnt,
-                "eventloop_duration_sum:%llu\r\n", server.duration_stats[EL_DURATION_TYPE_EL].sum,
-                "eventloop_duration_cmd_sum:%llu\r\n", server.duration_stats[EL_DURATION_TYPE_CMD].sum,
+                "eventloop_cycles:%llu\r\n", inst->duration_stats[EL_DURATION_TYPE_EL].cnt,
+                "eventloop_duration_sum:%llu\r\n", inst->duration_stats[EL_DURATION_TYPE_EL].sum,
+                "eventloop_duration_cmd_sum:%llu\r\n", inst->duration_stats[EL_DURATION_TYPE_CMD].sum,
                 "instantaneous_eventloop_cycles_per_sec:%llu\r\n", getInstantaneousMetric(STATS_METRIC_EL_CYCLE),
                 "instantaneous_eventloop_duration_usec:%llu\r\n", getInstantaneousMetric(STATS_METRIC_EL_DURATION),
-                "eventloop_priority_cycles:%llu\r\n", server.duration_stats[EL_DURATION_TYPE_PRIORITY_EL].cnt,
-                "eventloop_priority_duration_sum:%llu\r\n", server.duration_stats[EL_DURATION_TYPE_PRIORITY_EL].sum,
-                "eventloop_priority_duration_cmd_sum:%llu\r\n", server.duration_stats[EL_DURATION_TYPE_PRIORITY_CMD].sum));
+                "eventloop_priority_cycles:%llu\r\n", inst->duration_stats[EL_DURATION_TYPE_PRIORITY_EL].cnt,
+                "eventloop_priority_duration_sum:%llu\r\n", inst->duration_stats[EL_DURATION_TYPE_PRIORITY_EL].sum,
+                "eventloop_priority_duration_cmd_sum:%llu\r\n", inst->duration_stats[EL_DURATION_TYPE_PRIORITY_CMD].sum));
         info = genValkeyInfoStringACLStats(info);
     }
 
@@ -7113,8 +7113,8 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                             (long)m_ru.ru_stime.tv_sec, (long)m_ru.ru_stime.tv_usec, (long)m_ru.ru_utime.tv_sec,
                             (long)m_ru.ru_utime.tv_usec);
 #endif /* RUSAGE_THREAD */
-        long long active_seconds = server.stat_active_time / 1000000;
-        ustime_t active_microseconds = server.stat_active_time % 1000000;
+        long long active_seconds = inst->stat_active_time / 1000000;
+        ustime_t active_microseconds = inst->stat_active_time % 1000000;
         info = sdscatprintf(info,
                             "used_active_time_main_thread:%lld.%06lld\r\n",
                             active_seconds, active_microseconds);
@@ -7148,7 +7148,7 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
         if (sections++) info = sdscat(info, "\r\n");
         info = sdscat(info, "# Errorstats\r\n");
         raxIterator ri;
-        raxStart(&ri, server.errors);
+        raxStart(&ri, inst->errors);
         raxSeek(&ri, "^", NULL, 0);
         struct serverError *e;
         while (raxNext(&ri)) {
@@ -7197,7 +7197,7 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
         if (sections++) info = sdscat(info, "\r\n");
         info = sdscatprintf(info, "# Keyspace\r\n");
         for (j = 0; j < server.dbnum; j++) {
-            serverDb *db = server.db[j];
+            serverDb *db = inst->db[j];
             if (db == NULL) continue;
             long long keys, vkeys, keysvitems;
 
@@ -7246,12 +7246,12 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
             info,
             "# Debug\r\n" FMTARGS(
                 "used_memory_module_external:%zu\r\n", module_external_memory,
-                "eventloop_duration_aof_sum:%llu\r\n", server.duration_stats[EL_DURATION_TYPE_AOF].sum,
-                "eventloop_duration_cron_sum:%llu\r\n", server.duration_stats[EL_DURATION_TYPE_CRON].sum,
-                "eventloop_duration_max:%llu\r\n", server.duration_stats[EL_DURATION_TYPE_EL].max,
-                "eventloop_cmd_per_cycle_max:%lld\r\n", server.el_cmd_cnt_max,
-                "eventloop_priority_duration_max:%llu\r\n", server.duration_stats[EL_DURATION_TYPE_PRIORITY_EL].max,
-                "eventloop_priority_cmd_per_cycle_max:%lld\r\n", server.priority_el_cmd_cnt_max,
+                "eventloop_duration_aof_sum:%llu\r\n", inst->duration_stats[EL_DURATION_TYPE_AOF].sum,
+                "eventloop_duration_cron_sum:%llu\r\n", inst->duration_stats[EL_DURATION_TYPE_CRON].sum,
+                "eventloop_duration_max:%llu\r\n", inst->duration_stats[EL_DURATION_TYPE_EL].max,
+                "eventloop_cmd_per_cycle_max:%lld\r\n", inst->el_cmd_cnt_max,
+                "eventloop_priority_duration_max:%llu\r\n", inst->duration_stats[EL_DURATION_TYPE_PRIORITY_EL].max,
+                "eventloop_priority_cmd_per_cycle_max:%lld\r\n", inst->priority_el_cmd_cnt_max,
                 "io_threaded_reads_pending:%lld\r\n", server.stat_io_reads_pending,
                 "io_threaded_writes_pending:%lld\r\n", server.stat_io_writes_pending));
 
@@ -8276,8 +8276,8 @@ __attribute__((weak)) int main(int argc, char **argv) {
     serverSetCpuAffinity(server.server_cpulist);
     setOOMScoreAdj(-1);
 
-    aeMain(server.el);
-    aeDeleteEventLoop(server.el);
+    aeMain(inst->el);
+    aeDeleteEventLoop(inst->el);
     return 0;
 }
 

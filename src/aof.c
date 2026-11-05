@@ -821,7 +821,7 @@ int openNewIncrAofForAppend(void) {
      * is already synced at this point so fsync doesn't matter. */
     if (server.aof_fd != -1) {
         aof_background_fsync_and_close(server.aof_fd);
-        server.aof_last_fsync = server.mstime;
+        server.aof_last_fsync = inst->mstime;
     }
     server.aof_fd = newfd;
 
@@ -943,7 +943,7 @@ void stopAppendOnly(void) {
         if (valkey_fsync(server.aof_fd) == -1) {
             serverLog(LL_WARNING, "Fail to fsync the AOF file: %s", strerror(errno));
         } else {
-            server.aof_last_fsync = server.mstime;
+            server.aof_last_fsync = inst->mstime;
         }
         close(server.aof_fd);
     }
@@ -974,7 +974,7 @@ int startAppendOnly(void) {
         server.aof_rewrite_scheduled = 1;
         serverLog(LL_NOTICE, "AOF was enabled but there is already another background operation. An AOF background was "
                              "scheduled to start when possible.");
-    } else if (server.in_exec) {
+    } else if (inst->in_exec) {
         server.aof_rewrite_scheduled = 1;
         serverLog(LL_NOTICE,
                   "AOF was enabled during a transaction. An AOF background was scheduled to start when possible.");
@@ -995,7 +995,7 @@ int startAppendOnly(void) {
             return C_ERR;
         }
     }
-    server.aof_last_fsync = server.mstime;
+    server.aof_last_fsync = inst->mstime;
     /* If AOF fsync error in bio job, we just ignore it and log the event. */
     int aof_bio_fsync_status = atomic_load_explicit(&server.aof_bio_fsync_status, memory_order_relaxed);
     if (aof_bio_fsync_status == C_ERR) {
@@ -1092,7 +1092,7 @@ int restartAOFWithSyncRdb(void) {
     server.aof_lastbgrewrite_status = C_OK;
     server.stat_aofrw_consecutive_failures = 0;
 
-    server.aof_last_fsync = server.mstime;
+    server.aof_last_fsync = inst->mstime;
     server.aof_last_incr_size = 0;
     server.aof_last_incr_fsync_offset = 0;
     server.aof_rewrite_base_size = getAppendOnlyFileSize(new_base_filename, NULL);
@@ -1193,7 +1193,7 @@ void flushAppendOnlyFile(int force) {
          * stop write commands before fsync called in one second,
          * the data in page cache cannot be flushed in time. */
         if (server.aof_fsync == AOF_FSYNC_EVERYSEC && server.aof_last_incr_fsync_offset != server.aof_last_incr_size &&
-            server.mstime - server.aof_last_fsync >= 1000 && !(sync_in_progress = aofFsyncInProgress())) {
+            inst->mstime - server.aof_last_fsync >= 1000 && !(sync_in_progress = aofFsyncInProgress())) {
             goto try_fsync;
 
             /* Check if we need to do fsync even the aof buffer is empty,
@@ -1226,9 +1226,9 @@ void flushAppendOnlyFile(int force) {
             if (server.aof_flush_postponed_start == 0) {
                 /* No previous write postponing, remember that we are
                  * postponing the flush and return. */
-                server.aof_flush_postponed_start = server.mstime;
+                server.aof_flush_postponed_start = inst->mstime;
                 return;
-            } else if (server.mstime - server.aof_flush_postponed_start < 2000) {
+            } else if (inst->mstime - server.aof_flush_postponed_start < 2000) {
                 /* We were already waiting for fsync to finish, but for less
                  * than two seconds this is still ok. Postpone again. */
                 return;
@@ -1386,14 +1386,14 @@ try_fsync:
         latencyTraceIfNeeded(aof, aof_fsync_always, latency);
 
         server.aof_last_incr_fsync_offset = server.aof_last_incr_size;
-        server.aof_last_fsync = server.mstime;
+        server.aof_last_fsync = inst->mstime;
         atomic_store_explicit(&server.fsynced_reploff_pending, server.primary_repl_offset, memory_order_relaxed);
-    } else if (server.aof_fsync == AOF_FSYNC_EVERYSEC && server.mstime - server.aof_last_fsync >= 1000) {
+    } else if (server.aof_fsync == AOF_FSYNC_EVERYSEC && inst->mstime - server.aof_last_fsync >= 1000) {
         if (!sync_in_progress) {
             aof_background_fsync(server.aof_fd);
             server.aof_last_incr_fsync_offset = server.aof_last_incr_size;
         }
-        server.aof_last_fsync = server.mstime;
+        server.aof_last_fsync = inst->mstime;
     }
 }
 
@@ -1748,10 +1748,10 @@ int loadSingleAppendOnlyFile(char *filename) {
      * to the same file we're about to read. */
     server.aof_state = AOF_OFF;
 
-    client *old_cur_client = server.current_client;
-    client *old_exec_client = server.executing_client;
+    client *old_cur_client = inst->current_client;
+    client *old_exec_client = inst->executing_client;
     fakeClient = createAOFClient();
-    server.current_client = server.executing_client = fakeClient;
+    inst->current_client = inst->executing_client = fakeClient;
 
     /* Check if the AOF starts with a plain or streaming-compressed RDB (it may
      * be an RDB-encoded base AOF or old-style RDB-preamble AOF). In that case,
@@ -1911,8 +1911,8 @@ oomerr: /* An argument too large to allocate. */
 
 cleanup:
     if (fakeClient) freeClient(fakeClient);
-    server.current_client = old_cur_client;
-    server.executing_client = old_exec_client;
+    inst->current_client = old_cur_client;
+    inst->executing_client = old_exec_client;
     fclose(fp);
     sdsfree(aof_filepath);
     return ret;
@@ -2580,7 +2580,7 @@ int rewriteSlotToAppendOnlyFileRio(rio *aof, int db_num, int hashslot, size_t *k
 
     if (dbHasNoKeys(db_num)) return C_OK;
 
-    serverDb *db = server.db[db_num];
+    serverDb *db = inst->db[db_num];
     if (kvstoreHashtableSize(db->keys, hashslot) == 0) return C_OK;
 
     /* SELECT the DB */
@@ -2629,7 +2629,7 @@ int rewriteAppendOnlyFileRio(rio *aof) {
 
     for (j = 0; j < server.dbnum; j++) {
         if (dbHasNoKeys(j)) continue;
-        serverDb *db = server.db[j];
+        serverDb *db = inst->db[j];
 
         /* SELECT the new DB */
         if (rewriteSelectDbRio(aof, j) == C_ERR) goto werr;
@@ -2827,7 +2827,7 @@ int rewriteAppendOnlyFileBackground(void) {
 void bgrewriteaofCommand(client *c) {
     if (server.child_type == CHILD_TYPE_AOF) {
         addReplyError(c, "Background append only file rewriting already in progress");
-    } else if (hasActiveSaveOrChild() || server.in_exec) {
+    } else if (hasActiveSaveOrChild() || inst->in_exec) {
         server.aof_rewrite_scheduled = 1;
         /* When manually triggering AOFRW we reset the count
          * so that it can be executed immediately. */

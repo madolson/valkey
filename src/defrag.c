@@ -91,7 +91,7 @@ typedef struct {
  * Doesn't include variables specific to a stage or type of data. */
 struct DefragContext {
     monotime start_cycle;           // Time of beginning of defrag cycle
-    long long start_defrag_hits;    // server.stat_active_defrag_hits captured at beginning of cycle
+    long long start_defrag_hits;    // inst->stat_active_defrag_hits captured at beginning of cycle
     list *remaining_stages;         // List of stages which remain to be processed
     StageDescriptor *current_stage; // The stage that's currently being processed
 
@@ -168,7 +168,7 @@ static void *activeDefragAllocWithoutFree(void *ptr, size_t *allocation_size) {
     size_t size;
     void *newptr;
     if (!allocatorShouldDefrag(ptr)) {
-        server.stat_active_defrag_misses++;
+        inst->stat_active_defrag_misses++;
         return NULL;
     }
     /* move this allocation to a new allocation.
@@ -179,7 +179,7 @@ static void *activeDefragAllocWithoutFree(void *ptr, size_t *allocation_size) {
     memcpy(newptr, ptr, size);
     if (allocation_size) *allocation_size = size;
 
-    server.stat_active_defrag_hits++;
+    inst->stat_active_defrag_hits++;
     return newptr;
 }
 
@@ -246,7 +246,7 @@ static void defragZsetItemCallback(OrderedIndexItem *old_item, OrderedIndexItem 
     hashtable *ht = privdata;
     bool replaced = hashtableReplaceReallocatedEntry(ht, old_item, new_item);
     serverAssert(replaced);
-    server.stat_active_defrag_scanned++;
+    inst->stat_active_defrag_scanned++;
 }
 
 #define DEFRAG_SDS_DICT_NO_VAL 0
@@ -369,7 +369,7 @@ static long scanLaterList(robj *ob, unsigned long *cursor, monotime endtime) {
     /* Process nodes until time expires or list ends */
     while (node) {
         activeDefragQuickListNode(ql, &node);
-        server.stat_active_defrag_scanned++;
+        inst->stat_active_defrag_scanned++;
 
         /* Check time limit after processing each node */
         if (getMonotonicUs() > endtime) {
@@ -400,7 +400,7 @@ static void scanLaterZset(robj *ob, unsigned long *cursor) {
 static void scanHashtableCallbackCountScanned(void *privdata, void *elemref) {
     UNUSED(privdata);
     UNUSED(elemref);
-    server.stat_active_defrag_scanned++;
+    inst->stat_active_defrag_scanned++;
 }
 
 static void scanLaterSet(robj *ob, unsigned long *cursor) {
@@ -531,7 +531,7 @@ static int scanLaterStreamListpacks(robj *ob, unsigned long *cursor, monotime en
     while (raxNext(&ri)) {
         void *newdata = activeDefragAlloc(ri.data);
         if (newdata) raxSetData(ri.node, ri.data = newdata);
-        server.stat_active_defrag_scanned++;
+        inst->stat_active_defrag_scanned++;
         if (++iterations > 128) {
             if (getMonotonicUs() > endtime) {
                 serverAssert(ri.key_len == sizeof(last));
@@ -653,7 +653,7 @@ static void defragModule(serverDb *db, robj *obj) {
 /* for each key we scan in the main dict, this function will attempt to defrag
  * all the various pointers it has. */
 static void defragKey(defragKeysCtx *ctx, robj **elemref) {
-    serverDb *db = server.db[ctx->dbid];
+    serverDb *db = inst->db[ctx->dbid];
     int slot = ctx->kvstate.slot;
     robj *newob, *ob;
     unsigned char *newzl;
@@ -724,13 +724,13 @@ static void defragKey(defragKeysCtx *ctx, robj **elemref) {
 
 /* Defrag scan callback for the main db dictionary. */
 static void dbKeysScanCallback(void *privdata, void *elemref) {
-    long long hits_before = server.stat_active_defrag_hits;
+    long long hits_before = inst->stat_active_defrag_hits;
     defragKey((defragKeysCtx *)privdata, (robj **)elemref);
-    if (server.stat_active_defrag_hits != hits_before)
-        server.stat_active_defrag_key_hits++;
+    if (inst->stat_active_defrag_hits != hits_before)
+        inst->stat_active_defrag_key_hits++;
     else
-        server.stat_active_defrag_key_misses++;
-    server.stat_active_defrag_scanned++;
+        inst->stat_active_defrag_key_misses++;
+    inst->stat_active_defrag_scanned++;
 }
 
 /* Defrag scan callback for a pubsub channels hashtable. */
@@ -764,7 +764,7 @@ static void defragPubsubScanCallback(void *privdata, void *elemref) {
     if ((newclients = hashtableDefragTables(clients, activeDefragAlloc)))
         *clients_ref = newclients;
 
-    server.stat_active_defrag_scanned++;
+    inst->stat_active_defrag_scanned++;
 }
 
 /* returns 0 more work may or may not be needed (see non-zero cursor),
@@ -809,8 +809,8 @@ static doneStatus defragLaterStep(monotime endtime, void *privdata) {
     defragKeysCtx *ctx = privdata;
 
     unsigned int iterations = 0;
-    long long prev_defragged = server.stat_active_defrag_hits;
-    unsigned long long prev_scanned = server.stat_active_defrag_scanned;
+    long long prev_defragged = inst->stat_active_defrag_hits;
+    unsigned long long prev_scanned = inst->stat_active_defrag_scanned;
 
     while (defrag_later && listLength(defrag_later) > 0) {
         listNode *head = listFirst(defrag_later);
@@ -819,12 +819,12 @@ static doneStatus defragLaterStep(monotime endtime, void *privdata) {
         kvstoreHashtableFind(ctx->kvstate.kvs, ctx->kvstate.slot, key, &found);
         robj *ob = found;
 
-        long long key_defragged = server.stat_active_defrag_hits;
+        long long key_defragged = inst->stat_active_defrag_hits;
         bool timeout = (defragLaterItem(ob, &defrag_later_cursor, endtime, ctx->dbid) == 1);
-        if (key_defragged != server.stat_active_defrag_hits) {
-            server.stat_active_defrag_key_hits++;
+        if (key_defragged != inst->stat_active_defrag_hits) {
+            inst->stat_active_defrag_key_hits++;
         } else {
-            server.stat_active_defrag_key_misses++;
+            inst->stat_active_defrag_key_misses++;
         }
 
         if (timeout) break;
@@ -834,12 +834,12 @@ static doneStatus defragLaterStep(monotime endtime, void *privdata) {
             listDelNode(defrag_later, head);
         }
 
-        if (++iterations > 16 || server.stat_active_defrag_hits > prev_defragged ||
-            server.stat_active_defrag_scanned - prev_scanned > 64) {
+        if (++iterations > 16 || inst->stat_active_defrag_hits > prev_defragged ||
+            inst->stat_active_defrag_scanned - prev_scanned > 64) {
             if (getMonotonicUs() > endtime) break;
             iterations = 0;
-            prev_defragged = server.stat_active_defrag_hits;
-            prev_scanned = server.stat_active_defrag_scanned;
+            prev_defragged = inst->stat_active_defrag_hits;
+            prev_scanned = inst->stat_active_defrag_scanned;
         }
     }
 
@@ -869,8 +869,8 @@ static doneStatus defragStageKvstoreHelper(monotime endtime,
     }
 
     unsigned int iterations = 0;
-    long long prev_defragged = server.stat_active_defrag_hits;
-    unsigned long long prev_scanned = server.stat_active_defrag_scanned;
+    long long prev_defragged = inst->stat_active_defrag_hits;
+    unsigned long long prev_scanned = inst->stat_active_defrag_scanned;
 
     if (state.slot == KVS_SLOT_DEFRAG_LUT) {
         // Before we start scanning the kvstore, handle the main structures
@@ -882,11 +882,11 @@ static doneStatus defragStageKvstoreHelper(monotime endtime,
     }
 
     while (true) {
-        if (++iterations > 16 || server.stat_active_defrag_hits > prev_defragged || server.stat_active_defrag_scanned - prev_scanned > 64) {
+        if (++iterations > 16 || inst->stat_active_defrag_hits > prev_defragged || inst->stat_active_defrag_scanned - prev_scanned > 64) {
             if (getMonotonicUs() >= endtime) break;
             iterations = 0;
-            prev_defragged = server.stat_active_defrag_hits;
-            prev_scanned = server.stat_active_defrag_scanned;
+            prev_defragged = inst->stat_active_defrag_hits;
+            prev_scanned = inst->stat_active_defrag_scanned;
         }
 
         if (precontinue_fn) {
@@ -920,7 +920,7 @@ static doneStatus defragStageKvstoreHelper(monotime endtime,
 static doneStatus defragStageDbKeys(monotime endtime, void *target, void *privdata) {
     UNUSED(privdata);
     int dbid = (uintptr_t)target;
-    serverDb *db = server.db[dbid];
+    serverDb *db = inst->db[dbid];
 
     static defragKeysCtx ctx; // STATIC - this persists
     if (endtime == 0) {
@@ -941,7 +941,7 @@ static doneStatus defragStageDbKeys(monotime endtime, void *target, void *privda
 static doneStatus defragStageExpiresKvstore(monotime endtime, void *target, void *privdata) {
     UNUSED(privdata);
     int dbid = (uintptr_t)target;
-    serverDb *db = server.db[dbid];
+    serverDb *db = inst->db[dbid];
     return defragStageKvstoreHelper(endtime, db->expires,
                                     scanHashtableCallbackCountScanned, NULL, NULL);
 }
@@ -950,14 +950,14 @@ static doneStatus defragStageExpiresKvstore(monotime endtime, void *target, void
 static doneStatus defragStageKeysWithvolaItemsKvstore(monotime endtime, void *target, void *privdata) {
     UNUSED(privdata);
     int dbid = (uintptr_t)target;
-    serverDb *db = server.db[dbid];
+    serverDb *db = inst->db[dbid];
     return defragStageKvstoreHelper(endtime, db->keys_with_volatile_items,
                                     scanHashtableCallbackCountScanned, NULL, NULL);
 }
 
 
 static doneStatus defragStagePubsubKvstore(monotime endtime, void *target, void *privdata) {
-    // target is server.pubsub_channels or server.pubsubshard_channels
+    // target is server.pubsub_channels or inst->pubsubshard_channels
     getClientChannelsFnWrapper *fnWrapper = privdata;
     defragPubSubCtx ctx;
     ctx.getPubSubChannels = fnWrapper->fn;
@@ -1016,7 +1016,7 @@ static void endDefragCycle(bool normal_termination) {
         serverAssert(listLength(defrag.remaining_stages) == 0);
     } else {
         // Defrag is being terminated abnormally
-        aeDeleteTimeEvent(server.el, defrag.timeproc_id);
+        aeDeleteTimeEvent(inst->el, defrag.timeproc_id);
 
         if (defrag.current_stage) {
             zfree(defrag.current_stage);
@@ -1040,11 +1040,11 @@ static void endDefragCycle(bool normal_termination) {
     size_t frag_bytes;
     float frag_pct = getAllocatorFragmentation(&frag_bytes);
     serverLog(LL_VERBOSE, "Active defrag done in %dms, reallocated=%d, frag=%.0f%%, frag_bytes=%zu",
-              (int)elapsedMs(defrag.start_cycle), (int)(server.stat_active_defrag_hits - defrag.start_defrag_hits),
+              (int)elapsedMs(defrag.start_cycle), (int)(inst->stat_active_defrag_hits - defrag.start_defrag_hits),
               frag_pct, frag_bytes);
 
-    server.stat_total_active_defrag_time += elapsedUs(server.stat_last_active_defrag_time);
-    server.stat_last_active_defrag_time = 0;
+    inst->stat_total_active_defrag_time += elapsedUs(inst->stat_last_active_defrag_time);
+    inst->stat_last_active_defrag_time = 0;
     server.active_defrag_cpu_percent = 0;
 
     /* Immediately check to see if we should start another defrag cycle. */
@@ -1212,7 +1212,7 @@ void defragWhileBlocked(void) {
     long long reschedule_delay = activeDefragTimeProc(NULL, 0, NULL);
     if (reschedule_delay == AE_NOMORE) {
         // If it's done, deregister the timer
-        aeDeleteTimeEvent(server.el, timeproc_id);
+        aeDeleteTimeEvent(inst->el, timeproc_id);
     }
     /* Otherwise, just ignore the reschedule_delay, the timer will pop the next time that the
      * event loop can process timers again. */
@@ -1229,7 +1229,7 @@ static void beginDefragCycle(void) {
         /* Skip the non-existent dbs but not empty dbs since hashtableDefragTables
          * still defrags the internal allocations of the hashtables structs if they
          * exist. */
-        if (server.db[dbid] == NULL) continue;
+        if (inst->db[dbid] == NULL) continue;
 
         addDefragStage(defragStageDbKeys, (void *)(uintptr_t)dbid, NULL);
         addDefragStage(defragStageExpiresKvstore, (void *)(uintptr_t)dbid, NULL);
@@ -1239,7 +1239,7 @@ static void beginDefragCycle(void) {
     static getClientChannelsFnWrapper getClientPubSubChannelsFn = {getClientPubSubChannels};
     static getClientChannelsFnWrapper getClientPubSubShardChannelsFn = {getClientPubSubShardChannels};
     addDefragStage(defragStagePubsubKvstore, server.pubsub_channels, &getClientPubSubChannelsFn);
-    addDefragStage(defragStagePubsubKvstore, server.pubsubshard_channels, &getClientPubSubShardChannelsFn);
+    addDefragStage(defragStagePubsubKvstore, inst->pubsubshard_channels, &getClientPubSubShardChannelsFn);
 
     addDefragStage(defragLuaScripts, NULL, NULL);
     addDefragStage(defragModuleGlobals, NULL, NULL);
@@ -1247,12 +1247,12 @@ static void beginDefragCycle(void) {
 
     defrag.current_stage = NULL;
     defrag.start_cycle = getMonotonicUs();
-    defrag.start_defrag_hits = server.stat_active_defrag_hits;
+    defrag.start_defrag_hits = inst->stat_active_defrag_hits;
     defrag.timeproc_end_time = 0;
     defrag.timeproc_overage_us = 0;
-    defrag.timeproc_id = aeCreateTimeEvent(server.el, 0, activeDefragTimeProc, NULL, NULL);
+    defrag.timeproc_id = aeCreateTimeEvent(inst->el, 0, activeDefragTimeProc, NULL, NULL);
 
-    elapsedStart(&server.stat_last_active_defrag_time);
+    elapsedStart(&inst->stat_last_active_defrag_time);
 }
 
 

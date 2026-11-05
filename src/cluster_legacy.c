@@ -3091,7 +3091,7 @@ int clusterProcessGossipSection(clusterMsg *hdr, clusterLink *link) {
                  * it's greater than our view but is not in the future
                  * (with 500 milliseconds tolerance) from the POV of our
                  * clock. */
-                if (pongtime <= (server.mstime + 500) && pongtime > node->pong_received) {
+                if (pongtime <= (inst->mstime + 500) && pongtime > node->pong_received) {
                     node->pong_received = pongtime;
                 }
             }
@@ -7590,7 +7590,7 @@ int verifyClusterConfigWithData(void) {
 
 /* Remove all the shard channel related information not owned by the current shard. */
 static inline void removeAllNotOwnedShardChannelSubscriptions(void) {
-    if (!kvstoreSize(server.pubsubshard_channels)) return;
+    if (!kvstoreSize(inst->pubsubshard_channels)) return;
     clusterNode *cur_primary = clusterNodeIsPrimary(myself) ? myself : myself->replicaof;
     for (int j = 0; j < CLUSTER_SLOTS; j++) {
         if (server.cluster->slots[j] != cur_primary) {
@@ -8258,14 +8258,14 @@ unsigned int delKeysInSlot(unsigned int hashslot, int lazy, bool propagate_del, 
 
     /* We may lose a slot during the pause. We need to track this
      * state so that we don't assert in propagateNow(). */
-    server.server_del_keys_in_slot = 1;
+    inst->server_del_keys_in_slot = 1;
     unsigned int j = 0;
-    int before_execution_nesting = server.execution_nesting;
+    int before_execution_nesting = inst->execution_nesting;
 
     for (int i = 0; i < server.dbnum; i++) {
         kvstoreHashtableIterator *kvs_di = NULL;
         void *next;
-        serverDb *db = server.db[i];
+        serverDb *db = inst->db[i];
         if (db == NULL) continue;
         kvs_di = kvstoreGetHashtableIterator(db->keys, hashslot, HASHTABLE_ITER_SAFE);
         while (kvstoreHashtableIteratorNext(kvs_di, &next)) {
@@ -8294,7 +8294,7 @@ unsigned int delKeysInSlot(unsigned int hashslot, int lazy, bool propagate_del, 
             postExecutionUnitOperations();
             decrRefCount(key);
             j++;
-            server.dirty++;
+            inst->dirty++;
         }
         kvstoreReleaseHashtableIterator(kvs_di);
     }
@@ -8303,14 +8303,14 @@ unsigned int delKeysInSlot(unsigned int hashslot, int lazy, bool propagate_del, 
      * drop their hot-key state too. Sampling was suppressed during the loop via
      * server_del_keys_in_slot (see hotkeysShouldRecord). */
     hotkeysPurgeSlot(hashslot);
-    server.server_del_keys_in_slot = 0;
-    serverAssert(server.execution_nesting == before_execution_nesting);
+    inst->server_del_keys_in_slot = 0;
+    serverAssert(inst->execution_nesting == before_execution_nesting);
     return j;
 }
 
 /* Get the count of the channels for a given slot. */
 unsigned int countChannelsInSlot(unsigned int hashslot) {
-    return kvstoreHashtableSize(server.pubsubshard_channels, hashslot);
+    return kvstoreHashtableSize(inst->pubsubshard_channels, hashslot);
 }
 
 clusterNode *getMyClusterNode(void) {

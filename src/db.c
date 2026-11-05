@@ -111,8 +111,8 @@ robj *lookupKey(serverDb *db, robj *key, int flags) {
          * Don't do it if we have a saving child, as this will trigger
          * a copy on write madness. */
         if ((flags & LOOKUP_NOTOUCH) == 0 &&
-            server.current_client && server.current_client->flag.no_touch &&
-            server.executing_client && server.executing_client->cmd->proc != touchCommand)
+            inst->current_client && inst->current_client->flag.no_touch &&
+            inst->executing_client && inst->executing_client->cmd->proc != touchCommand)
             flags |= LOOKUP_NOTOUCH;
         if (!hasActiveChildProcess() && !(flags & LOOKUP_NOTOUCH)) {
             /* Shared objects can't be stored in the database. */
@@ -120,11 +120,11 @@ robj *lookupKey(serverDb *db, robj *key, int flags) {
             val->lru = lrulfu_touch(val->lru);
         }
 
-        if (!(flags & (LOOKUP_NOSTATS | LOOKUP_WRITE))) server.stat_keyspace_hits++;
+        if (!(flags & (LOOKUP_NOSTATS | LOOKUP_WRITE))) inst->stat_keyspace_hits++;
         /* TODO: Use separate hits stats for WRITE */
     } else {
         if (!(flags & (LOOKUP_NONOTIFY | LOOKUP_WRITE))) notifyKeyspaceEvent(NOTIFY_KEY_MISS, "keymiss", key, db->id);
-        if (!(flags & (LOOKUP_NOSTATS | LOOKUP_WRITE))) server.stat_keyspace_misses++;
+        if (!(flags & (LOOKUP_NOSTATS | LOOKUP_WRITE))) inst->stat_keyspace_misses++;
         /* TODO: Use separate misses stats and notify event for WRITE */
     }
 
@@ -265,20 +265,20 @@ int getCachedKeySlot(sds key) {
      * Modules and scripts executed on the primary may get replicated as multi-execs that operate on multiple slots,
      * so we must always recompute the slot for commands coming from the primary or AOF.
      */
-    if (server.current_client && server.current_client->slot >= 0 && server.current_client->flag.executing_command &&
-        !mustObeyClient(server.current_client) &&
-        server.current_client->cmd &&
-        !(server.current_client->cmd->flags & (CMD_MODULE | CMD_TOUCHES_ARBITRARY_KEYS))) {
-        debugServerAssertWithInfo(server.current_client, NULL,
-                                  (int)keyHashSlot(key, (int)sdslen(key)) == server.current_client->slot);
-        return server.current_client->slot;
+    if (inst->current_client && inst->current_client->slot >= 0 && inst->current_client->flag.executing_command &&
+        !mustObeyClient(inst->current_client) &&
+        inst->current_client->cmd &&
+        !(inst->current_client->cmd->flags & (CMD_MODULE | CMD_TOUCHES_ARBITRARY_KEYS))) {
+        debugServerAssertWithInfo(inst->current_client, NULL,
+                                  (int)keyHashSlot(key, (int)sdslen(key)) == inst->current_client->slot);
+        return inst->current_client->slot;
     }
     int slot = keyHashSlot(key, (int)sdslen(key));
     /* For the case of commands from clients we must obey, getNodeByQuery() never gets called,
      * and thus c->slot never gets populated. That said, if this command ends up accessing
      * a key, we are able to backfill c->slot here, where the key's hash calculation is made. */
-    if (server.current_client && mustObeyClient(server.current_client)) {
-        server.current_client->slot = slot;
+    if (inst->current_client && mustObeyClient(inst->current_client)) {
+        inst->current_client->slot = slot;
     }
     return slot;
 }
@@ -708,7 +708,7 @@ long long emptyData(int dbnum, int flags, void(callback)(hashtable *)) {
     }
 
     /* Empty the database structure. */
-    removed = emptyDbStructure(server.db, dbnum, async, callback);
+    removed = emptyDbStructure(inst->db, dbnum, async, callback);
 
     if (hotkeysEnabled()) {
         if (dbnum == -1)
@@ -769,7 +769,7 @@ long long dbTotalServerKeyCount(void) {
     int j;
     for (j = 0; j < server.dbnum; j++) {
         if (dbHasNoKeys(j)) continue;
-        total += kvstoreSize(server.db[j]->keys);
+        total += kvstoreSize(inst->db[j]->keys);
     }
     return total;
 }
@@ -801,9 +801,9 @@ void signalFlushedDb(int dbid, int async) {
     }
 
     for (int j = startdb; j <= enddb; j++) {
-        if (server.db[j] == NULL) continue;
-        scanDatabaseForDeletedKeys(server.db[j], NULL);
-        touchAllWatchedKeysInDb(server.db[j], NULL);
+        if (inst->db[j] == NULL) continue;
+        scanDatabaseForDeletedKeys(inst->db[j], NULL);
+        touchAllWatchedKeysInDb(inst->db[j], NULL);
     }
 
     trackingInvalidateKeysOnFlush(async);
@@ -848,7 +848,7 @@ int parseFlushCommandFlagsOrReply(client *c, int *flags) {
 
 /* Flushes the whole server data set. */
 void flushAllDataAndResetRDB(int flags) {
-    server.dirty += emptyData(-1, flags, NULL);
+    inst->dirty += emptyData(-1, flags, NULL);
     if (isForkBgsaveInProgress()) killRDBChild();
     if (isForklessSaveInProgress()) forklessSaveCancel();
     if (server.child_type == CHILD_TYPE_SLOT_MIGRATION) killSlotMigrationChild();
@@ -875,7 +875,7 @@ void flushdbCommand(client *c) {
     if (parseFlushCommandFlagsOrReply(c, &flags) == C_ERR) return;
 
     /* flushdb should not flush the functions */
-    server.dirty += emptyData(c->db->id, flags | EMPTYDB_NOFUNCTIONS, NULL);
+    inst->dirty += emptyData(c->db->id, flags | EMPTYDB_NOFUNCTIONS, NULL);
 
     /* Without the forceCommandPropagation, when DB was already empty,
      * FLUSHDB will neither be replicated nor put into the AOF. */
@@ -918,7 +918,7 @@ void delGenericCommand(client *c, int lazy) {
         if (deleted) {
             signalModifiedKey(c, c->db, c->argv[j]);
             notifyKeyspaceEvent(NOTIFY_GENERIC, "del", c->argv[j], c->db->id);
-            server.dirty++;
+            inst->dirty++;
             numdel++;
         }
     }
@@ -1526,9 +1526,9 @@ void shutdownCommand(client *c) {
     if (!(flags & SHUTDOWN_NOSAVE) && isInsideYieldingLongCommand()) {
         /* Script timed out. Shutdown allowed only with the NOSAVE flag. See
          * also processCommand where these errors are returned. */
-        if (server.busy_module_yield_flags && server.busy_module_yield_reply) {
-            addReplyErrorFormat(c, "-BUSY %s", server.busy_module_yield_reply);
-        } else if (server.busy_module_yield_flags) {
+        if (inst->busy_module_yield_flags && inst->busy_module_yield_reply) {
+            addReplyErrorFormat(c, "-BUSY %s", inst->busy_module_yield_reply);
+        } else if (inst->busy_module_yield_flags) {
             addReplyErrorObject(c, shared.slowmoduleerr);
         } else if (scriptIsEval()) {
             addReplyErrorObject(c, shared.slowevalerr);
@@ -1581,7 +1581,7 @@ void renameGenericCommand(client *c, int nx) {
     signalModifiedKey(c, c->db, c->argv[2]);
     notifyKeyspaceEvent(NOTIFY_GENERIC, "rename_from", c->argv[1], c->db->id);
     notifyKeyspaceEvent(NOTIFY_GENERIC, "rename_to", c->argv[2], c->db->id);
-    server.dirty++;
+    inst->dirty++;
     addReply(c, nx ? shared.cone : shared.ok);
 }
 
@@ -1662,7 +1662,7 @@ void moveCommand(client *c) {
     notifyKeyspaceEvent(NOTIFY_GENERIC, "move_from", c->argv[1], src->id);
     notifyKeyspaceEvent(NOTIFY_GENERIC, "move_to", c->argv[1], dst->id);
 
-    server.dirty++;
+    inst->dirty++;
     addReply(c, shared.cone);
 }
 
@@ -1757,7 +1757,7 @@ void copyCommand(client *c) {
     signalModifiedKey(c, dst, c->argv[2]);
     notifyKeyspaceEvent(NOTIFY_GENERIC, "copy_to", c->argv[2], dst->id);
 
-    server.dirty++;
+    inst->dirty++;
     addReply(c, shared.cone);
 }
 
@@ -1880,11 +1880,11 @@ void swapMainDbWithTempDb(serverDb **tempDb) {
     bgIteration_flushall();
 
     for (int i = 0; i < server.dbnum; i++) {
-        if (tempDb[i] == NULL && server.db[i] == NULL) continue;
+        if (tempDb[i] == NULL && inst->db[i] == NULL) continue;
         if (tempDb[i] == NULL) tempDb[i] = createDatabase(i);
-        if (server.db[i] == NULL) server.db[i] = createDatabase(i);
-        serverDb aux = *server.db[i];
-        serverDb *activedb = server.db[i], *newdb = tempDb[i];
+        if (inst->db[i] == NULL) inst->db[i] = createDatabase(i);
+        serverDb aux = *inst->db[i];
+        serverDb *activedb = inst->db[i], *newdb = tempDb[i];
 
         /* Swapping databases should make transaction fail if there is any
          * client watching keys. */
@@ -1944,7 +1944,7 @@ void swapdbCommand(client *c) {
     } else {
         ValkeyModuleSwapDbInfo si = {VALKEYMODULE_SWAPDBINFO_VERSION, id1, id2};
         moduleFireServerEvent(VALKEYMODULE_EVENT_SWAPDB, 0, &si);
-        server.dirty++;
+        inst->dirty++;
         addReply(c, shared.ok);
     }
 }
@@ -2047,7 +2047,7 @@ void deleteExpiredKeyAndPropagateWithDictIndex(serverDb *db, robj *keyobj, int d
     notifyKeyspaceEvent(NOTIFY_EXPIRED, "expired", keyobj, db->id);
     signalModifiedKey(NULL, db, keyobj);
     propagateDeletion(db, keyobj, server.lazyfree_lazy_expire, dict_index);
-    server.stat_expiredkeys++;
+    inst->stat_expiredkeys++;
 }
 
 
@@ -2055,14 +2055,14 @@ void deleteExpiredKeyAndPropagateWithDictIndex(serverDb *db, robj *keyobj, int d
 void deleteExpiredKeyFromOverwriteAndPropagate(client *c, robj *keyobj) {
     int deleted = dbGenericDelete(c->db, keyobj, server.lazyfree_lazy_expire, DB_FLAG_KEY_EXPIRED);
     serverAssertWithInfo(c, keyobj, deleted);
-    server.dirty++;
+    inst->dirty++;
 
     /* Replicate/AOF this as an explicit DEL or UNLINK. */
     robj *aux = server.lazyfree_lazy_expire ? shared.unlink : shared.del;
     rewriteClientCommandVector(c, 2, aux, keyobj);
     signalModifiedKey(c, c->db, keyobj);
     notifyKeyspaceEvent(NOTIFY_EXPIRED, "expired", keyobj, c->db->id);
-    server.stat_expiredkeys++;
+    inst->stat_expiredkeys++;
 }
 
 /* Propagate an implicit key deletion into replicas and the AOF file.
@@ -2078,7 +2078,7 @@ void deleteExpiredKeyFromOverwriteAndPropagate(client *c, robj *keyobj) {
  * This function may be called from:
  * 1. Within call(): Example: Lazy-expire on key access.
  *    In this case the caller doesn't have to do anything
- *    because call() handles server.also_propagate(); or
+ *    because call() handles inst->also_propagate(); or
  * 2. Outside of call(): Example: Active-expire, eviction, slot ownership changed.
  *    In this the caller must remember to call
  *    postExecutionUnitOperations, preferably just after a
@@ -2092,10 +2092,10 @@ void propagateDeletion(serverDb *db, robj *key, int lazy, int slot) {
 
     /* If the primary decided to delete a key we must propagate it to replicas no matter what.
      * Even if module executed a command without asking for propagation. */
-    int prev_replication_allowed = server.replication_allowed;
-    server.replication_allowed = 1;
+    int prev_replication_allowed = inst->replication_allowed;
+    inst->replication_allowed = 1;
     alsoPropagate(db->id, argv, 2, PROPAGATE_AOF | PROPAGATE_REPL, slot);
-    server.replication_allowed = prev_replication_allowed;
+    inst->replication_allowed = prev_replication_allowed;
 }
 
 #define EXPIRE_BULK_LIMIT ((size_t)1024) /* Maximum number of fields to active-expire (per replicated HDEL command */
@@ -2107,8 +2107,8 @@ void propagateDeletion(serverDb *db, robj *key, int lazy, int slot) {
  * constructs the command using the field names, and sends it via alsoPropagate().
  * Returns how many fields where propagated */
 int propagateFieldsDeletion(serverDb *db, robj *o, size_t n_fields, robj *fields[], int didx) {
-    int prev_replication_allowed = server.replication_allowed;
-    server.replication_allowed = 1;
+    int prev_replication_allowed = inst->replication_allowed;
+    inst->replication_allowed = 1;
 
     robj *argv[EXPIRE_BULK_LIMIT + 2]; /* HDEL + key + fields */
     if (n_fields > EXPIRE_BULK_LIMIT) n_fields = EXPIRE_BULK_LIMIT;
@@ -2123,7 +2123,7 @@ int propagateFieldsDeletion(serverDb *db, robj *o, size_t n_fields, robj *fields
     }
 
     alsoPropagate(db->id, argv, argc, PROPAGATE_AOF | PROPAGATE_REPL, didx);
-    server.replication_allowed = prev_replication_allowed;
+    inst->replication_allowed = prev_replication_allowed;
     for (int i = 0; i < argc; i++) {
         decrRefCount(argv[i]);
     }
@@ -2169,10 +2169,10 @@ size_t dbReclaimExpiredFields(robj *o, serverDb *db, mstime_t now, unsigned long
             dbDelete(db, keyobj);
             propagateDeletion(db, keyobj, server.lazyfree_lazy_expire, didx);
             notifyKeyspaceEvent(NOTIFY_GENERIC, "del", keyobj, db->id);
-            server.dirty++;
+            inst->dirty++;
         } else {
             if (!hashTypeHasVolatileFields(o)) dbUntrackKeyWithVolatileItems(db, o);
-            server.dirty += (long long)expired;
+            inst->dirty += (long long)expired;
         }
         signalModifiedKey(NULL, db, keyobj);
         exitExecutionUnit();
@@ -2192,7 +2192,7 @@ static int objectIsExpired(robj *val) {
     if (server.loading) return 0;
     if (!timestampIsExpired(objectGetExpire(val))) return 0;
     if (server.primary_host == NULL && server.import_mode) {
-        if (server.current_client && server.current_client->flag.import_source) return 0;
+        if (inst->current_client && inst->current_client->flag.import_source) return 0;
     }
     return 1;
 }
@@ -2210,7 +2210,7 @@ static int keyIsExpiredWithDictIndex(serverDb *db, robj *key, int dict_index) {
 
     /* See expireIfNeededWithDictIndex for more details. */
     if (server.primary_host == NULL && server.import_mode) {
-        if (server.current_client && server.current_client->flag.import_source) return 0;
+        if (inst->current_client && inst->current_client->flag.import_source) return 0;
     }
     return 1;
 }
@@ -2223,7 +2223,7 @@ int keyIsExpired(serverDb *db, robj *key) {
 
 /* val is optional. Pass NULL if val is not yet fetched from the database. */
 static keyStatus expireIfNeededWithDictIndex(serverDb *db, robj *key, robj *val, int flags, int dict_index) {
-    if (server.lazy_expire_disabled) return KEY_VALID;
+    if (inst->lazy_expire_disabled) return KEY_VALID;
     if (val != NULL) {
         if (!objectIsExpired(val)) return KEY_VALID;
     } else {

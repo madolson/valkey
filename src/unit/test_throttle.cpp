@@ -168,7 +168,7 @@ TEST_F(ThrottleTest, throttleHappyCase) {
     throttle_setRate(t, THROTTLE_UNLIMITED_RATE);
     fakeMonotimeUs += 1000000;
     EXPECT_CALL(mock, queueClientForReprocessing(c)).Times(1);
-    long long ret = timeProc(server.el, 1, clientData);
+    long long ret = timeProc(inst->el, 1, clientData);
     EXPECT_EQ(ret, AE_NOMORE);
 
     EXPECT_FALSE(clientIsThrottled(c));
@@ -233,7 +233,7 @@ TEST_F(ThrottleTest, deregisteredThrottlerDrainsButDoesNotThrottleNewClients) {
     /* Drain via timeProc — deregister already set rate to UNLIMITED. */
     fakeMonotimeUs += 1000000;
     EXPECT_CALL(mock, queueClientForReprocessing(queued)).Times(1);
-    long long ret = timeProc(server.el, 1, clientData);
+    long long ret = timeProc(inst->el, 1, clientData);
     EXPECT_EQ(ret, AE_NOMORE);
     verifyThrottler("fake_throttler", 0, 1);
 
@@ -269,7 +269,7 @@ TEST_F(ThrottleTest, strictestThrottlerThrottle) {
     EXPECT_CALL(mock, tokenBucket_tryConsume(_, _, false)).WillOnce(Return(true));
     EXPECT_CALL(mock, tokenBucket_tryConsume(_, _, true)).WillOnce(Return(true));
     EXPECT_CALL(mock, queueClientForReprocessing(c)).Times(1);
-    long long ret = timeProc(server.el, 1, clientData);
+    long long ret = timeProc(inst->el, 1, clientData);
     EXPECT_EQ(ret, AE_NOMORE);
     EXPECT_EQ(c->flag.throttle_multi, 0ULL);
 
@@ -425,7 +425,7 @@ TEST_F(ThrottleTest, metricsAggregateAcrossSharedName) {
     EXPECT_CALL(mock, tokenBucket_tryConsume(_, _, false)).Times(2).WillRepeatedly(Return(true));
     EXPECT_CALL(mock, tokenBucket_tryConsume(_, _, true)).Times(2).WillRepeatedly(Return(true));
     EXPECT_CALL(mock, queueClientForReprocessing(_)).Times(2);
-    long long ret = timeProc(server.el, 1, clientData);
+    long long ret = timeProc(inst->el, 1, clientData);
     EXPECT_EQ(ret, AE_NOMORE);
 
     throttle_getMetrics("shared", &m);
@@ -483,7 +483,7 @@ TEST_F(ThrottleTest, timeProcHappyCaseOneCall) {
 
     EXPECT_CALL(mock, queueClientForReprocessing(_)).Times(2);
 
-    long long ret = timeProc(server.el, 1, clientData);
+    long long ret = timeProc(inst->el, 1, clientData);
     EXPECT_EQ(ret, AE_NOMORE);
 
     EXPECT_FALSE(clientIsThrottled(c1));
@@ -517,7 +517,7 @@ TEST_F(ThrottleTest, timeProcHappyCaseMultipleCall) {
     /* Only the first client will be released. No aeDeleteTimeEvent since queue stays non-empty. */
     EXPECT_CALL(mock, queueClientForReprocessing(c1)).Times(1);
 
-    long long ret = timeProc(server.el, 1, clientData);
+    long long ret = timeProc(inst->el, 1, clientData);
     /* Should return a positive wait time (reschedule). */
     EXPECT_EQ(ret, 100);
 
@@ -529,7 +529,7 @@ TEST_F(ThrottleTest, timeProcHappyCaseMultipleCall) {
     /* Drain c2 for cleanup. */
     fakeMonotimeUs += 1000000; /* advance 1s, 1 token available */
     EXPECT_CALL(mock, queueClientForReprocessing(c2)).Times(1);
-    ret = timeProc(server.el, 1, clientData);
+    ret = timeProc(inst->el, 1, clientData);
     EXPECT_EQ(ret, AE_NOMORE);
     EXPECT_FALSE(clientIsThrottled(c2));
     verifyThrottler("fake_throttler", 0, 2);
@@ -565,7 +565,7 @@ TEST_F(ThrottleTest, timeProcMultiThrottlerConsumesOtherBuckets) {
     EXPECT_CALL(mock, tokenBucket_tryConsume(_, _, true)).WillOnce(Return(true));
     EXPECT_CALL(mock, queueClientForReprocessing(c)).Times(1);
 
-    long long ret = timeProc(server.el, 1, clientData);
+    long long ret = timeProc(inst->el, 1, clientData);
     EXPECT_EQ(ret, AE_NOMORE);
     EXPECT_FALSE(clientIsThrottled(c));
     verifyThrottler("share", 0, 1);
@@ -595,7 +595,7 @@ TEST_F(ThrottleTest, timeProcCleanupThrottlerFreesOnDrain) {
     fakeMonotimeUs += 1000000;
     EXPECT_CALL(mock, queueClientForReprocessing(c)).Times(1);
 
-    long long ret = timeProc(server.el, 1, clientData);
+    long long ret = timeProc(inst->el, 1, clientData);
     EXPECT_EQ(ret, AE_NOMORE);
     EXPECT_FALSE(clientIsThrottled(c));
     verifyThrottler("fake_throttler", 0, 1);
@@ -684,7 +684,7 @@ static void releaseThrottledRdmaClient(MockValkey &mock, client *c, int (*proces
     c->cmd_queue.len = 2;
     c->cmd_queue.off = 1;
 
-    server.unblocked_clients = listCreate();
+    inst->unblocked_clients = listCreate();
     server.clients_index = raxNew();
     uint64_t id = htonu64(c->id);
     raxInsert(server.clients_index, (unsigned char *)&id, sizeof(id), c, NULL);
@@ -695,7 +695,7 @@ static void releaseThrottledRdmaClient(MockValkey &mock, client *c, int (*proces
 
     throttle_setRate(t, THROTTLE_UNLIMITED_RATE);
     fakeMonotimeUs += 1000000;
-    EXPECT_EQ(timeProc(server.el, 1, clientData), AE_NOMORE);
+    EXPECT_EQ(timeProc(inst->el, 1, clientData), AE_NOMORE);
 
     EXPECT_CALL(mock, processPendingCommandAndInputBuffer(c)).WillOnce(Invoke(process));
     EXPECT_CALL(mock, beforeNextClient(c)).Times(1);
@@ -705,8 +705,8 @@ static void releaseThrottledRdmaClient(MockValkey &mock, client *c, int (*proces
 
     raxFree(server.clients_index);
     server.clients_index = NULL;
-    listRelease(server.unblocked_clients);
-    server.unblocked_clients = NULL;
+    listRelease(inst->unblocked_clients);
+    inst->unblocked_clients = NULL;
     throttle_deregister(t);
     connFreeFake(fc);
     c->conn = NULL;

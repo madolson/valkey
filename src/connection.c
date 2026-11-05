@@ -183,7 +183,7 @@ int connSetPriority(connection *conn, bool is_priority) {
         return C_OK;
     }
 
-    int mask = aeGetFileEvents(server.el, conn->fd);
+    int mask = aeGetFileEvents(inst->el, conn->fd);
     if (mask == AE_NONE) {
         conn->is_priority = is_priority;
         return C_OK;
@@ -207,7 +207,7 @@ int connSetPriority(connection *conn, bool is_priority) {
         mask = (mask & ~AE_HIGH_PRIORITY);               /* Strip off old priority flag */
         if (conn->is_priority) mask |= AE_HIGH_PRIORITY; /* Add new priority flag */
 
-        if (aeCreateFileEvent(server.el, conn->fd, mask, conn->type->ae_handler, conn) == AE_ERR) {
+        if (aeCreateFileEvent(inst->el, conn->fd, mask, conn->type->ae_handler, conn) == AE_ERR) {
             return C_ERR;
         }
     }

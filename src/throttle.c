@@ -179,7 +179,7 @@ static void throttlerAddClient(throttler *t, client *c) {
 
     if (listLength(t->client_queue) == 1) {
         serverAssert(t->time_event_id == AE_DELETED_EVENT_ID);
-        t->time_event_id = aeCreateTimeEvent(server.el,
+        t->time_event_id = aeCreateTimeEvent(inst->el,
                                              waitTimeMs(t),
                                              throttlerTimeProc,
                                              t, NULL);
@@ -294,7 +294,7 @@ void throttle_removeClient(client *c) {
 
     if (listLength(t->client_queue) == 0) {
         serverAssert(t->time_event_id != AE_DELETED_EVENT_ID);
-        aeDeleteTimeEvent(server.el, t->time_event_id);
+        aeDeleteTimeEvent(inst->el, t->time_event_id);
         t->time_event_id = AE_DELETED_EVENT_ID;
         if (t->cleanup) freeThrottler(t);
     }

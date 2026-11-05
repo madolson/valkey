@@ -101,7 +101,7 @@ static int writeSelectDb(forklessSaveInfo *saveInfo, int new_db) {
 
 static int writeDbSizeHints(forklessSaveInfo *saveInfo) {
     for (int dbid = 0; dbid < server.dbnum; dbid++) {
-        serverDb *db = server.db[dbid];
+        serverDb *db = inst->db[dbid];
         if (db == NULL || dbSize(db) == 0) continue;
         if (writeSelectDb(saveInfo, dbid) != C_OK) return C_ERR;
         if (rdbSaveDbSizeHints(&saveInfo->save_rio, db, 0) < 0) return C_ERR;
@@ -683,7 +683,7 @@ static void forklessSaveComplete(bool terminated, void *privdata) {
         saveInfo->bytes_written = saveInfo->save_rio.processed_bytes;
 
         /* Start a cron job to check for the background job completion */
-        aeCreateTimeEvent(server.el, SNAPSHOT_FILE_CLOSE_MONITOR_INTERVAL_MS, snapshotEndMonitorTimeProc, saveInfo, NULL);
+        aeCreateTimeEvent(inst->el, SNAPSHOT_FILE_CLOSE_MONITOR_INTERVAL_MS, snapshotEndMonitorTimeProc, saveInfo, NULL);
         /* Submit a background job to close and rename the snapshot file */
         saveInfo->foreground_queue = mutexQueueCreate(); // The monitor proc will delete this
         bioCreateLazyFreeJob(forklessSaveCloseSnapshotFile, 1, saveInfo);
@@ -1028,7 +1028,7 @@ int forklessSaveToSockets(int req, int rdbver) {
      * The bg thread can't free clients directly — it queues them to
      * foreground_queue, and this timer frees them on the main thread. */
     saveInfo->foreground_queue = mutexQueueCreate();
-    long long timeProcId = aeCreateTimeEvent(server.el, REPLICATION_MONITOR_INTERVAL_MS,
+    long long timeProcId = aeCreateTimeEvent(inst->el, REPLICATION_MONITOR_INTERVAL_MS,
                                              replicationMonitorTimeProc, saveInfo->foreground_queue, NULL);
     if (timeProcId == AE_ERR) {
         mutexQueueRelease(saveInfo->foreground_queue);

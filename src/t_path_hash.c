@@ -277,7 +277,7 @@ void phsetCommand(client *c) {
 
     signalModifiedKey(c, c->db, c->argv[1]);
     notifyKeyspaceEvent(NOTIFY_PATH_HASH, "phset", c->argv[1], c->db->id);
-    server.dirty += numfields;
+    inst->dirty += numfields;
     addReply(c, shared.ok);
 }
 
@@ -308,7 +308,7 @@ void phmsetCommand(client *c) {
     if (created_tree) dbAdd(c->db, c->argv[1], &o);
     signalModifiedKey(c, c->db, c->argv[1]);
     notifyKeyspaceEvent(NOTIFY_PATH_HASH, "phmset", c->argv[1], c->db->id);
-    server.dirty += assignments;
+    inst->dirty += assignments;
     addReply(c, shared.ok);
 }
 
@@ -394,7 +394,7 @@ void phdelCommand(client *c) {
         signalModifiedKey(c, c->db, c->argv[1]);
         notifyKeyspaceEvent(NOTIFY_PATH_HASH, "phdel", c->argv[1], c->db->id);
         if (keyremoved) notifyKeyspaceEvent(NOTIFY_GENERIC, "del", c->argv[1], c->db->id);
-        server.dirty += deleted;
+        inst->dirty += deleted;
     }
     addReplyLongLong(c, deleted);
 }
@@ -599,7 +599,7 @@ void phpathdelCommand(client *c) {
         signalModifiedKey(c, c->db, c->argv[1]);
         notifyKeyspaceEvent(NOTIFY_PATH_HASH, "phpathdel", c->argv[1], c->db->id);
         if (keyremoved) notifyKeyspaceEvent(NOTIFY_GENERIC, "del", c->argv[1], c->db->id);
-        server.dirty += deleted;
+        inst->dirty += deleted;
     }
     addReplyLongLong(c, deleted);
 }

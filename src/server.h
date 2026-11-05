@@ -739,7 +739,7 @@ typedef enum {
 /* Using the following macro you can run code inside serverCron() with the
  * specified period, specified in milliseconds.
  * The actual resolution depends on server.hz. */
-#define run_with_period(_ms_) if (((_ms_) <= 1000 / server.hz) || !(server.cronloops % ((_ms_) / (1000 / server.hz))))
+#define run_with_period(_ms_) if (((_ms_) <= 1000 / server.hz) || !(inst->cronloops % ((_ms_) / (1000 / server.hz))))
 
 /* We can print the stacktrace, so our assert is defined this way: */
 #define serverAssertWithInfo(_c, _o, _e) \
@@ -1049,7 +1049,7 @@ typedef struct blockingState {
                              is deleted or does not exist anymore */
     union {
         listNode *client_waiting_acks_list_node; /* list node in server.clients_waiting_acks list. */
-        listNode *postponed_list_node;           /* list node in server.postponed_clients */
+        listNode *postponed_list_node;           /* list node in inst->postponed_clients */
         listNode *generic_blocked_list_node;     /* generic placeholder for blocked clients utility lists.
                                                     Since a client cannot be blocked multiple times, we can assume
                                                     it will be held in only one extra utility list, so it is ok to maintain
@@ -1074,17 +1074,17 @@ typedef struct blockingState {
                                    handled in module.c. */
 } blockingState;
 
-/* The following structure represents a node in the server.ready_keys list,
+/* The following structure represents a node in the inst->ready_keys list,
  * where we accumulate all the keys that had clients blocked with a blocking
  * operation such as B[LR]POP, but received new data in the context of the
  * last executed command.
  *
  * After the execution of every command or script, we iterate over this list to check
  * if as a result we should serve data to clients blocked, unblocking them.
- * Note that server.ready_keys will not have duplicates as there dictionary
+ * Note that inst->ready_keys will not have duplicates as there dictionary
  * also called ready_keys in every structure representing a database,
  * where we make sure to remember if a given key was already added in the
- * server.ready_keys list. */
+ * inst->ready_keys list. */
 typedef struct readyList {
     serverDb *db;
     robj *key;
@@ -1210,7 +1210,7 @@ typedef struct ClientFlags {
     uint64_t blocked : 1;                  /* The client is waiting in a blocking operation */
     uint64_t dirty_cas : 1;                /* Watched keys modified. EXEC will fail. */
     uint64_t close_after_reply : 1;        /* Close after writing entire reply. */
-    uint64_t unblocked : 1;                /* This client was unblocked and is stored in server.unblocked_clients */
+    uint64_t unblocked : 1;                /* This client was unblocked and is stored in inst->unblocked_clients */
     uint64_t script : 1;                   /* This is a non connected client used by Lua */
     uint64_t asking : 1;                   /* Client issued the ASKING command */
     uint64_t close_asap : 1;               /* Close this client ASAP */
@@ -1876,6 +1876,111 @@ typedef enum childInfoType {
     CHILD_INFO_TYPE_REPL_OUTPUT_BYTES
 } childInfoType;
 
+/* State owned by one logical server instance. Today there is exactly one
+ * instance; `inst` points at it on every thread that runs instance code.
+ * Fields that are process-global (configuration, replication, persistence,
+ * cluster bus, networking) stay in struct valkeyServer. */
+struct valkeyInstance {
+    serverDb **db;                                 /* each db created when it's first used */
+    aeEventLoop *el;                               /* Main event loop */
+    rax *errors;                                   /* Errors table */
+    int cronloops;                                 /* Number of times the cron function run */
+    int in_exec;                                   /* Are we inside EXEC? */
+    int in_call;                                   /* Nesting level within the call() function. */
+    int busy_module_yield_flags;                   /* Are we inside a busy module? (triggered by RM_Yield). see BUSY_MODULE_YIELD_ flags. */
+    const char *busy_module_yield_reply;           /* When non-null, we are inside RM_Yield. */
+    int client_pause_in_transaction;               /* Was a client pause executed during this Exec? */
+    int server_del_keys_in_slot;                   /* The server is deleting the keys in the dirty slot. */
+    int module_pipe[2];                            /* Pipe used to awake the event loop by module threads. */
+    client *current_client;                        /* The client that triggered the command execution (External or AOF). */
+    client *executing_client;                      /* The client executing the current command (possibly script or module). */
+    rax *clients_timeout_table;                    /* Radix tree for blocked clients timeouts. */
+    int execution_nesting;                         /* Execution nesting level.
+                                                    * e.g. call(), async module stuff (timers, events, etc.),
+                                                    * cron stuff (active expire, eviction) */
+    list *postponed_clients;                       /* List of postponed clients */
+    dict *migrate_cached_sockets;                  /* MIGRATE cached sockets */
+    long long events_processed_while_blocked;      /* processEventsWhileBlocked() */
+    long long stat_numcommands;                    /* Number of processed commands */
+    long long stat_expiredkeys;                    /* Number of expired keys */
+    long long stat_expiredfields;                  /* Number of expired hash fields */
+    double stat_expired_keys_stale_perc;           /* Percentage of keys probably expired */
+    double stat_expired_keys_with_vola_stale_perc; /* Percentage of keys probably expired */
+    long long stat_expired_time_cap_reached_count; /* Early expire cycle stops.*/
+    long long stat_expire_cycle_time_used;         /* Cumulative microseconds used. */
+    long long stat_evictedkeys;                    /* Number of evicted keys (maxmemory) */
+    long long stat_evictedscripts;                 /* Number of evicted lua scripts. */
+    long long stat_total_eviction_exceeded_time;   /* Total time over the memory limit, unit us */
+    monotime stat_last_eviction_exceeded_time;     /* Timestamp of current eviction start, unit us */
+    long long stat_keyspace_hits;                  /* Number of successful lookups of keys */
+    long long stat_keyspace_misses;                /* Number of failed lookups of keys */
+    long long stat_active_defrag_hits;             /* number of allocations moved */
+    long long stat_active_defrag_misses;           /* number of allocations scanned but not moved */
+    long long stat_active_defrag_key_hits;         /* number of keys with moved allocations */
+    long long stat_active_defrag_key_misses;       /* number of keys scanned and not moved */
+    long long stat_active_defrag_scanned;          /* number of dictEntries scanned */
+    long long stat_total_active_defrag_time;       /* Total time memory fragmentation over the limit, unit us */
+    monotime stat_last_active_defrag_time;         /* Timestamp of current active defrag start */
+    commandlog commandlog[COMMANDLOG_TYPE_NUM];    /* Logs of commands. */
+    long long
+        stat_unexpected_error_replies;         /* Number of unexpected (aof-loading, replica to primary, etc.) error replies */
+    long long stat_total_error_replies;        /* Total number of issued error replies ( command + rejected errors ) */
+    long long stat_dump_payload_sanitizations; /* Number deep dump payloads integrity validations. */
+    long long stat_total_prefetch_entries;     /* Total number of prefetched dict entries */
+    long long stat_total_prefetch_batches;     /* Total number of prefetched batches */
+    /* The following two are used to track instantaneous metrics, like
+     * number of operations per second, network traffic. */
+    struct {
+        long long last_sample_base;  /* The divisor of last sample window */
+        long long last_sample_value; /* The dividend of last sample window */
+        long long samples[STATS_METRIC_SAMPLES];
+        int idx;
+    } inst_metric[STATS_METRIC_COUNT];
+    monotime el_start;
+    /* Main thread utilization tracking */
+    monotime stat_active_time; /* Cumulative active time for main thread in microseconds */
+    bool el_iteration_active;  /* Tracks if any work was done in the current event loop iteration */
+    /* The following two are used to record the max number of commands executed in one eventloop.
+     * Note that commands in transactions are also counted. */
+    long long el_cmd_cnt_start;
+    long long el_cmd_cnt_max;
+    /* Record the previous baseline and peak number of priority commands executed in one priority cycle. */
+    long long priority_el_cmd_cnt_prev;
+    long long priority_el_cmd_cnt_max;
+    /* The sum of active-expire, active-defrag and all other tasks done by cron and beforeSleep,
+       but excluding read, write and AOF, which are counted by other sets of metrics. */
+    monotime el_cron_duration;
+    durationStats duration_stats[EL_DURATION_TYPE_NUM];
+    int lazy_expire_disabled; /* If > 0, don't trigger lazy expire */
+    long long dirty;          /* Changes to DB from the last save */
+    /* Propagation of commands in AOF / replication */
+    serverOpArray also_propagate; /* Additional command to propagate. */
+    int replication_allowed;      /* Are we allowed to replicate? */
+    /* Blocked clients */
+    unsigned int blocked_clients; /* # of clients executing a blocking cmd.*/
+    unsigned int blocked_clients_by_type[BLOCKED_NUM];
+    list *unblocked_clients;       /* list of clients to unblock before next loop */
+    list *ready_keys;              /* List of readyList structures for BLPOP & co */
+    unsigned int tracking_clients; /* # of clients with tracking enabled.*/
+    list *tracking_pending_keys;   /* tracking invalidation keys pending to flush */
+    list *pending_push_messages;   /* pending publish or other push messages to flush */
+    /* Sort parameters - qsort_r() is only available under BSD so we
+     * have to take this state global, in order to pass it to sortCompare() */
+    int sort_desc;
+    int sort_alpha;
+    int sort_bypattern;
+    int sort_store;
+    mstime_t mstime;               /* 'unixtime' in milliseconds. */
+    ustime_t ustime;               /* 'unixtime' in microseconds. */
+    mstime_t cmd_time_snapshot;    /* Time snapshot of the root execution nesting. */
+    size_t blocking_op_nesting;    /* Nesting level of blocking operation, used to reset blocked_last_cron. */
+    long long blocked_last_cron;   /* Indicate the mstime of the last time we did cron jobs from a blocking operation */
+    kvstore *pubsubshard_channels; /* Map shard channels in every slot to list of subscribed clients */
+    unsigned int watching_clients; /* # of clients are watching keys */
+    int pre_command_oom_state;     /* OOM before command (script?) was started */
+    struct spaceSavingManager *hotkeys_manager;
+};
+
 struct valkeyServer {
     /* General */
     pid_t pid;                                        /* Main process pid. */
@@ -1887,14 +1992,11 @@ struct valkeyServer {
     int hz;                                           /* serverCron() calls frequency in hertz */
     int clients_hz;                                   /* clientsTimeProc() frequency in hertz */
     int in_fork_child;                                /* indication that this is a fork child */
-    serverDb **db;                                    /* each db created when it's first used */
     hashtable *commands;                              /* Command table */
     hashtable *orig_commands;                         /* Command table before command renaming. */
     sds command_response_cache[RESP_CACHE_INDEX_MAX]; /* Cached COMMAND response: [0]=RESP2, [1]=RESP3 */
-    aeEventLoop *el;                                  /* Main event loop */
     _Atomic(AeIoState) io_poll_state;                 /* Indicates the state of the IO polling. */
     int io_ae_fired_events;                           /* Number of poll events received by the IO thread. */
-    rax *errors;                                      /* Errors table */
     volatile sig_atomic_t shutdown_asap;              /* Shutdown ordered by signal handler. */
     mstime_t shutdown_mstime;                         /* Timestamp to limit graceful shutdown. */
     int last_sig_received;                            /* Indicates the last SIGNAL received, if any (e.g., SIGINT or SIGTERM). */
@@ -1903,18 +2005,11 @@ struct valkeyServer {
     int active_defrag_cpu_percent;                    /* Current desired CPU percentage for active defrag */
     char *pidfile;                                    /* PID file path */
     int arch_bits;                                    /* 32 or 64 depending on sizeof(long) */
-    int cronloops;                                    /* Number of times the cron function run */
     char runid[CONFIG_RUN_ID_SIZE + 1];               /* ID always different at every exec. */
     int sentinel_mode;                                /* True if this instance is a Sentinel. */
     size_t initial_memory_usage;                      /* Bytes used after initialization. */
     int always_show_logo;                             /* Show logo even for non-stdout logging. */
-    int in_exec;                                      /* Are we inside EXEC? */
-    int in_call;                                      /* Nesting level within the call() function. */
-    int busy_module_yield_flags;                      /* Are we inside a busy module? (triggered by RM_Yield). see BUSY_MODULE_YIELD_ flags. */
-    const char *busy_module_yield_reply;              /* When non-null, we are inside RM_Yield. */
     char *ignore_warnings;                            /* Config: warnings that should be ignored. */
-    int client_pause_in_transaction;                  /* Was a client pause executed during this Exec? */
-    int server_del_keys_in_slot;                      /* The server is deleting the keys in the dirty slot. */
     int thp_enabled;                                  /* If true, THP is enabled. */
     size_t page_size;                                 /* The page size of OS. */
     /* Modules */
@@ -1924,7 +2019,6 @@ struct valkeyServer {
     dict *module_configs_queue;        /* Dict that stores module configurations from .conf file until after modules are loaded
                                           during startup or arguments to loadex. */
     list *loadmodule_queue;            /* List of modules to load at startup. */
-    int module_pipe[2];                /* Pipe used to awake the event loop by module threads. */
     pid_t child_pid;                   /* PID of current child */
     int child_type;                    /* Type of current child */
     _Atomic(int) module_gil_acquiring; /* Indicates whether the GIL is being acquiring by the main thread. */
@@ -1950,8 +2044,6 @@ struct valkeyServer {
                                             * Value: RDB client object
                                             * This structure holds dual-channel sync replicas from the start of their
                                             * RDB transfer until their main channel establishes partial synchronization. */
-    client *current_client;                /* The client that triggered the command execution (External or AOF). */
-    client *executing_client;              /* The client executing the current command (possibly script or module). */
 
 #ifdef LOG_REQ_RES
     char *req_res_logfile; /* Path of log file for logging all requests and their replies. If NULL, no logging will be
@@ -1962,29 +2054,22 @@ struct valkeyServer {
     /* Stuff for client mem eviction */
     clientMemUsageBucket *client_mem_usage_buckets;
 
-    rax *clients_timeout_table; /* Radix tree for blocked clients timeouts. */
-    int execution_nesting;      /* Execution nesting level.
-                                 * e.g. call(), async module stuff (timers, events, etc.),
-                                 * cron stuff (active expire, eviction) */
-    rax *clients_index;         /* Active clients dictionary by client ID. */
-    uint32_t paused_actions;    /* Bitmask of actions that are currently paused */
-    list *postponed_clients;    /* List of postponed clients */
+    rax *clients_index;      /* Active clients dictionary by client ID. */
+    uint32_t paused_actions; /* Bitmask of actions that are currently paused */
     pause_event client_pause_per_purpose[NUM_PAUSE_PURPOSES];
-    char neterr[ANET_ERR_LEN];                /* Error buffer for anet.c */
-    dict *migrate_cached_sockets;             /* MIGRATE cached sockets */
-    _Atomic(uint64_t) next_client_id;         /* Next client unique ID. Incremental. */
-    int protected_mode;                       /* Don't accept external connections. */
-    int io_threads_num;                       /* Number of IO threads to use. */
-    int active_io_threads_num;                /* Current number of active IO threads, includes main thread. */
-    int io_threads_always_active;             /* Activate all IO threads regardless of load size. */
-    int prefetch_batch_max_size;              /* Maximum number of keys to prefetch in a single batch */
-    long long events_processed_while_blocked; /* processEventsWhileBlocked() */
-    int enable_protected_configs;             /* Enable the modification of protected configs, see PROTECTED_ACTION_ALLOWED_* */
-    int enable_debug_cmd;                     /* Enable DEBUG commands, see PROTECTED_ACTION_ALLOWED_* */
-    int enable_module_cmd;                    /* Enable MODULE commands, see PROTECTED_ACTION_ALLOWED_* */
-    int enable_debug_assert;                  /* Enable debug asserts */
-    int debug_client_enforce_reply_list;      /* Force client to always use the reply list */
-    int debug_force_free_primary_async;       /* Force freeClient on primary to use async path */
+    char neterr[ANET_ERR_LEN];           /* Error buffer for anet.c */
+    _Atomic(uint64_t) next_client_id;    /* Next client unique ID. Incremental. */
+    int protected_mode;                  /* Don't accept external connections. */
+    int io_threads_num;                  /* Number of IO threads to use. */
+    int active_io_threads_num;           /* Current number of active IO threads, includes main thread. */
+    int io_threads_always_active;        /* Activate all IO threads regardless of load size. */
+    int prefetch_batch_max_size;         /* Maximum number of keys to prefetch in a single batch */
+    int enable_protected_configs;        /* Enable the modification of protected configs, see PROTECTED_ACTION_ALLOWED_* */
+    int enable_debug_cmd;                /* Enable DEBUG commands, see PROTECTED_ACTION_ALLOWED_* */
+    int enable_module_cmd;               /* Enable MODULE commands, see PROTECTED_ACTION_ALLOWED_* */
+    int enable_debug_assert;             /* Enable debug asserts */
+    int debug_client_enforce_reply_list; /* Force client to always use the reply list */
+    int debug_force_free_primary_async;  /* Force freeClient on primary to use async path */
     /* Reply construction copy avoidance */
     int min_io_threads_copy_avoid;           /* Minimum number of IO threads for copy avoidance in reply construction */
     int min_string_size_copy_avoid_threaded; /* Minimum bulk string size for copy avoidance in reply construction when IO threads enabled */
@@ -2000,28 +2085,8 @@ struct valkeyServer {
     time_t loading_process_events_interval_ms;
     /* Fields used only for stats */
     time_t stat_starttime;                                 /* Server start time */
-    long long stat_numcommands;                            /* Number of processed commands */
     long long stat_numconnections;                         /* Number of connections received */
-    long long stat_expiredkeys;                            /* Number of expired keys */
-    long long stat_expiredfields;                          /* Number of expired hash fields */
-    double stat_expired_keys_stale_perc;                   /* Percentage of keys probably expired */
-    double stat_expired_keys_with_vola_stale_perc;         /* Percentage of keys probably expired */
-    long long stat_expired_time_cap_reached_count;         /* Early expire cycle stops.*/
-    long long stat_expire_cycle_time_used;                 /* Cumulative microseconds used. */
-    long long stat_evictedkeys;                            /* Number of evicted keys (maxmemory) */
     long long stat_evictedclients;                         /* Number of evicted clients */
-    long long stat_evictedscripts;                         /* Number of evicted lua scripts. */
-    long long stat_total_eviction_exceeded_time;           /* Total time over the memory limit, unit us */
-    monotime stat_last_eviction_exceeded_time;             /* Timestamp of current eviction start, unit us */
-    long long stat_keyspace_hits;                          /* Number of successful lookups of keys */
-    long long stat_keyspace_misses;                        /* Number of failed lookups of keys */
-    long long stat_active_defrag_hits;                     /* number of allocations moved */
-    long long stat_active_defrag_misses;                   /* number of allocations scanned but not moved */
-    long long stat_active_defrag_key_hits;                 /* number of keys with moved allocations */
-    long long stat_active_defrag_key_misses;               /* number of keys scanned and not moved */
-    long long stat_active_defrag_scanned;                  /* number of dictEntries scanned */
-    long long stat_total_active_defrag_time;               /* Total time memory fragmentation over the limit, unit us */
-    monotime stat_last_active_defrag_time;                 /* Timestamp of current active defrag start */
     size_t stat_peak_memory;                               /* Max used memory record */
     long long stat_aof_rewrites;                           /* number of aof file rewrites performed */
     long long stat_aofrw_consecutive_failures;             /* The number of consecutive failures of aofrw */
@@ -2041,7 +2106,6 @@ struct valkeyServer {
     long long stat_sync_full;                              /* Number of full resyncs with replicas. */
     long long stat_sync_partial_ok;                        /* Number of accepted PSYNC requests. */
     long long stat_sync_partial_err;                       /* Number of unaccepted PSYNC requests. */
-    commandlog commandlog[COMMANDLOG_TYPE_NUM];            /* Logs of commands. */
     struct malloc_stats cron_malloc_stats;                 /* sampled in serverCron(). */
     long long stat_net_input_bytes;                        /* Bytes read from network. */
     long long stat_net_output_bytes;                       /* Bytes written to network. */
@@ -2066,48 +2130,19 @@ struct valkeyServer {
     long long stat_cluster_threaded_writes_processed;   /* Cluster writes completed by I/O threads */
     long long stat_cluster_threaded_accepts_processed;  /* Cluster accepts completed by I/O threads */
     long long stat_cluster_io_main_thread_fallbacks;    /* Cluster I/O ops handled on the main thread because dispatch failed */
-    long long
-        stat_unexpected_error_replies;                 /* Number of unexpected (aof-loading, replica to primary, etc.) error replies */
-    long long stat_total_error_replies;                /* Total number of issued error replies ( command + rejected errors ) */
-    long long stat_dump_payload_sanitizations;         /* Number deep dump payloads integrity validations. */
-    long long stat_io_reads_processed;                 /* Number of read events processed by IO threads */
-    long long stat_io_reads_pending;                   /* Number of read events pending in IO threads */
-    long long stat_io_writes_processed;                /* Number of write events processed by IO threads */
-    long long stat_io_writes_pending;                  /* Number of write events pending in IO threads */
-    long long stat_io_freed_objects;                   /* Number of objects freed by IO threads */
-    long long stat_io_accept_offloaded;                /* Number of offloaded accepts */
-    long long stat_poll_processed_by_io_threads;       /* Total number of poll jobs processed by IO */
-    long long stat_total_reads_processed;              /* Total number of read events processed */
-    long long stat_total_writes_processed;             /* Total number of write events processed */
-    long long stat_client_qbuf_limit_disconnections;   /* Total number of clients reached query buf length limit */
-    long long stat_client_outbuf_limit_disconnections; /* Total number of clients reached output buf length limit */
-    long long stat_total_prefetch_entries;             /* Total number of prefetched dict entries */
-    long long stat_total_prefetch_batches;             /* Total number of prefetched batches */
-    /* The following two are used to track instantaneous metrics, like
-     * number of operations per second, network traffic. */
-    struct {
-        long long last_sample_base;  /* The divisor of last sample window */
-        long long last_sample_value; /* The dividend of last sample window */
-        long long samples[STATS_METRIC_SAMPLES];
-        int idx;
-    } inst_metric[STATS_METRIC_COUNT];
-    long long stat_reply_buffer_shrinks; /* Total number of output buffer shrinks */
-    long long stat_reply_buffer_expands; /* Total number of output buffer expands */
-    monotime el_start;
-    /* Main thread utilization tracking */
-    monotime stat_active_time; /* Cumulative active time for main thread in microseconds */
-    bool el_iteration_active;  /* Tracks if any work was done in the current event loop iteration */
-    /* The following two are used to record the max number of commands executed in one eventloop.
-     * Note that commands in transactions are also counted. */
-    long long el_cmd_cnt_start;
-    long long el_cmd_cnt_max;
-    /* Record the previous baseline and peak number of priority commands executed in one priority cycle. */
-    long long priority_el_cmd_cnt_prev;
-    long long priority_el_cmd_cnt_max;
-    /* The sum of active-expire, active-defrag and all other tasks done by cron and beforeSleep,
-       but excluding read, write and AOF, which are counted by other sets of metrics. */
-    monotime el_cron_duration;
-    durationStats duration_stats[EL_DURATION_TYPE_NUM];
+    long long stat_io_reads_processed;                  /* Number of read events processed by IO threads */
+    long long stat_io_reads_pending;                    /* Number of read events pending in IO threads */
+    long long stat_io_writes_processed;                 /* Number of write events processed by IO threads */
+    long long stat_io_writes_pending;                   /* Number of write events pending in IO threads */
+    long long stat_io_freed_objects;                    /* Number of objects freed by IO threads */
+    long long stat_io_accept_offloaded;                 /* Number of offloaded accepts */
+    long long stat_poll_processed_by_io_threads;        /* Total number of poll jobs processed by IO */
+    long long stat_total_reads_processed;               /* Total number of read events processed */
+    long long stat_total_writes_processed;              /* Total number of write events processed */
+    long long stat_client_qbuf_limit_disconnections;    /* Total number of clients reached query buf length limit */
+    long long stat_client_outbuf_limit_disconnections;  /* Total number of clients reached output buf length limit */
+    long long stat_reply_buffer_shrinks;                /* Total number of output buffer shrinks */
+    long long stat_reply_buffer_expands;                /* Total number of output buffer expands */
 
     /* Configuration */
     int verbosity;               /* Loglevel verbosity */
@@ -2116,7 +2151,6 @@ struct valkeyServer {
     int tcpkeepalive;            /* Set SO_KEEPALIVE if non-zero. */
     int active_expire_enabled;   /* Can be disabled for testing purposes. */
     int active_expire_effort;    /* From 1 (default) to 10, active effort. */
-    int lazy_expire_disabled;    /* If > 0, don't trigger lazy expire */
     int active_defrag_enabled;
     int skip_checksum_validation;                /* Disable checksum validation for RDB and RESTORE payload. */
     int rdb_version_check;                       /* Try to load RDB produced by a future version. */
@@ -2192,7 +2226,6 @@ struct valkeyServer {
                                            default no. (for testings). */
 
     /* RDB persistence */
-    long long dirty;                      /* Changes to DB from the last save */
     long long dirty_before_bgsave;        /* Used to restore dirty on failed BGSAVE */
     long long rdb_last_load_keys_expired; /* number of expired keys when loading RDB */
     long long rdb_last_load_keys_loaded;  /* number of loaded keys when loading RDB */
@@ -2234,9 +2267,6 @@ struct valkeyServer {
     /* Pipe and data structures for child -> parent info sharing. */
     int child_info_pipe[2]; /* Pipe used to write the child_info_data. */
     int child_info_nread;   /* Num of bytes of the last read from pipe */
-    /* Propagation of commands in AOF / replication */
-    serverOpArray also_propagate; /* Additional command to propagate. */
-    int replication_allowed;      /* Are we allowed to replicate? */
     /* Logging */
     char *logfile;            /* Path of log file */
     int syslog_enabled;       /* Is syslog enabled? */
@@ -2381,22 +2411,8 @@ struct valkeyServer {
     int oom_score_adj_values[CONFIG_OOM_COUNT]; /* Linux oom_score_adj configuration */
     int oom_score_adj;                          /* If true, oom_score_adj is managed */
     int disable_thp;                            /* If true, disable THP by syscall */
-    /* Blocked clients */
-    unsigned int blocked_clients; /* # of clients executing a blocking cmd.*/
-    unsigned int blocked_clients_by_type[BLOCKED_NUM];
-    list *unblocked_clients; /* list of clients to unblock before next loop */
-    list *ready_keys;        /* List of readyList structures for BLPOP & co */
     /* Client side caching. */
-    unsigned int tracking_clients;  /* # of clients with tracking enabled.*/
     size_t tracking_table_max_keys; /* Max number of keys in tracking table. */
-    list *tracking_pending_keys;    /* tracking invalidation keys pending to flush */
-    list *pending_push_messages;    /* pending publish or other push messages to flush */
-    /* Sort parameters - qsort_r() is only available under BSD so we
-     * have to take this state global, in order to pass it to sortCompare() */
-    int sort_desc;
-    int sort_alpha;
-    int sort_bypattern;
-    int sort_store;
     /* Zip structure config, see redis.conf for more information  */
     size_t hash_max_listpack_entries;
     size_t hash_max_listpack_value;
@@ -2415,19 +2431,12 @@ struct valkeyServer {
     _Atomic(time_t) unixtime;     /* Unix time sampled every cron cycle. */
     time_t timezone;              /* Cached timezone. As set by tzset(). */
     _Atomic(int) daylight_active; /* Currently in daylight saving time. */
-    mstime_t mstime;              /* 'unixtime' in milliseconds. */
-    ustime_t ustime;              /* 'unixtime' in microseconds. */
-    mstime_t cmd_time_snapshot;   /* Time snapshot of the root execution nesting. */
-    size_t blocking_op_nesting;   /* Nesting level of blocking operation, used to reset blocked_last_cron. */
-    long long blocked_last_cron;  /* Indicate the mstime of the last time we did cron jobs from a blocking operation */
     /* Pubsub */
-    kvstore *pubsub_channels;      /* Map channels to list of subscribed clients */
-    dict *pubsub_patterns;         /* A dict of pubsub_patterns */
-    int notify_keyspace_events;    /* Events to propagate via Pub/Sub. This is an
-                                      xor of NOTIFY_... flags. */
-    kvstore *pubsubshard_channels; /* Map shard channels in every slot to list of subscribed clients */
-    unsigned int pubsub_clients;   /* # of clients in Pub/Sub mode */
-    unsigned int watching_clients; /* # of clients are watching keys */
+    kvstore *pubsub_channels;    /* Map channels to list of subscribed clients */
+    dict *pubsub_patterns;       /* A dict of pubsub_patterns */
+    int notify_keyspace_events;  /* Events to propagate via Pub/Sub. This is an
+                                    xor of NOTIFY_... flags. */
+    unsigned int pubsub_clients; /* # of clients in Pub/Sub mode */
     /* Cluster */
     int cluster_enabled;                                   /* Is cluster enabled? */
     int cluster_port;                                      /* Set the cluster port for a node. */
@@ -2500,7 +2509,6 @@ struct valkeyServer {
     sds cached_cluster_slot_info[CACHE_CONN_TYPE_MAX]; /* Index in array is a bitwise or of CACHE_CONN_TYPE_* */
     /* Scripting */
     mstime_t busy_reply_threshold;  /* Script / module timeout in milliseconds */
-    int pre_command_oom_state;      /* OOM before command (script?) was started */
     int script_disable_deny_script; /* Allow running commands marked "noscript" inside a script. */
     int lua_enable_insecure_api;    /* Config to enable insecure api */
     int lua_insecure_api_current;   /* Current value of if insecure apis are enabled, used to determine if flush is needed. */
@@ -2569,7 +2577,6 @@ struct valkeyServer {
     int hotkeys_sampling_percentage; /* Percentage (1-100) of key accesses sampled for hot-key detection. */
     int hotkeys_top_k;               /* Number of top keys to track (Space-Saving K); 0 disables detection. */
     int hotkeys_window_seconds;      /* Length of the QPS accounting window in seconds. */
-    struct spaceSavingManager *hotkeys_manager;
 };
 
 #define MAX_KEYS_BUFFER 256
@@ -3036,6 +3043,8 @@ typedef struct clusterScanCtx {
  *----------------------------------------------------------------------------*/
 
 extern struct valkeyServer server;
+extern struct valkeyInstance server_instance;
+extern __thread struct valkeyInstance *inst;
 
 static inline bool onServerMainThread(void) {
     return pthread_equal(server.main_thread_id, pthread_self()) != 0;

@@ -383,7 +383,7 @@ static listNode *scriptsLRUAdd(sds sha) {
     while (listLength(evalCtx.scripts_lru_list) >= LRU_LIST_LENGTH) {
         sds oldest = listNodeValue(listFirst(evalCtx.scripts_lru_list));
         evalCtxDeleteScript(oldest);
-        server.stat_evictedscripts++;
+        inst->stat_evictedscripts++;
     }
 
     /* Add current. */
@@ -465,7 +465,7 @@ static int performScriptsEvictions(void) {
 
         sds sha = listNodeValue(node);
         evalCtxDeleteScript(sha);
-        server.stat_evictedscripts++;
+        inst->stat_evictedscripts++;
         scripts_evicted++;
 
         if (scripts_evicted % 16 == 0) {
@@ -502,7 +502,7 @@ static long long scriptsEvictionTimeProc(struct aeEventLoop *eventLoop, long lon
 void startScriptsEvictionTimeProc(void) {
     if (!isScriptsEvictionProcRunning) {
         isScriptsEvictionProcRunning = 1;
-        aeCreateTimeEvent(server.el, 0, scriptsEvictionTimeProc, NULL, NULL);
+        aeCreateTimeEvent(inst->el, 0, scriptsEvictionTimeProc, NULL, NULL);
     }
 }
 

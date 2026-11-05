@@ -1057,7 +1057,7 @@ static int tlsConfigure(void *priv, int reconfigure, bool background) {
 
         if (!metadataChanged(&active_metadata, &new_metadata)) {
             serverLog(LL_DEBUG, "TLS reload skipped: materials unchanged");
-            atomic_store_explicit(&lastTlsConfigureTime, server.ustime, memory_order_relaxed);
+            atomic_store_explicit(&lastTlsConfigureTime, inst->ustime, memory_order_relaxed);
             return C_OK;
         }
         serverLog(LL_NOTICE, "TLS materials changed, reloading in background");
@@ -1098,7 +1098,7 @@ static int tlsConfigure(void *priv, int reconfigure, bool background) {
         tlsRefreshAllCertInfo();
     }
 
-    atomic_store_explicit(&lastTlsConfigureTime, server.ustime, memory_order_relaxed);
+    atomic_store_explicit(&lastTlsConfigureTime, inst->ustime, memory_order_relaxed);
     return C_OK;
 }
 
@@ -1161,7 +1161,7 @@ void tlsApplyPendingReload(void) {
 /* Check if it's time to trigger a background TLS reload check. */
 void tlsReconfigureIfNeeded(void) {
     long long lastConfigureTime = atomic_load_explicit(&lastTlsConfigureTime, memory_order_relaxed);
-    const long long configAgeMicros = server.ustime - lastConfigureTime;
+    const long long configAgeMicros = inst->ustime - lastConfigureTime;
     const long long configAgeSeconds = (configAgeMicros / 1000) / 1000;
     if (server.tls_ctx_config.auto_reload_interval == 0 ||
         configAgeSeconds < server.tls_ctx_config.auto_reload_interval) {
@@ -1340,15 +1340,15 @@ static int updateStateAfterSSLIO(tls_connection *conn, int ret_value, int update
 
 static void registerSSLEvent(tls_connection *conn) {
     int priority_flag = connGetAEPriorityFlag(&conn->c);
-    int mask = aeGetFileEvents(server.el, conn->c.fd);
+    int mask = aeGetFileEvents(inst->el, conn->c.fd);
     bool priority_changed = ((mask & AE_HIGH_PRIORITY) != (priority_flag & AE_HIGH_PRIORITY));
 
     if (conn->flags & TLS_CONN_FLAG_WRITE_WANT_READ) {
-        if (mask & AE_WRITABLE) aeDeleteFileEvent(server.el, conn->c.fd, AE_WRITABLE);
-        if (!(mask & AE_READABLE) || priority_changed) aeCreateFileEvent(server.el, conn->c.fd, AE_READABLE | priority_flag, tlsEventHandler, conn);
+        if (mask & AE_WRITABLE) aeDeleteFileEvent(inst->el, conn->c.fd, AE_WRITABLE);
+        if (!(mask & AE_READABLE) || priority_changed) aeCreateFileEvent(inst->el, conn->c.fd, AE_READABLE | priority_flag, tlsEventHandler, conn);
     } else if (conn->flags & TLS_CONN_FLAG_READ_WANT_WRITE) {
-        if (mask & AE_READABLE) aeDeleteFileEvent(server.el, conn->c.fd, AE_READABLE);
-        if (!(mask & AE_WRITABLE) || priority_changed) aeCreateFileEvent(server.el, conn->c.fd, AE_WRITABLE | priority_flag, tlsEventHandler, conn);
+        if (mask & AE_READABLE) aeDeleteFileEvent(inst->el, conn->c.fd, AE_READABLE);
+        if (!(mask & AE_WRITABLE) || priority_changed) aeCreateFileEvent(inst->el, conn->c.fd, AE_WRITABLE | priority_flag, tlsEventHandler, conn);
     } else {
         serverAssert(0);
     }
@@ -1391,16 +1391,16 @@ static void updateSSLEvent(tls_connection *conn) {
     if (conn->flags & TLS_CONN_FLAG_POSTPONE_UPDATE_STATE) return;
 
     int priority_flag = connGetAEPriorityFlag(&conn->c);
-    int mask = aeGetFileEvents(server.el, conn->c.fd);
+    int mask = aeGetFileEvents(inst->el, conn->c.fd);
     bool priority_changed = ((mask & AE_HIGH_PRIORITY) != (priority_flag & AE_HIGH_PRIORITY));
     int need_read = conn->c.read_handler || (conn->c.write_handler && (conn->flags & TLS_CONN_FLAG_WRITE_WANT_READ));
     int need_write = conn->c.write_handler || (conn->c.read_handler && (conn->flags & TLS_CONN_FLAG_READ_WANT_WRITE));
 
-    if (need_read && (!(mask & AE_READABLE) || priority_changed)) aeCreateFileEvent(server.el, conn->c.fd, AE_READABLE | priority_flag, tlsEventHandler, conn);
-    if (!need_read && (mask & AE_READABLE)) aeDeleteFileEvent(server.el, conn->c.fd, AE_READABLE);
+    if (need_read && (!(mask & AE_READABLE) || priority_changed)) aeCreateFileEvent(inst->el, conn->c.fd, AE_READABLE | priority_flag, tlsEventHandler, conn);
+    if (!need_read && (mask & AE_READABLE)) aeDeleteFileEvent(inst->el, conn->c.fd, AE_READABLE);
 
-    if (need_write && (!(mask & AE_WRITABLE) || priority_changed)) aeCreateFileEvent(server.el, conn->c.fd, AE_WRITABLE | priority_flag, tlsEventHandler, conn);
-    if (!need_write && (mask & AE_WRITABLE)) aeDeleteFileEvent(server.el, conn->c.fd, AE_WRITABLE);
+    if (need_write && (!(mask & AE_WRITABLE) || priority_changed)) aeCreateFileEvent(inst->el, conn->c.fd, AE_WRITABLE | priority_flag, tlsEventHandler, conn);
+    if (!need_write && (mask & AE_WRITABLE)) aeDeleteFileEvent(inst->el, conn->c.fd, AE_WRITABLE);
 }
 
 static int TLSHandleAcceptResult(tls_connection *conn, int call_handler_on_error) {

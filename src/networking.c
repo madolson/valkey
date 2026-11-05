@@ -299,8 +299,8 @@ int cmdHasPushAsReply(struct serverCommand *cmd) {
 
 /* Publish-to-self push must wait until after the command reply. */
 static int shouldDeferPushMessage(client *c) {
-    return c->flag.pushing && c == server.current_client && server.executing_client &&
-           !cmdHasPushAsReply(server.executing_client->cmd);
+    return c->flag.pushing && c == inst->current_client && inst->executing_client &&
+           !cmdHasPushAsReply(inst->executing_client->cmd);
 }
 
 /* Decides if copy avoidance is preferred according to client type, number of I/O threads, object size
@@ -661,7 +661,7 @@ static size_t _addReplyPayloadToBuffer(client *c, const void *payload, size_t le
     size_t available = c->buf_usable_size - c->bufpos;
     size_t reply_len = min(available, len);
     if (c->flag.buf_encoded) {
-        int track_bytes = (server.commandlog[COMMANDLOG_TYPE_LARGE_REPLY].threshold != -1);
+        int track_bytes = (inst->commandlog[COMMANDLOG_TYPE_LARGE_REPLY].threshold != -1);
         reply_len = upsertPayloadHeader(c->buf, &c->bufpos, &c->last_header, payload_type, len, c->slot, track_bytes, available);
     }
     if (!reply_len) return 0;
@@ -712,7 +712,7 @@ static void _addReplyPayloadToList(client *c, list *reply_list, const char *payl
         size_t copy = avail >= len ? len : avail;
 
         if (tail->flag.buf_encoded) {
-            int track_bytes = (server.commandlog[COMMANDLOG_TYPE_LARGE_REPLY].threshold != -1);
+            int track_bytes = (inst->commandlog[COMMANDLOG_TYPE_LARGE_REPLY].threshold != -1);
             copy = upsertPayloadHeader(tail->buf, &tail->used, &tail->last_header, payload_type, len, c->slot, track_bytes, avail);
         } else if (encoded) {
             /* If encoded buffer is required but tail is unencoded then pretend nothing can be added to it
@@ -741,7 +741,7 @@ static void _addReplyPayloadToList(client *c, list *reply_list, const char *payl
         tail->flag.buf_encoded = encoded;
         tail->last_header = NULL;
         if (tail->flag.buf_encoded) {
-            int track_bytes = (server.commandlog[COMMANDLOG_TYPE_LARGE_REPLY].threshold != -1);
+            int track_bytes = (inst->commandlog[COMMANDLOG_TYPE_LARGE_REPLY].threshold != -1);
             upsertPayloadHeader(tail->buf, &tail->used, &tail->last_header, payload_type, len, c->slot, track_bytes, tail->size);
         }
         memcpy(tail->buf + tail->used, payload, len);
@@ -796,7 +796,7 @@ void _addReplyToBufferOrList(client *c, const char *s, size_t len) {
     }
 
     if (defer_push_message) {
-        _addReplyProtoToList(c, server.pending_push_messages, s, len);
+        _addReplyProtoToList(c, inst->pending_push_messages, s, len);
         return;
     }
     size_t reply_len = _addReplyToBuffer(c, s, len);
@@ -910,7 +910,7 @@ void afterErrorReply(client *c, const char *s, size_t len, int flags) {
     commitDeferredReplyBuffer(c, 1);
     if (!(flags & ERR_REPLY_FLAG_NO_STATS_UPDATE)) {
         /* Increment the global error counter */
-        server.stat_total_error_replies++;
+        inst->stat_total_error_replies++;
         /* Increment the error stats
          * If the string already starts with "-..." then the error prefix
          * is provided by the caller (we limit the search to 32 chars). Otherwise, we use "-ERR". */
@@ -927,8 +927,8 @@ void afterErrorReply(client *c, const char *s, size_t len, int flags) {
         }
         /* After the errors RAX reaches its limit, instead of tracking
          * custom errors (e.g. LUA), we track the error under `errorstat_ERRORSTATS_OVERFLOW` */
-        if (flags & ERR_REPLY_FLAG_CUSTOM && raxSize(server.errors) >= ERRORSTATS_LIMIT &&
-            !raxFind(server.errors, (unsigned char *)err_prefix, prefix_len, NULL)) {
+        if (flags & ERR_REPLY_FLAG_CUSTOM && raxSize(inst->errors) >= ERRORSTATS_LIMIT &&
+            !raxFind(inst->errors, (unsigned char *)err_prefix, prefix_len, NULL)) {
             err_prefix = ERRORSTATS_OVERFLOW_ERR;
             prefix_len = strlen(ERRORSTATS_OVERFLOW_ERR);
         }
@@ -988,7 +988,7 @@ void afterErrorReply(client *c, const char *s, size_t len, int flags) {
         if (ctype == CLIENT_TYPE_PRIMARY && server.repl_backlog && server.repl_backlog->histlen > 0) {
             showLatestBacklog();
         }
-        server.stat_unexpected_error_replies++;
+        inst->stat_unexpected_error_replies++;
 
         /* Based off the propagation error behavior, check if we need to panic here. There
          * are currently two checked cases:
@@ -1549,7 +1549,7 @@ void addReplyBulk(client *c, robj *obj) {
     if (tryAvoidBulkStrCopyToReply(c, obj) == C_OK) {
         /* If copy avoidance allowed, then we explicitly maintain net_output_bytes_curr_cmd.
          * We determine per-reply if tracking is enabled by checking the config in the main thread. */
-        if (server.commandlog[COMMANDLOG_TYPE_LARGE_REPLY].threshold != -1) {
+        if (inst->commandlog[COMMANDLOG_TYPE_LARGE_REPLY].threshold != -1) {
             serverAssert(obj->encoding == OBJ_ENCODING_RAW);
             size_t str_len = sdslen(objectGetVal(obj));
             uint32_t num_len = digits10(str_len);
@@ -2232,7 +2232,7 @@ void disconnectReplicas(void) {
         /* If we are going to disconnect all replicas, there is no need to protect the rdb channel. */
         replica->flag.protected_rdb_channel = 0;
         /* The replica may be the client running this command. */
-        if (replica == server.current_client)
+        if (replica == inst->current_client)
             freeClientAsync(replica);
         else
             freeClient(replica);
@@ -2246,7 +2246,7 @@ void unlinkClient(client *c) {
     listNode *ln;
 
     /* If this is marked as current client unset it. */
-    if (c->conn && server.current_client == c) server.current_client = NULL;
+    if (c->conn && inst->current_client == c) inst->current_client = NULL;
 
     /* Certain operations must be done only if the client has an active connection.
      * If the client was already unlinked or if it's a "fake client" the
@@ -2324,9 +2324,9 @@ void unlinkClient(client *c) {
     /* When client was just unblocked because of a blocking operation,
      * remove it from the list of unblocked clients. */
     if (c->flag.unblocked) {
-        ln = listSearchKey(server.unblocked_clients, c);
+        ln = listSearchKey(inst->unblocked_clients, c);
         serverAssert(ln != NULL);
-        listDelNode(server.unblocked_clients, ln);
+        listDelNode(inst->unblocked_clients, ln);
         c->flag.unblocked = 0;
     }
 
@@ -2554,7 +2554,7 @@ void freeClientAsync(client *c) {
  * assert in prepareClientToWrite() when the server tries to write the response.
  * So instead flag it for closure after the current command completes. */
 void freeClientOrCloseLater(client *c, int async) {
-    if (c == server.current_client) {
+    if (c == inst->current_client) {
         c->flag.close_after_command = 1;
     } else {
         if (async) {
@@ -4452,8 +4452,8 @@ void commandProcessed(client *c) {
  * of processing the command; otherwise, C_OK is returned. */
 int processCommandAndResetClient(client *c) {
     int deadclient = 0;
-    client *old_client = server.current_client;
-    server.current_client = c;
+    client *old_client = inst->current_client;
+    inst->current_client = c;
     if (processCommand(c) == C_OK) {
         commandProcessed(c);
         /* Update the client's memory to include output buffer growth following the
@@ -4461,15 +4461,15 @@ int processCommandAndResetClient(client *c) {
         if (c->conn) updateClientMemUsageAndBucket(c);
     }
 
-    if (server.current_client == NULL) deadclient = 1;
+    if (inst->current_client == NULL) deadclient = 1;
     /*
      * Restore the old client, this is needed because when a script
      * times out, we will get into this code from processEventsWhileBlocked.
-     * Which will cause to set the server.current_client. If not restored
+     * Which will cause to set the inst->current_client. If not restored
      * we will return 1 to our caller which will falsely indicate the client
      * is dead and will stop reading from its buffer.
      */
-    server.current_client = old_client;
+    inst->current_client = old_client;
     /* performEvictions may flush replica output buffers. This may
      * result in a replica, that may be the active client, to be
      * freed. */
@@ -4997,9 +4997,9 @@ char *getClientSockname(client *c) {
 int isClientConnIpV6(client *c) {
     /* The cached client peer id is on the form "[IPv6]:port" for IPv6
      * addresses, so we just check for '[' here. */
-    if (c->flag.fake && server.current_client) {
+    if (c->flag.fake && inst->current_client) {
         /* Fake client? Use current client instead, if we have one. */
-        c = server.current_client;
+        c = inst->current_client;
     }
 
     if (c->flag.fake || !c->conn) {
@@ -5597,7 +5597,7 @@ static int clientMatchesFilter(client *client, clientFilter *client_filter) {
     if (client_filter->type != -1 && getClientType(client) != client_filter->type) return 0;
     if (client_filter->ids && !intsetFind(client_filter->ids, client->id)) return 0;
     if (client_filter->user && client->user != client_filter->user) return 0;
-    if (client_filter->skipme && client == server.current_client) return 0;
+    if (client_filter->skipme && client == inst->current_client) return 0;
     if (client_filter->max_age != 0 && (long long)(commandTimeSnapshot() / 1000 - client->ctime) < client_filter->max_age) return 0;
     if (client_filter->idle != 0 && (long long)(commandTimeSnapshot() / 1000 - client->last_interaction) < client_filter->idle) return 0;
     if (client_filter->flags && clientMatchesFlagFilter(client, client_filter->flags) == 0) return 0;
@@ -6964,8 +6964,8 @@ mstime_t getPausedActionTimeout(uint32_t action, pause_purpose *purpose) {
     *purpose = NUM_PAUSE_PURPOSES;
     for (int i = 0; i < NUM_PAUSE_PURPOSES; i++) {
         pause_event *p = &(server.client_pause_per_purpose[i]);
-        if (p->paused_actions & action && (p->end - server.mstime) > timeout) {
-            timeout = p->end - server.mstime;
+        if (p->paused_actions & action && (p->end - inst->mstime) > timeout) {
+            timeout = p->end - inst->mstime;
             *purpose = i;
         }
     }
@@ -6980,7 +6980,7 @@ void updatePausedActions(void) {
 
     for (int i = 0; i < NUM_PAUSE_PURPOSES; i++) {
         pause_event *p = &(server.client_pause_per_purpose[i]);
-        if (p->end > server.mstime)
+        if (p->end > inst->mstime)
             server.paused_actions |= p->paused_actions;
         else {
             p->paused_actions = 0;
@@ -7001,7 +7001,7 @@ void updatePausedActions(void) {
 void unblockPostponedClients(void) {
     listNode *ln;
     listIter li;
-    listRewind(server.postponed_clients, &li);
+    listRewind(inst->postponed_clients, &li);
     while ((ln = listNext(&li)) != NULL) {
         client *c = listNodeValue(ln);
         unblockClient(c, 1);
@@ -7052,8 +7052,8 @@ void pauseActions(pause_purpose purpose, mstime_t end, uint32_t actions) {
      * up before and after to execute. We need
      * to track this state so that we don't assert
      * in propagateNow(). */
-    if (server.in_exec) {
-        server.client_pause_in_transaction = 1;
+    if (inst->in_exec) {
+        inst->client_pause_in_transaction = 1;
     }
 }
 
@@ -7103,8 +7103,8 @@ void processEventsWhileBlocked(void) {
      * provide a fresher time than the one from when the script started (they
      * still won't get it from the call due to execution_nesting. For commands
      * during loading this doesn't matter. */
-    mstime_t prev_cmd_time_snapshot = server.cmd_time_snapshot;
-    server.cmd_time_snapshot = server.mstime;
+    mstime_t prev_cmd_time_snapshot = inst->cmd_time_snapshot;
+    inst->cmd_time_snapshot = inst->mstime;
 
     /* Note: when we are processing events while blocked (for instance during
      * busy Lua scripts), we set a global flag. When such flag is set, we
@@ -7115,13 +7115,13 @@ void processEventsWhileBlocked(void) {
      * that came from AOF. */
     ProcessingEventsWhileBlocked++;
     while (iterations--) {
-        long long startval = server.events_processed_while_blocked;
+        long long startval = inst->events_processed_while_blocked;
         long long ae_events =
-            aeProcessEvents(server.el, AE_FILE_EVENTS | AE_DONT_WAIT | AE_CALL_BEFORE_SLEEP | AE_CALL_AFTER_SLEEP);
-        /* Note that server.events_processed_while_blocked will also get
+            aeProcessEvents(inst->el, AE_FILE_EVENTS | AE_DONT_WAIT | AE_CALL_BEFORE_SLEEP | AE_CALL_AFTER_SLEEP);
+        /* Note that inst->events_processed_while_blocked will also get
          * incremented by callbacks called by the event loop handlers. */
-        server.events_processed_while_blocked += ae_events;
-        long long events = server.events_processed_while_blocked - startval;
+        inst->events_processed_while_blocked += ae_events;
+        long long events = inst->events_processed_while_blocked - startval;
         if (!events) break;
     }
 
@@ -7130,7 +7130,7 @@ void processEventsWhileBlocked(void) {
     ProcessingEventsWhileBlocked--;
     serverAssert(ProcessingEventsWhileBlocked >= 0);
 
-    server.cmd_time_snapshot = prev_cmd_time_snapshot;
+    inst->cmd_time_snapshot = prev_cmd_time_snapshot;
 }
 
 /* Return 1 if the client read is handled using threaded I/O.

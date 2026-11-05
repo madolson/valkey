@@ -93,7 +93,7 @@ void disableTracking(client *c) {
 
     /* Clear flags and adjust the count. */
     if (c->flag.tracking) {
-        server.tracking_clients--;
+        inst->tracking_clients--;
         c->flag.tracking = 0;
         c->flag.tracking_broken_redir = 0;
         c->flag.tracking_bcast = 0;
@@ -179,7 +179,7 @@ void enableBcastTrackingForPrefix(client *c, char *prefix, size_t plen) {
  * inform it of the condition. Multiple clients can redirect the invalidation
  * messages to the same client ID. */
 void enableTracking(client *c, uint64_t redirect_to, struct ClientFlags options, robj **prefix, size_t numprefix) {
-    if (!c->flag.tracking) server.tracking_clients++;
+    if (!c->flag.tracking) inst->tracking_clients++;
     c->flag.tracking = 1;
     c->flag.tracking_broken_redir = 0;
     c->flag.tracking_bcast = 0;
@@ -400,16 +400,16 @@ void trackingInvalidateKey(client *c, robj *keyobj, int bcast) {
 
         /* If the client enabled the NOLOOP mode, don't send notifications
          * about keys changed by the client itself. */
-        if (target->flag.tracking_noloop && target == server.current_client) {
+        if (target->flag.tracking_noloop && target == inst->current_client) {
             continue;
         }
 
         /* If target is current client and it's executing a command, we need schedule key invalidation.
          * As the invalidation messages may be interleaved with command
          * response and should after command response. */
-        if (target == server.current_client && (server.current_client->flag.executing_command)) {
+        if (target == inst->current_client && (inst->current_client->flag.executing_command)) {
             incrRefCount(keyobj);
-            listAddNodeTail(server.tracking_pending_keys, keyobj);
+            listAddNodeTail(inst->tracking_pending_keys, keyobj);
         } else {
             sendTrackingMessage(target, (char *)objectGetVal(keyobj), sdslen(objectGetVal(keyobj)), 0);
         }
@@ -424,39 +424,39 @@ void trackingInvalidateKey(client *c, robj *keyobj, int bcast) {
 }
 
 /* Whether any tracking (client-side-caching) key invalidation is pending
- * flush. A tiny accessor over server.tracking_pending_keys rather than
+ * flush. A tiny accessor over inst->tracking_pending_keys rather than
  * having callers reach into the list themselves, so this file stays the
  * sole owner of how pending invalidations are tracked. */
 bool trackingHasPendingKeyInvalidations(void) {
-    return listLength(server.tracking_pending_keys) > 0;
+    return listLength(inst->tracking_pending_keys) > 0;
 }
 
 void trackingHandlePendingKeyInvalidations(void) {
-    if (!listLength(server.tracking_pending_keys)) return;
+    if (!listLength(inst->tracking_pending_keys)) return;
 
     /* Flush pending invalidation messages only when we are not in nested call.
      * So the messages are not interleaved with transaction response. */
-    if (server.execution_nesting) return;
+    if (inst->execution_nesting) return;
 
     listNode *ln;
     listIter li;
 
-    listRewind(server.tracking_pending_keys, &li);
+    listRewind(inst->tracking_pending_keys, &li);
     while ((ln = listNext(&li)) != NULL) {
         robj *key = listNodeValue(ln);
         /* current_client maybe freed, so we need to send invalidation
          * message only when current_client is still alive */
-        if (server.current_client != NULL) {
+        if (inst->current_client != NULL) {
             if (key != NULL) {
-                sendTrackingMessage(server.current_client, (char *)objectGetVal(key), sdslen(objectGetVal(key)), 0);
+                sendTrackingMessage(inst->current_client, (char *)objectGetVal(key), sdslen(objectGetVal(key)), 0);
             } else {
-                sendTrackingMessage(server.current_client, objectGetVal(shared.null[server.current_client->resp]),
-                                    sdslen(objectGetVal(shared.null[server.current_client->resp])), 1);
+                sendTrackingMessage(inst->current_client, objectGetVal(shared.null[inst->current_client->resp]),
+                                    sdslen(objectGetVal(shared.null[inst->current_client->resp])), 1);
             }
         }
         if (key != NULL) decrRefCount(key);
     }
-    listEmpty(server.tracking_pending_keys);
+    listEmpty(inst->tracking_pending_keys);
 }
 
 /* This function is called when one or all of the databases are
@@ -476,16 +476,16 @@ void freeTrackingRadixTree(rax *rt) {
 
 /* A RESP NULL is sent to indicate that all keys are invalid */
 void trackingInvalidateKeysOnFlush(int async) {
-    if (server.tracking_clients) {
+    if (inst->tracking_clients) {
         listNode *ln;
         listIter li;
         listRewind(server.clients, &li);
         while ((ln = listNext(&li)) != NULL) {
             client *c = listNodeValue(ln);
             if (c->flag.tracking) {
-                if (c == server.current_client) {
+                if (c == inst->current_client) {
                     /* We use a special NULL to indicate that we should send null */
-                    listAddNodeTail(server.tracking_pending_keys, NULL);
+                    listAddNodeTail(inst->tracking_pending_keys, NULL);
                 } else {
                     sendTrackingMessage(c, objectGetVal(shared.null[c->resp]), sdslen(objectGetVal(shared.null[c->resp])), 1);
                 }
@@ -725,7 +725,7 @@ void trackingSweepFull(void) {
  * at the slow end - a quiet server pays one 100us scan per minute, a burst
  * of disconnects quickly ramps reclamation up.
  *
- * Deliberately not gated on server.tracking_clients: the leak's typical
+ * Deliberately not gated on inst->tracking_clients: the leak's typical
  * shape is a table full of dead IDs after every tracking client has
  * disconnected. It does bail out while the table itself doesn't exist
  * (tracking never enabled, or torn down), since there is nothing to sweep. */
@@ -812,7 +812,7 @@ void trackingBroadcastInvalidationMessages(void) {
     raxIterator ri, ri2;
 
     /* Return ASAP if there is nothing to do here. */
-    if (TrackingTable == NULL || !server.tracking_clients) return;
+    if (TrackingTable == NULL || !inst->tracking_clients) return;
 
     raxStart(&ri, PrefixTable);
     raxSeek(&ri, "^", NULL, 0);
@@ -949,8 +949,8 @@ int defragTrackingTable(monotime endtime) {
     }
 
     unsigned int iterations = 0;
-    long long prev_defragged = server.stat_active_defrag_hits;
-    unsigned long long prev_scanned = server.stat_active_defrag_scanned;
+    long long prev_defragged = inst->stat_active_defrag_hits;
+    unsigned long long prev_scanned = inst->stat_active_defrag_scanned;
 
     while (raxNext(&ri)) {
         rax *ids = ri.data;
@@ -982,12 +982,12 @@ int defragTrackingTable(monotime endtime) {
             raxSeek(&idi, "^", NULL, 0);
         }
         while (raxNext(&idi)) {
-            server.stat_active_defrag_scanned++;
+            inst->stat_active_defrag_scanned++;
             /* Deadline check inside the inner tree: one tracked key can hold
              * an unbounded number of (dead) client IDs, so within-key
              * progress must be interruptible too. */
-            if (++iterations > 16 || server.stat_active_defrag_hits > prev_defragged ||
-                server.stat_active_defrag_scanned - prev_scanned > 64) {
+            if (++iterations > 16 || inst->stat_active_defrag_hits > prev_defragged ||
+                inst->stat_active_defrag_scanned - prev_scanned > 64) {
                 if (getMonotonicUs() >= endtime) {
                     /* Save the resume point (the only time the key is copied). */
                     sdsfree(defrag_cursor.key);
@@ -999,15 +999,15 @@ int defragTrackingTable(monotime endtime) {
                     return 0;
                 }
                 iterations = 0;
-                prev_defragged = server.stat_active_defrag_hits;
-                prev_scanned = server.stat_active_defrag_scanned;
+                prev_defragged = inst->stat_active_defrag_hits;
+                prev_scanned = inst->stat_active_defrag_scanned;
             }
         }
         raxStop(&idi);
 
         /* Between-keys deadline check, mirroring the other stages. */
-        if (++iterations > 16 || server.stat_active_defrag_hits > prev_defragged ||
-            server.stat_active_defrag_scanned - prev_scanned > 64) {
+        if (++iterations > 16 || inst->stat_active_defrag_hits > prev_defragged ||
+            inst->stat_active_defrag_scanned - prev_scanned > 64) {
             if (getMonotonicUs() >= endtime) {
                 /* Resume strictly after this fully-processed key. */
                 sdsfree(defrag_cursor.key);
@@ -1017,8 +1017,8 @@ int defragTrackingTable(monotime endtime) {
                 return 0;
             }
             iterations = 0;
-            prev_defragged = server.stat_active_defrag_hits;
-            prev_scanned = server.stat_active_defrag_scanned;
+            prev_defragged = inst->stat_active_defrag_hits;
+            prev_scanned = inst->stat_active_defrag_scanned;
         }
     }
     raxStop(&ri);

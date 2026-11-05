@@ -68,7 +68,7 @@ static commandlogEntry *commandlogCreateEntry(client *c, robj **argv, int argc, 
     }
     ce->time = time(NULL);
     ce->value = value;
-    ce->id = server.commandlog[type].entry_id++;
+    ce->id = inst->commandlog[type].entry_id++;
     /* For commands executed from a script, the executing client is a fake
      * client with no connection, so attribute the entry to the calling client. */
     client *caller = scriptIsRunning() ? scriptGetCaller() : c;
@@ -96,9 +96,9 @@ static void commandlogFreeEntry(void *ceptr) {
  * at server startup. */
 void commandlogInit(void) {
     for (int i = 0; i < COMMANDLOG_TYPE_NUM; i++) {
-        server.commandlog[i].entries = listCreate();
-        server.commandlog[i].entry_id = 0;
-        listSetFreeMethod(server.commandlog[i].entries, commandlogFreeEntry);
+        inst->commandlog[i].entries = listCreate();
+        inst->commandlog[i].entry_id = 0;
+        listSetFreeMethod(inst->commandlog[i].entries, commandlogFreeEntry);
     }
 }
 
@@ -106,17 +106,17 @@ void commandlogInit(void) {
  * This function will make sure to trim the command log accordingly to the
  * configured max length. */
 static void commandlogPushEntryIfNeeded(client *c, robj **argv, int argc, long long value, int type) {
-    if (server.commandlog[type].threshold < 0 || server.commandlog[type].max_len == 0) return; /* The corresponding commandlog disabled */
-    if (value >= server.commandlog[type].threshold)
-        listAddNodeHead(server.commandlog[type].entries, commandlogCreateEntry(c, argv, argc, value, type));
+    if (inst->commandlog[type].threshold < 0 || inst->commandlog[type].max_len == 0) return; /* The corresponding commandlog disabled */
+    if (value >= inst->commandlog[type].threshold)
+        listAddNodeHead(inst->commandlog[type].entries, commandlogCreateEntry(c, argv, argc, value, type));
 
     /* Remove old entries if needed. */
-    while (listLength(server.commandlog[type].entries) > server.commandlog[type].max_len) listDelNode(server.commandlog[type].entries, listLast(server.commandlog[type].entries));
+    while (listLength(inst->commandlog[type].entries) > inst->commandlog[type].max_len) listDelNode(inst->commandlog[type].entries, listLast(inst->commandlog[type].entries));
 }
 
 /* Remove all the entries from the current command log of the specified type. */
 static void commandlogReset(int type) {
-    while (listLength(server.commandlog[type].entries) > 0) listDelNode(server.commandlog[type].entries, listLast(server.commandlog[type].entries));
+    while (listLength(inst->commandlog[type].entries) > 0) listDelNode(inst->commandlog[type].entries, listLast(inst->commandlog[type].entries));
 }
 
 /* Reply command logs to client. */
@@ -125,11 +125,11 @@ static void commandlogGetReply(client *c, int type, long count) {
     listNode *ln;
     commandlogEntry *ce;
 
-    if (count > (long)listLength(server.commandlog[type].entries)) {
-        count = listLength(server.commandlog[type].entries);
+    if (count > (long)listLength(inst->commandlog[type].entries)) {
+        count = listLength(inst->commandlog[type].entries);
     }
     addReplyArrayLen(c, count);
-    listRewind(server.commandlog[type].entries, &li);
+    listRewind(inst->commandlog[type].entries, &li);
     while (count--) {
         int j;
 
@@ -187,7 +187,7 @@ void slowlogCommand(client *c) {
         commandlogReset(COMMANDLOG_TYPE_SLOW);
         addReply(c, shared.ok);
     } else if (c->argc == 2 && !strcasecmp(objectGetVal(c->argv[1]), "len")) {
-        addReplyLongLong(c, listLength(server.commandlog[COMMANDLOG_TYPE_SLOW].entries));
+        addReplyLongLong(c, listLength(inst->commandlog[COMMANDLOG_TYPE_SLOW].entries));
     } else if ((c->argc == 2 || c->argc == 3) && !strcasecmp(objectGetVal(c->argv[1]), "get")) {
         long count = 10;
 
@@ -199,8 +199,8 @@ void slowlogCommand(client *c) {
 
             if (count == -1) {
                 /* We treat -1 as a special value, which means to get all slow logs.
-                 * Simply set count to the length of server.commandlog. */
-                count = listLength(server.commandlog[COMMANDLOG_TYPE_SLOW].entries);
+                 * Simply set count to the length of inst->commandlog. */
+                count = listLength(inst->commandlog[COMMANDLOG_TYPE_SLOW].entries);
             }
         }
 
@@ -246,7 +246,7 @@ void commandlogCommand(client *c) {
         addReply(c, shared.ok);
     } else if (c->argc == 3 && !strcasecmp(objectGetVal(c->argv[1]), "len")) {
         if ((type = commandlogGetTypeOrReply(c, c->argv[2])) == -1) return;
-        addReplyLongLong(c, listLength(server.commandlog[type].entries));
+        addReplyLongLong(c, listLength(inst->commandlog[type].entries));
     } else if (c->argc == 4 && !strcasecmp(objectGetVal(c->argv[1]), "get")) {
         long count;
 
@@ -259,8 +259,8 @@ void commandlogCommand(client *c) {
 
         if (count == -1) {
             /* We treat -1 as a special value, which means to get all command logs.
-             * Simply set count to the length of server.commandlog. */
-            count = listLength(server.commandlog[type].entries);
+             * Simply set count to the length of inst->commandlog. */
+            count = listLength(inst->commandlog[type].entries);
         }
 
         commandlogGetReply(c, type, count);

@@ -105,7 +105,7 @@ static void moveToNextKey(void) {
 
 static void markKeyAsdone(KeyPrefetchInfo *info) {
     info->state = PREFETCH_DONE;
-    server.stat_total_prefetch_entries++;
+    inst->stat_total_prefetch_entries++;
     batch->keys_done++;
 }
 
@@ -314,7 +314,7 @@ static void prefetchCommands(void) {
 
     /* Prefetch hashtable keys for all commands. Prefetching is beneficial only if there are more than one key. */
     if (batch->key_count > 1) {
-        server.stat_total_prefetch_batches++;
+        inst->stat_total_prefetch_batches++;
         /* Prefetch keys from the main hashtable */
         hashtablePrefetch(batch->keys_tables);
     }

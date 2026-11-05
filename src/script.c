@@ -197,7 +197,7 @@ int scriptPrepareForRun(scriptRunCtx *run_ctx,
 
         /* Check OOM state. the no-writes flag imply allow-oom. we tested it
          * after the no-write error, so no need to mention it in the error reply. */
-        if (!client_allow_oom && server.pre_command_oom_state && server.maxmemory &&
+        if (!client_allow_oom && inst->pre_command_oom_state && server.maxmemory &&
             !(script_flags & (SCRIPT_FLAG_ALLOW_OOM | SCRIPT_FLAG_NO_WRITES))) {
             addReplyError(caller, "-OOM allow-oom flag is not set on the script, "
                                   "can not run it when used memory > 'maxmemory'");

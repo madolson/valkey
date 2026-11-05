@@ -254,7 +254,7 @@ void setSlotImportingStateInDb(serverDb *db,
 
 void setSlotImportingStateInAllDbs(list *slot_ranges, int is_importing) {
     for (int i = 0; i < server.dbnum; i++) {
-        serverDb *db = server.db[i];
+        serverDb *db = inst->db[i];
         setSlotImportingStateInDb(db, slot_ranges, is_importing);
     }
 }
@@ -1043,12 +1043,12 @@ void propagateSyncSlotsFinish(slotMigrationJob *job) {
      * e.g. a failed import right after delKeysInSlot() propagated its DELs.
      * The FINISH only settles slot ownership for replicas, like those DELs, so
      * it gets the same exemption in propagateNow(). */
-    server.server_del_keys_in_slot = 1;
+    inst->server_del_keys_in_slot = 1;
     enterExecutionUnit(1, 0);
     alsoPropagate(-1, argv, argc, PROPAGATE_REPL | PROPAGATE_AOF, -1);
     exitExecutionUnit();
     postExecutionUnitOperations();
-    server.server_del_keys_in_slot = 0;
+    inst->server_del_keys_in_slot = 0;
 
     if (name_obj) decrRefCount(name_obj);
     if (message_obj) decrRefCount(message_obj);
@@ -1769,7 +1769,7 @@ int slotExportJobBeginSnapshotToTargetSocket(slotMigrationJob *job) {
 
         serverLog(LL_NOTICE, "Started child process %ld for slot migration %s", (long)childpid, job->description);
         close(slot_migration_pipe_write); /* close write in parent so that it can detect the close on the child. */
-        if (aeCreateFileEvent(server.el, server.slot_migration_pipe_read, AE_READABLE, slotMigrationPipeReadHandler, NULL) == AE_ERR) {
+        if (aeCreateFileEvent(inst->el, server.slot_migration_pipe_read, AE_READABLE, slotMigrationPipeReadHandler, NULL) == AE_ERR) {
             serverPanic("Unrecoverable error creating server.slot_migration_pipe_read file event.");
         }
         close(safe_to_exit_pipe);
@@ -1790,7 +1790,7 @@ void backgroundSlotMigrationDoneHandler(int exitcode, int bysignal) {
     }
     if (server.slot_migration_child_exit_pipe != -1) close(server.slot_migration_child_exit_pipe);
     if (server.slot_migration_pipe_read > 0) {
-        aeDeleteFileEvent(server.el, server.slot_migration_pipe_read, AE_READABLE);
+        aeDeleteFileEvent(inst->el, server.slot_migration_pipe_read, AE_READABLE);
         close(server.slot_migration_pipe_read);
     }
     server.slot_migration_child_exit_pipe = -1;

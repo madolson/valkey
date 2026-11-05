@@ -175,7 +175,7 @@ void IOThreadsBeforeSleep(long long current_time) {
         static long long last_measurement_time = 0;
         if (current_time - last_measurement_time < 50000) return; /* Sample once in 50ms */
         last_measurement_time = current_time;
-        trackInstantaneousMetric(STATS_METRIC_MAIN_THREAD_ACTIVE_TIME, server.stat_active_time, current_time, 1000000);
+        trackInstantaneousMetric(STATS_METRIC_MAIN_THREAD_ACTIVE_TIME, inst->stat_active_time, current_time, 1000000);
     }
 }
 
@@ -203,7 +203,7 @@ void IOThreadsAfterSleep(int numevents) {
         return;
     }
 
-    mstime_t now = server.mstime;
+    mstime_t now = inst->mstime;
     static long long last_scale_time = 0;
 
     /* Ignition Policy */
@@ -1111,26 +1111,26 @@ void trySendPollJobToIOThreads(void) {
     }
 
     server.io_poll_state = AE_IO_STATE_POLL;
-    aeSetPollProtect(server.el, 1);
+    aeSetPollProtect(inst->el, 1);
 
     /* Use SPMC to minimize polling overhead. At high thread counts, use private SPSC queues for lower latency. */
     if (server.active_io_threads_num <= 9) {
-        if (unlikely(spmcEnqueue(&io_shared_inbox[JOB_PRIORITY_NORMAL], tagJob(server.el, JOB_REQ_POLL)) == false)) {
+        if (unlikely(spmcEnqueue(&io_shared_inbox[JOB_PRIORITY_NORMAL], tagJob(inst->el, JOB_REQ_POLL)) == false)) {
             server.io_poll_state = AE_IO_STATE_NONE;
-            aeSetPollProtect(server.el, 0);
+            aeSetPollProtect(inst->el, 0);
             return;
         }
     } else {
         cur_epoll_thread = ((cur_epoll_thread) % (server.active_io_threads_num - 1)) + 1;
         if (unlikely(spscIsFull(&io_private_inbox[cur_epoll_thread]))) {
             server.io_poll_state = AE_IO_STATE_NONE;
-            aeSetPollProtect(server.el, 0);
+            aeSetPollProtect(inst->el, 0);
             return;
         }
-        spscEnqueue(&io_private_inbox[cur_epoll_thread], tagJob(server.el, JOB_SPSC_POLL), true);
+        spscEnqueue(&io_private_inbox[cur_epoll_thread], tagJob(inst->el, JOB_SPSC_POLL), true);
     }
 
-    aeSetCustomPollProc(server.el, getIOThreadPollResults);
+    aeSetCustomPollProc(inst->el, getIOThreadPollResults);
     io_jobs_submitted++;
 }
 
@@ -1335,7 +1335,7 @@ int processIOThreadsResponses(void) {
         if (processed == 0) {
             /* 2. Preemptive Poll: When high-priority outbox is empty, check if any new
              * high-priority events arrived on QoS channels before processing normal traffic. */
-            aeProcessQoSEventsPreemptively(server.el);
+            aeProcessQoSEventsPreemptively(inst->el);
         }
         /* 3. Drain normal client events */
         processed += processOutboxBatch(&io_shared_outbox[JOB_PRIORITY_NORMAL]);

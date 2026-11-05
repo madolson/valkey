@@ -539,7 +539,7 @@ static fifo *fullScanIteratorGetEntries(genericIterator *genIt, int *orig_dbid, 
                 fifoRelease(dbEntryFifo);
                 return NULL; // Iteration complete
             }
-            serverDb *db = server.db[it->orig_to_cur_db[it->iter_db]];
+            serverDb *db = inst->db[it->orig_to_cur_db[it->iter_db]];
             if (db != NULL) {
                 it->kvs = db->keys;
                 it->kvs_didx = kvstoreGetFirstNonEmptyHashtableIndex(it->kvs);
@@ -1134,7 +1134,7 @@ static bool expediteSingleKeyWithoutOptimization(bgIterator *it,
     bool mustBlock = false;
 
     sds key = objectGetVal(oKey);
-    dbEntry *de = (server.db[dbid]) ? dbFind(server.db[dbid], key) : NULL;
+    dbEntry *de = (inst->db[dbid]) ? dbFind(inst->db[dbid], key) : NULL;
     if (de != NULL) {
         if (!iteratorHasPassedKey(it, dbid, key, de)) {
             if (addEarlyIterationKey(it, de, dbid)) {
@@ -1275,7 +1275,7 @@ static bool expediteKeysForWrite(bgIterator *it,
         for (int i = 0; i < numKeys; i++) {
             robj *oKey = argv[keyrefs[i].pos];
             sds key = objectGetVal(oKey);
-            dbEntry *de = (server.db[dbid]) ? dbFind(server.db[dbid], key) : NULL;
+            dbEntry *de = (inst->db[dbid]) ? dbFind(inst->db[dbid], key) : NULL;
             if (de == NULL) continue; // New key, no need to expedite
             if (!iteratorHasPassedKey(it, dbid, key, de) &&
                 ((bgIterationEntryMetadata *)objectGetMetadata(de))->iterator_epoch <= it->consistent_modification_id) {
@@ -1306,7 +1306,7 @@ static bool expediteKeysForWrite(bgIterator *it,
             for (int i = 0; i < numKeys; i++) {
                 robj *oKey = argv[keyrefs[i].pos];
                 sds key = objectGetVal(oKey);
-                dbEntry *de = (server.db[dbid]) ? dbFind(server.db[dbid], key) : NULL;
+                dbEntry *de = (inst->db[dbid]) ? dbFind(inst->db[dbid], key) : NULL;
                 if (de == NULL) {
                     if (collectMissing) {
                         incrRefCount(oKey);
@@ -1334,7 +1334,7 @@ static bool expediteKeysForWrite(bgIterator *it,
              * transaction have already been identified to replicate, we must wait on all keys and
              * replicate here as well.  (Take care not to set cur_cmd_may_replicate to false.) */
             if (someIterated) {
-                if (server.in_exec) {
+                if (inst->in_exec) {
                     /* We are now executing the commands in a multi-exec block.
                      *
                      * Regarding MULTI/EXEC:  Remember that this code is executed twice for commands
@@ -1369,7 +1369,7 @@ static bool expediteKeysForWrite(bgIterator *it,
             for (int i = 0; i < numKeys; i++) {
                 robj *oKey = argv[keyrefs[i].pos];
                 sds key = objectGetVal(oKey);
-                dbEntry *de = (server.db[dbid]) ? dbFind(server.db[dbid], key) : NULL;
+                dbEntry *de = (inst->db[dbid]) ? dbFind(inst->db[dbid], key) : NULL;
                 if (de == NULL) {
                     if (collectMissing) {
                         incrRefCount(oKey);
@@ -1811,9 +1811,9 @@ static void handleSwapdb(int db1, int db2) {
 static bool isDbSignificant(int dbid) {
     unsigned long long totalKeys = 0;
     for (int i = 0; i < server.dbnum; i++) {
-        totalKeys += (server.db[i]) ? dbSize(server.db[i]) : 0;
+        totalKeys += (inst->db[i]) ? dbSize(inst->db[i]) : 0;
     }
-    return (server.db[dbid]) ? (dbSize(server.db[dbid]) > totalKeys / 2) : false;
+    return (inst->db[dbid]) ? (dbSize(inst->db[dbid]) > totalKeys / 2) : false;
 }
 
 
@@ -2053,7 +2053,7 @@ static bgIterator *bgIteratorCreate(const char *name,
 
     if (bgIterator_timeproc_id <= 0) {
         // If iteration is not currently active, start the feeding task.  (Runs in main thread.)
-        bgIterator_timeproc_id = aeCreateTimeEvent(server.el, 0, bgIteration_feedIterators_task, NULL, NULL);
+        bgIterator_timeproc_id = aeCreateTimeEvent(inst->el, 0, bgIteration_feedIterators_task, NULL, NULL);
         serverAssert(bgIterator_timeproc_id != AE_ERR);
     }
 
@@ -2268,7 +2268,7 @@ void bgIteration_keyDelete(int dbid, const_sds key) {
         debugBuffer = sdscatprintf(debugBuffer, "KEYDEL: (%d)%s\n", dbid, key);
     }
 
-    dbEntry *de = dbFind(server.db[dbid], (sds)key);
+    dbEntry *de = dbFind(inst->db[dbid], (sds)key);
     serverAssert(de != NULL); // This API should be called BEFORE removal from main dict
 
     // For consistent iterators, we need to make sure the item gets written before delete
@@ -2295,7 +2295,7 @@ void bgIteration_keyDelete(int dbid, const_sds key) {
     /* We might be within the context of a command execution.  This happens if the key is found to
      * be expired when attempting to execute the command.  In this case, we should treat the key as
      * missing.  If the key exists after the command executes, we can treat it like a new key. */
-    if (server.in_call) {
+    if (inst->in_call) {
         robj *oKey = createObject(OBJ_STRING, sdsdup(key));
         listAddNodeHead(curCmdMissingKeys, oKey);
     }
@@ -2370,11 +2370,11 @@ bool bgIteration_blockClientIfRequired(client *c) {
                 static mstime_t last_log = 0; // STATIC: persists to prevent log spamming
                 static int blocked_count = 0; // STATIC: persistent count since last log
                 blocked_count++;
-                if (server.mstime - last_log > SYNC_BLOCKING_LOG_INTERVAL) {
+                if (inst->mstime - last_log > SYNC_BLOCKING_LOG_INTERVAL) {
                     serverLog(LL_WARNING,
                               "Forkless operation synchronously blocked %d times for scripts with undeclared keys",
                               blocked_count);
-                    last_log = server.mstime;
+                    last_log = inst->mstime;
                     blocked_count = 0;
                 }
 
@@ -2470,7 +2470,7 @@ void bgIteration_handleCommandReplication(int dbid,
         robj *oKey = argv[1];
         special_key = (sds)objectGetVal(oKey);
 
-        special_dbEntry = dbFind(server.db[special_dbid], special_key);
+        special_dbEntry = dbFind(inst->db[special_dbid], special_key);
     }
     if (cmd->proc == copyCommand) {
         // The COPY command succeeded.  However COPY requires special handling (like MOVE).
@@ -2481,7 +2481,7 @@ void bgIteration_handleCommandReplication(int dbid,
         robj *oKey = argv[2];
         special_key = (sds)objectGetVal(oKey);
 
-        special_dbEntry = dbFind(server.db[special_dbid], special_key);
+        special_dbEntry = dbFind(inst->db[special_dbid], special_key);
     }
 
     /* Implementation note regarding LUA and MULTI:  LUA scripts and MULTI-EXEC blocks must be
@@ -2532,7 +2532,7 @@ void bgIteration_handleCommandReplication(int dbid,
                 while ((missingNode = listNext(&missingIt)) != NULL) {
                     robj *oKey = listNodeValue(missingNode);
                     const_sds key = objectGetVal(oKey);
-                    dbEntry *de = dbFind(server.db[dbid], (sds)key);
+                    dbEntry *de = dbFind(inst->db[dbid], (sds)key);
                     if (de != NULL) {
                         // It exists now!
                         if (it->cur_cmd_may_replicate &&
@@ -2598,10 +2598,10 @@ void bgIteration_handleCommandReplication(int dbid,
         bool isDelCommand = isDeleteCmd(cmd);
         if (isDelCommand) {
             sds key = objectGetVal(argv[1]);
-            dbEntry *de = dbFind(server.db[dbid], key);
+            dbEntry *de = dbFind(inst->db[dbid], key);
             serverAssert(de == NULL); // dbEntry should be removed before replication (self-check)
             if (it->keyset_iter->isKeyInScope(it->keyset_iter, key)) {
-                bool blockClientIfRequiredWasCalled = (server.in_call > 0);
+                bool blockClientIfRequiredWasCalled = (inst->in_call > 0);
                 if (blockClientIfRequiredWasCalled && iteratorReplicationFlagsWereUpdated) {
                     // Here we know that the DEL is related to the running command
                     shouldReplicateDelCommand = it->cur_cmd_may_replicate;
@@ -2673,7 +2673,7 @@ void bgIteration_dbEntryModified(dbEntry *de) {
 // PUBLIC API
 void bgIteration_keyModified(int dbid, const_sds key) {
     if (bgIteration_iterationActive()) {
-        dbEntry *de = dbFind(server.db[dbid], (sds)key);
+        dbEntry *de = dbFind(inst->db[dbid], (sds)key);
         if (de) bgIteration_dbEntryModified(de);
     }
 }

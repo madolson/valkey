@@ -90,7 +90,7 @@ pubsubtype pubSubShardType = {
     .shard = 1,
     .clientPubSubChannels = getClientPubSubShardChannels,
     .subscriptionCount = clientShardSubscriptionsCount,
-    .serverPubSubChannels = &server.pubsubshard_channels,
+    .serverPubSubChannels = &inst->pubsubshard_channels,
     .subscribeMsg = &shared.ssubscribebulk,
     .unsubscribeMsg = &shared.sunsubscribebulk,
     .messageBulk = &shared.smessagebulk,
@@ -214,7 +214,7 @@ int serverPubsubSubscriptionCount(void) {
 
 /* Return the number of pubsub shard level channels is handled. */
 int serverPubsubShardSubscriptionCount(void) {
-    return kvstoreSize(server.pubsubshard_channels);
+    return kvstoreSize(inst->pubsubshard_channels);
 }
 
 /* Return the number of channels + patterns a client is subscribed to. */
@@ -372,9 +372,9 @@ int pubsubUnsubscribeChannel(client *c, robj *channel, int notify, pubsubtype ty
 
 /* Unsubscribe all shard channels in a slot. */
 void pubsubShardUnsubscribeAllChannelsInSlot(unsigned int slot) {
-    if (!kvstoreHashtableSize(server.pubsubshard_channels, slot)) return;
+    if (!kvstoreHashtableSize(inst->pubsubshard_channels, slot)) return;
 
-    kvstoreHashtableIterator *kvs_di = kvstoreGetHashtableIterator(server.pubsubshard_channels, slot, HASHTABLE_ITER_SAFE);
+    kvstoreHashtableIterator *kvs_di = kvstoreGetHashtableIterator(inst->pubsubshard_channels, slot, HASHTABLE_ITER_SAFE);
     void *element;
     while (kvstoreHashtableIteratorNext(kvs_di, &element)) {
         hashtable *clients = element;
@@ -396,7 +396,7 @@ void pubsubShardUnsubscribeAllChannelsInSlot(unsigned int slot) {
             c->pubsub_data->pubsub_object_mem -= getStringObjectMemory(channel);
         }
         hashtableCleanupIterator(&client_iter);
-        kvstoreHashtableDelete(server.pubsubshard_channels, slot, channel);
+        kvstoreHashtableDelete(inst->pubsubshard_channels, slot, channel);
     }
     kvstoreReleaseHashtableIterator(kvs_di);
 }
@@ -720,7 +720,7 @@ void pubsubCommand(client *c) {
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "shardchannels") && (c->argc == 2 || c->argc == 3)) {
         /* PUBSUB SHARDCHANNELS */
         sds pat = (c->argc == 2) ? NULL : objectGetVal(c->argv[2]);
-        channelList(c, pat, server.pubsubshard_channels);
+        channelList(c, pat, inst->pubsubshard_channels);
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "shardnumsub") && c->argc >= 2) {
         /* PUBSUB SHARDNUMSUB [ShardChannel_1 ... ShardChannel_N] */
         int j;
@@ -729,7 +729,7 @@ void pubsubCommand(client *c) {
             sds key = objectGetVal(c->argv[j]);
             unsigned int slot = server.cluster_enabled ? keyHashSlot(key, (int)sdslen(key)) : 0;
             void *found = NULL;
-            kvstoreHashtableFind(server.pubsubshard_channels, slot, c->argv[j], &found);
+            kvstoreHashtableFind(inst->pubsubshard_channels, slot, c->argv[j], &found);
             hashtable *clients = found;
             addReplyBulk(c, c->argv[j]);
             addReplyLongLong(c, clients ? hashtableSize(clients) : 0);
@@ -824,5 +824,5 @@ size_t pubsubMemOverhead(client *c) {
 
 int pubsubTotalSubscriptions(void) {
     return dictSize(server.pubsub_patterns) + kvstoreSize(server.pubsub_channels) +
-           kvstoreSize(server.pubsubshard_channels);
+           kvstoreSize(inst->pubsubshard_channels);
 }

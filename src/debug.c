@@ -304,7 +304,7 @@ void computeDatasetDigest(unsigned char *final) {
     memset(final, 0, 20); /* Start with a clean result */
 
     for (int j = 0; j < server.dbnum; j++) {
-        serverDb *db = server.db[j];
+        serverDb *db = inst->db[j];
         if (db == NULL || kvstoreSize(db->keys) == 0) continue;
         kvstoreIterator *kvs_it = kvstoreIteratorInit(db->keys, HASHTABLE_ITER_SAFE | HASHTABLE_ITER_PREFETCH_VALUES);
 
@@ -661,7 +661,7 @@ void debugCommand(client *c) {
             addReplyError(c, "Error trying to load the AOF files, check server logs.");
             return;
         }
-        server.dirty = 0; /* Prevent AOF / replication */
+        inst->dirty = 0; /* Prevent AOF / replication */
         serverLog(LL_NOTICE, "Append Only File loaded by DEBUG LOADAOF");
         addReply(c, shared.ok);
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "drop-cluster-packet-filter") && c->argc == 3) {
@@ -1011,7 +1011,7 @@ void debugCommand(client *c) {
         if (c->argc >= 4 && !strcasecmp(objectGetVal(c->argv[3]), "full")) full = 1;
 
         stats = sdscatprintf(stats, "[Dictionary HT]\n");
-        serverDb *db = server.db[dbid];
+        serverDb *db = inst->db[dbid];
         if (db) {
             kvstoreGetStats(db->keys, buf, sizeof(buf), full);
             stats = sdscat(stats, buf);
@@ -2544,8 +2544,8 @@ void printCrashReport(void) {
     logServerInfo();
 
     /* Log the current client */
-    logCurrentClient(server.current_client, "CURRENT");
-    logCurrentClient(server.executing_client, "EXECUTING");
+    logCurrentClient(inst->current_client, "CURRENT");
+    logCurrentClient(inst->executing_client, "EXECUTING");
 
     /* Log modules info. Something we wanna do last since we fear it may crash. */
     logModulesInfo();

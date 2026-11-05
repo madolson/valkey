@@ -342,7 +342,7 @@ static long long evictionTimeProc(struct aeEventLoop *eventLoop, long long id, v
 void startEvictionTimeProc(void) {
     if (!isEvictionProcRunning) {
         isEvictionProcRunning = 1;
-        aeCreateTimeEvent(server.el, 0, evictionTimeProc, NULL, NULL);
+        aeCreateTimeEvent(inst->el, 0, evictionTimeProc, NULL, NULL);
     }
 }
 
@@ -412,7 +412,7 @@ static long long evictSingleKey(serverDb *db, robj *keyobj, int slot) {
     latencyAddSampleIfNeeded("eviction-del", eviction_latency);
     latencyTraceIfNeeded(db, eviction_del, eviction_latency);
     delta -= (long long)zmalloc_used_memory();
-    server.stat_evictedkeys++;
+    inst->stat_evictedkeys++;
     signalModifiedKey(NULL, db, keyobj);
     notifyKeyspaceEvent(NOTIFY_EVICTED, "evicted", keyobj, db->id);
     propagateDeletion(db, keyobj, server.lazyfree_lazy_eviction, slot);
@@ -476,8 +476,8 @@ int performEvictions(void) {
     monotime evictionTimer;
     elapsedStart(&evictionTimer);
 
-    /* Try to smoke-out bugs (server.also_propagate should be empty here) */
-    serverAssert(server.also_propagate.numops == 0);
+    /* Try to smoke-out bugs (inst->also_propagate should be empty here) */
+    serverAssert(inst->also_propagate.numops == 0);
     /* Evictions are performed on random keys that have nothing to do with the current command slot. */
 
     while (mem_freed < (long long)mem_tofree) {
@@ -499,7 +499,7 @@ int performEvictions(void) {
                  * so to start populate the eviction pool sampling keys from
                  * every DB. */
                 for (i = 0; i < server.dbnum; i++) {
-                    db = server.db[i];
+                    db = inst->db[i];
                     if (db == NULL) continue;
                     kvstore *kvs;
                     if (server.maxmemory_policy & MAXMEMORY_FLAG_ALLKEYS) {
@@ -533,9 +533,9 @@ int performEvictions(void) {
 
                     kvstore *kvs;
                     if (server.maxmemory_policy & MAXMEMORY_FLAG_ALLKEYS) {
-                        kvs = server.db[bestdbid]->keys;
+                        kvs = inst->db[bestdbid]->keys;
                     } else {
-                        kvs = server.db[bestdbid]->expires;
+                        kvs = inst->db[bestdbid]->expires;
                     }
                     void *entry = NULL;
 
@@ -568,7 +568,7 @@ int performEvictions(void) {
              * incrementally visit all DBs. */
             for (i = 0; i < server.dbnum; i++) {
                 j = (++next_db) % server.dbnum;
-                db = server.db[j];
+                db = inst->db[j];
                 if (db == NULL) continue;
                 kvstore *kvs;
                 if (server.maxmemory_policy == MAXMEMORY_ALLKEYS_RANDOM) {
@@ -590,7 +590,7 @@ int performEvictions(void) {
 
         /* Finally remove the selected key. */
         if (bestkey) {
-            db = server.db[bestdbid];
+            db = inst->db[bestdbid];
             robj *keyobj = createStringObject(bestkey, sdslen(bestkey));
             delta = evictSingleKey(db, keyobj, bestslot);
             mem_freed += delta;
@@ -658,11 +658,11 @@ cant_free:
 
 update_metrics:
     if (result == EVICT_RUNNING || result == EVICT_FAIL) {
-        if (server.stat_last_eviction_exceeded_time == 0) elapsedStart(&server.stat_last_eviction_exceeded_time);
+        if (inst->stat_last_eviction_exceeded_time == 0) elapsedStart(&inst->stat_last_eviction_exceeded_time);
     } else if (result == EVICT_OK) {
-        if (server.stat_last_eviction_exceeded_time != 0) {
-            server.stat_total_eviction_exceeded_time += elapsedUs(server.stat_last_eviction_exceeded_time);
-            server.stat_last_eviction_exceeded_time = 0;
+        if (inst->stat_last_eviction_exceeded_time != 0) {
+            inst->stat_total_eviction_exceeded_time += elapsedUs(inst->stat_last_eviction_exceeded_time);
+            inst->stat_last_eviction_exceeded_time = 0;
         }
     }
     return result;
