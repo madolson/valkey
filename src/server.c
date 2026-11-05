@@ -7404,6 +7404,11 @@ static void chunkyInstanceSetup(int idx, const char *group) {
     if (server.port) server.port += idx;
     if (server.tls_port) server.tls_port += idx;
     if (server.cluster_port) server.cluster_port += idx;
+    if (server.cluster_announce_port) server.cluster_announce_port += idx;
+    if (server.cluster_announce_tls_port) server.cluster_announce_tls_port += idx;
+    if (server.cluster_announce_bus_port) server.cluster_announce_bus_port += idx;
+    if (server.cluster_announce_client_port) server.cluster_announce_client_port += idx;
+    if (server.cluster_announce_client_tls_port) server.cluster_announce_client_tls_port += idx;
     if (server.unixsocket) {
         sds s = sdscatprintf(sdsempty(), "%s-%d", server.unixsocket, idx);
         zfree(server.unixsocket);
