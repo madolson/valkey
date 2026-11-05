@@ -1620,6 +1620,8 @@ int VM_CreateSubcommand(ValkeyModuleCommand *parent,
         moduleCreateCommandProxy(parent->module, declared_name, fullname, cmdfunc, flags, firstkey, lastkey, keystep);
     cp->serverCmd->arity = -2;
 
+    /* Drain IO queue before modifying the parent's subcommands to prevent concurrent access while modifying it. */
+    drainIOThreadsQueue();
     commandAddSubcommand(parent_cmd, cp->serverCmd);
     return VALKEYMODULE_OK;
 }
@@ -11868,6 +11870,10 @@ int VM_UnregisterCommandFilter(ValkeyModuleCtx *ctx, ValkeyModuleCommandFilter *
     zfree(filter);
 
     return VALKEYMODULE_OK;
+}
+
+int moduleHasCommandFilters(void) {
+    return listLength(moduleCommandFilters) != 0;
 }
 
 void moduleCallCommandFilters(client *c) {

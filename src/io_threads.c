@@ -718,6 +718,11 @@ int trySendReadToIOThreads(client *c) {
     c->read_flags = canParseCommand(c) ? 0 : READ_FLAGS_DONT_PARSE;
     c->read_flags |= authRequired(c) ? READ_FLAGS_AUTH_REQUIRED : 0;
     c->read_flags |= isReplicatedClient(c) ? READ_FLAGS_REPLICATED : 0;
+    /* The session precheckCommandQueue() checks against. No precheck in MULTI:
+     * ACL checks queued commands against the transaction db. */
+    c->precheck.user = c->flag.multi ? NULL : c->user;
+    c->precheck.dbid = c->db->id;
+    c->precheck.authenticated = c->flag.authenticated;
 
     c->io_read_state = CLIENT_PENDING_IO;
     connSetPostponeUpdateState(c->conn, clientConnPostponeMaskFromIOState(c));

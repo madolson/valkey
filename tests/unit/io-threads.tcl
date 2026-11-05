@@ -171,3 +171,289 @@ start_server {config "minimal.conf" tags {"external:skip" "valgrind:skip"} overr
         assert_equal {PONG} [r ping]
     }
 }
+
+# IO threads run the auth and ACL checks of the commands they parse
+# (precheckCommandQueue). Each test lets a command be prechecked in an IO
+# thread, then changes what it was checked against before it runs.
+start_server {config "minimal.conf" tags {"external:skip" "valgrind:skip"} overrides {io-threads 2 io-threads-always-active yes}} {
+    r set k v
+
+    # One write while the server is paused, so one IO thread read parses all
+    # of the commands into the client's command queue.
+    proc send_pipeline_in_one_read {rd cmds} {
+        set buf {}
+        foreach cmd $cmds { append buf [format_command {*}$cmd] }
+        set server_pid [s process_id]
+        pause_process $server_pid
+        $rd write $buf
+        $rd flush
+        resume_process $server_pid
+    }
+
+    test {Pipelined command sees an ACL change made while it was queued} {
+        r del l
+        r acl setuser precheck-u on nopass +@all ~*
+        set rd [valkey_deferring_client]
+        $rd auth precheck-u x
+        assert_equal {OK} [$rd read]
+        send_pipeline_in_one_read $rd {{blpop l 0} {get k}}
+        wait_for_blocked_clients_count 1
+        r acl setuser precheck-u -get
+        r lpush l x
+        assert_equal {l x} [$rd read]
+        assert_error {*NOPERM*} {$rd read}
+        $rd close
+    }
+
+    test {Pipelined command after AUTH is checked against the new user} {
+        r acl setuser precheck-limited on >pw +auth +ping
+        set rd [valkey_deferring_client]
+        send_pipeline_in_one_read $rd {{auth precheck-limited pw} {get k}}
+        assert_equal {OK} [$rd read]
+        assert_error {*NOPERM*} {$rd read}
+        $rd close
+    }
+
+    # Ports of the hazard scenarios of src/rust/valkey-io/hazards.py on
+    # rust-io/iter4: a command is prechecked while its connection waits in
+    # BLPOP, the state it was checked against changes, and it must see the
+    # change.
+    test {Revoked command is logged in ACL LOG by the main thread} {
+        r del l
+        r acl log reset
+        r acl setuser precheck-log on nopass +@all ~*
+        set rd [valkey_deferring_client]
+        $rd auth precheck-log x
+        assert_equal {OK} [$rd read]
+        send_pipeline_in_one_read $rd {{blpop l 0} {get k}}
+        wait_for_blocked_clients_count 1
+        r acl setuser precheck-log -get
+        r lpush l x
+        assert_equal {l x} [$rd read]
+        assert_error {*NOPERM*} {$rd read}
+        set entry [lindex [r acl log 1] 0]
+        assert_equal {command get precheck-log} [list [dict get $entry reason] [dict get $entry object] [dict get $entry username]]
+        $rd close
+    }
+
+    test {Revoked key pattern applies to a queued command} {
+        r del l
+        r set app:1 a
+        r acl setuser precheck-keys on nopass +@all ~app:*
+        set rd [valkey_deferring_client]
+        $rd auth precheck-keys x
+        assert_equal {OK} [$rd read]
+        send_pipeline_in_one_read $rd {{blpop app:l 0} {get app:1}}
+        wait_for_blocked_clients_count 1
+        r acl setuser precheck-keys resetkeys ~other:*
+        r acl setuser precheck-keys ~app:l
+        r lpush app:l x
+        assert_equal {app:l x} [$rd read]
+        assert_error {*NOPERM*} {$rd read}
+        $rd close
+    }
+
+    test {Granted command applies to a queued command} {
+        r del l
+        r acl setuser precheck-grant on nopass +@all -get ~*
+        set rd [valkey_deferring_client]
+        $rd auth precheck-grant x
+        assert_equal {OK} [$rd read]
+        send_pipeline_in_one_read $rd {{blpop l 0} {get k}}
+        wait_for_blocked_clients_count 1
+        r acl setuser precheck-grant +get
+        r lpush l x
+        assert_equal {l x} [$rd read]
+        assert_equal {v} [$rd read]
+        $rd close
+    }
+
+    test {Same-connection ACL SETUSER applies to the rest of the pipeline} {
+        r acl setuser precheck-self on nopass +@all ~*
+        set rd [valkey_deferring_client]
+        $rd auth precheck-self x
+        assert_equal {OK} [$rd read]
+        send_pipeline_in_one_read $rd {{get k} {acl setuser precheck-self -get} {get k} {acl setuser precheck-self +get} {get k}}
+        assert_equal {v} [$rd read]
+        assert_equal {OK} [$rd read]
+        assert_error {*NOPERM*} {$rd read}
+        assert_equal {OK} [$rd read]
+        assert_equal {v} [$rd read]
+        $rd close
+    }
+
+    test {Key-pattern pipeline keeps reply order} {
+        r set app:1 a
+        r acl setuser precheck-order on nopass +@all ~app:*
+        set rd [valkey_deferring_client]
+        $rd auth precheck-order x
+        assert_equal {OK} [$rd read]
+        send_pipeline_in_one_read $rd {{set app:1 a} {get other} {get app:1} {nosuchcmd} {get app:1}}
+        assert_equal {OK} [$rd read]
+        assert_error {*NOPERM*} {$rd read}
+        assert_equal {a} [$rd read]
+        assert_error {*unknown command*} {$rd read}
+        assert_equal {a} [$rd read]
+        $rd close
+    }
+
+    test {Queued command after AUTH behind BLPOP is checked against the new user} {
+        r del l
+        r acl setuser precheck-limited2 on >pw +auth +ping
+        set rd [valkey_deferring_client]
+        send_pipeline_in_one_read $rd {{blpop l 0} {auth precheck-limited2 pw} {get k}}
+        wait_for_blocked_clients_count 1
+        r lpush l x
+        assert_equal {l x} [$rd read]
+        assert_equal {OK} [$rd read]
+        assert_error {*NOPERM*} {$rd read}
+        $rd close
+    }
+
+    test {Queued command after SELECT behind BLPOP is checked against the new db} {
+        r del l
+        r acl setuser precheck-db2 on nopass resetkeys ~* -@all +auth +select +blpop db=1,9 (+get ~* db=9)
+        set rd [valkey_deferring_client]
+        $rd auth precheck-db2 x
+        assert_equal {OK} [$rd read]
+        send_pipeline_in_one_read $rd {{blpop l 0} {get k} {select 1} {get k}}
+        wait_for_blocked_clients_count 1
+        r lpush l x
+        assert_equal {l x} [$rd read]
+        assert_equal {v} [$rd read]
+        assert_equal {OK} [$rd read]
+        assert_error {*NOPERM*} {$rd read}
+        $rd close
+    }
+
+    test {Queued user is deleted while its command waits} {
+        r del l
+        r acl setuser precheck-del on nopass +@all ~*
+        set rd [valkey_deferring_client]
+        $rd auth precheck-del x
+        assert_equal {OK} [$rd read]
+        send_pipeline_in_one_read $rd {{blpop l 0} {set deleted 1}}
+        wait_for_blocked_clients_count 1
+        r acl deluser precheck-del
+        r lpush l x
+        catch {$rd read}
+        assert_equal 0 [r exists deleted]
+        $rd close
+    }
+
+    test {CLIENT PAUSE WRITE holds a queued prechecked SET} {
+        r del l paused
+        set rd [valkey_deferring_client]
+        $rd client id
+        set rd_id [$rd read]
+        send_pipeline_in_one_read $rd {{blpop l 0} {set paused 1} {get k}}
+        wait_for_blocked_clients_count 1
+        r client pause 100000 write
+        r client unblock $rd_id
+        assert_equal {} [$rd read]
+        wait_for_condition 100 10 {
+            [string match {*flags=b*cmd=set*} [r client list id $rd_id]]
+        } else {
+            fail "SET was not postponed: [r client list id $rd_id]"
+        }
+        assert_equal 0 [r exists paused]
+        r client unpause
+        assert_equal {OK} [$rd read]
+        assert_equal {v} [$rd read]
+        $rd close
+    }
+
+    test {MULTI and SELECT pipelined behind BLPOP} {
+        r del l ma
+        set rd [valkey_deferring_client]
+        send_pipeline_in_one_read $rd {{multi} {set ma 1} {incr ma} {exec} {get ma}}
+        assert_equal {OK} [$rd read]
+        assert_equal {QUEUED} [$rd read]
+        assert_equal {QUEUED} [$rd read]
+        assert_equal {OK 2} [$rd read]
+        assert_equal {2} [$rd read]
+        send_pipeline_in_one_read $rd {{multi} {set ma 1} {badcmd} {exec}}
+        assert_equal {OK} [$rd read]
+        assert_equal {QUEUED} [$rd read]
+        assert_error {ERR*} {$rd read}
+        assert_error {EXECABORT*} {$rd read}
+        send_pipeline_in_one_read $rd {{blpop l 0} {multi} {set ma 5} {exec} {select 1} {set ma db1} {select 9} {get ma}}
+        wait_for_blocked_clients_count 1
+        r lpush l x
+        assert_equal {l x} [$rd read]
+        assert_equal {OK} [$rd read]
+        assert_equal {QUEUED} [$rd read]
+        assert_equal {OK} [$rd read]
+        assert_equal {OK} [$rd read]
+        assert_equal {OK} [$rd read]
+        assert_equal {OK} [$rd read]
+        assert_equal {5} [$rd read]
+        r select 1
+        assert_equal {db1} [r get ma]
+        r select 9
+        $rd close
+    }
+
+    test {Pipelined command after SELECT is checked against the new db} {
+        r acl setuser precheck-db on nopass resetkeys ~* -@all +auth +select db=1 (+get ~* db=9)
+        set rd [valkey_deferring_client]
+        $rd auth precheck-db x
+        assert_equal {OK} [$rd read]
+        send_pipeline_in_one_read $rd {{get k} {select 1} {get k}}
+        assert_equal {v} [$rd read]
+        assert_equal {OK} [$rd read]
+        assert_error {*NOPERM*} {$rd read}
+        $rd close
+    }
+}
+
+# Port of hazards.py scenario 1: AUTH in a pipeline on a connection that must
+# authenticate.
+start_server {config "minimal.conf" tags {"external:skip" "valgrind:skip"} overrides {io-threads 2 io-threads-always-active yes requirepass pw}} {
+    r auth pw
+    r set k v
+
+    proc send_pipeline_in_one_read {rd cmds} {
+        set buf {}
+        foreach cmd $cmds { append buf [format_command {*}$cmd] }
+        set server_pid [s process_id]
+        pause_process $server_pid
+        $rd write $buf
+        $rd flush
+        resume_process $server_pid
+    }
+
+    test {Pipelined AUTH then GET on an unauthenticated connection} {
+        set rd [valkey_deferring_client_by_addr [srv 0 host] [srv 0 port]]
+        send_pipeline_in_one_read $rd {{get k} {auth pw} {get k} {set k2 x}}
+        assert_error {NOAUTH*} {$rd read}
+        assert_equal {OK} [$rd read]
+        assert_equal {v} [$rd read]
+        assert_equal {OK} [$rd read]
+        $rd close
+
+        set rd [valkey_deferring_client_by_addr [srv 0 host] [srv 0 port]]
+        send_pipeline_in_one_read $rd {{auth wrong} {get k}}
+        assert_error {WRONGPASS*} {$rd read}
+        assert_error {NOAUTH*} {$rd read}
+        $rd close
+    }
+
+    test {Password required while an authenticated command waits} {
+        r del l
+        r acl setuser default on nopass
+        set rd [valkey_deferring_client_by_addr [srv 0 host] [srv 0 port]]
+        $rd ping
+        assert_equal {PONG} [$rd read]
+        r acl setuser precheck-auth on nopass +@all ~*
+        send_pipeline_in_one_read $rd {{blpop l 0} {auth precheck-auth x} {get k}}
+        wait_for_blocked_clients_count 1
+        r acl setuser precheck-auth -get
+        r lpush l x
+        assert_equal {l x} [$rd read]
+        assert_equal {OK} [$rd read]
+        assert_error {*NOPERM*} {$rd read}
+        r acl setuser default on >pw
+        $rd close
+    }
+}

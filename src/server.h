@@ -1500,6 +1500,15 @@ typedef struct client {
     int nread;                                    /* Number of bytes of the last read. */
     int read_flags;                               /* Client Read flags - used to communicate the client read state. */
     int slot;                                     /* The slot the client is executing against. Set to -1 if no slot is being used */
+    /* The session the IO thread prechecks the queued commands against, saved by the
+     * main thread before the read job, and the epoch of the ACL snapshot it used.
+     * See precheckCommandQueue(). */
+    struct {
+        uint64_t acl_epoch;
+        user *user;
+        int dbid;
+        int authenticated;
+    } precheck;
     listNode *mem_usage_bucket_node;
     clientMemUsageBucket *mem_usage_bucket;
     /* In updateClientMemoryUsage() we track the memory usage of
@@ -3121,6 +3130,8 @@ void dictVanillaFree(void *val);
 #define READ_FLAGS_PREFETCHED (1 << 21)
 #define READ_FLAGS_ERROR_INVALID_CRLF (1 << 22)
 #define READ_FLAGS_ERROR_NUL_IN_INLINE_PROTOCOL (1 << 23)
+/* An IO thread ran the NO_MULTI and ACL checks; see precheckCommandQueue(). */
+#define READ_FLAGS_PRECHECKED (1 << 24)
 
 /* Write flags for various write errors and states */
 #define WRITE_FLAGS_WRITE_ERROR (1 << 0)
@@ -3575,6 +3586,13 @@ int isMutuallyExclusiveChildType(int type);
 extern rax *Users;
 extern rax *Roles;
 extern user *DefaultUser;
+extern uint64_t acl_mutation_epoch;
+typedef struct aclSnapshot aclSnapshot;
+void ACLSnapshotPublish(void);
+aclSnapshot *ACLSnapshotPin(int tid);
+void ACLSnapshotUnpin(int tid);
+uint64_t ACLSnapshotEpoch(aclSnapshot *s);
+user *ACLSnapshotUser(aclSnapshot *s, user *live);
 void ACLInit(void);
 int ACLModuleHasCommandRules(const struct ValkeyModule *module, sds *rule_out);
 /* Return values for ACLCheckAllPerm(). */
@@ -3712,6 +3730,7 @@ int overMaxmemoryAfterAlloc(size_t moremem);
 uint64_t getCommandFlags(client *c);
 void prepareCommand(client *c);
 void prepareCommandQueue(client *c);
+void precheckCommandQueue(client *c);
 void unprepareCommand(client *c);
 int processCommand(client *c);
 int processPendingCommandAndInputBuffer(client *c);

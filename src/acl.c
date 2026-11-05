@@ -43,10 +43,11 @@
 rax *Users; /* Table mapping usernames to user structures. */
 rax *Roles; /* Table mapping role names to user structures (with USER_FLAG_ROLE). */
 
-user *DefaultUser; /* Global reference to the default user.
-                      Every new connection is associated to it, if no
-                      AUTH or HELLO is used to authenticate with a
-                      different user. */
+user *DefaultUser;               /* Global reference to the default user.
+                                    Every new connection is associated to it, if no
+                                    AUTH or HELLO is used to authenticate with a
+                                    different user. */
+uint64_t acl_mutation_epoch = 0; /* See ACLBeginMutation(). */
 
 list *UsersToLoad; /* This is a list of users found in the configuration file
                       that we'll need to load in the final stage of the server
@@ -504,6 +505,14 @@ static user *ACLCreateUser(const char *name, size_t namelen) {
     return u;
 }
 
+/* Call before changing a user or role, or which user a client has. IO threads
+ * check commands against a copy of the users (see ACLSnapshotPublish()), never
+ * the live ones, so nothing waits for them. Commands they prechecked at an
+ * older epoch are checked again in full on the main thread. */
+static void ACLBeginMutation(void) {
+    acl_mutation_epoch++;
+}
+
 /* This function should be called when we need an unlinked "fake" user
  * we can use in order to validate ACL rules or for other similar reasons.
  * The user will not get linked to the Users radix tree. The returned
@@ -551,6 +560,7 @@ static void ACLCopyRoles(user *dst, user *src) {
 /* Release the memory used by the user structure. Note that this function
  * will not remove the user from the Users global radix tree. */
 void ACLFreeUser(user *u) {
+    ACLBeginMutation();
     ACLUserClearRoles(u);
     sdsfree(u->name);
     if (u->acl_string) {
@@ -575,6 +585,7 @@ static void ACLFreeUserVoid(void *u) {
  * connections in order to kill all the pending ones that
  * are authenticated with such user. */
 void ACLFreeUserAndKillClients(user *u) {
+    ACLBeginMutation();
     listIter li;
     listNode *ln;
     listRewind(server.clients, &li);
@@ -600,6 +611,7 @@ void ACLFreeUserAndKillClients(user *u) {
  * user 'dst' so that at the end of the process they'll have exactly the
  * same rules (but the names will continue to be the original ones). */
 static void ACLCopyUser(user *dst, user *src) {
+    ACLBeginMutation();
     if (dst->passwords) listRelease(dst->passwords);
     listRelease(dst->selectors);
     dst->passwords = src->passwords ? listDup(src->passwords) : NULL;
@@ -621,6 +633,118 @@ static void ACLCopyUser(user *dst, user *src) {
     } else {
         dst->roles = NULL;
     }
+}
+
+/* =============================================================================
+ * Copy-on-write snapshot of the users, for the precheck in IO threads
+ * ==========================================================================*/
+
+/* IO threads check commands against private deep copies of the users, so ACL
+ * changes never wait for them. The main thread builds a new snapshot when
+ * acl_mutation_epoch moved, at most once per event loop iteration. An IO
+ * thread pins the current one for a read job with a hazard pointer, and the
+ * main thread frees a retired snapshot once no IO thread holds it. Users that
+ * hold roles are left out, since their copies would point at the live roles,
+ * and so are module users, which are not in Users. Their commands get the
+ * full check on the main thread. */
+#define ACL_SNAPSHOT_MAX_USERS 64
+
+struct aclSnapshot {
+    uint64_t epoch; /* The acl_mutation_epoch the copies reflect. */
+    int nusers;
+    user *live[ACL_SNAPSHOT_MAX_USERS]; /* Identity only, never dereferenced off the main thread. */
+    user *copy[ACL_SNAPSHOT_MAX_USERS]; /* Read-only once published. */
+    struct aclSnapshot *next;           /* Retired list. */
+};
+
+static _Atomic(aclSnapshot *) acl_snapshot_current;
+/* One cache line per IO thread: each writes its slot twice per read job. */
+static struct {
+    _Atomic(aclSnapshot *) s;
+    char pad[CACHE_LINE_SIZE - sizeof(aclSnapshot *)];
+} acl_snapshot_hazard[IO_THREADS_MAX_NUM] __attribute__((aligned(CACHE_LINE_SIZE)));
+static aclSnapshot *acl_snapshot_retired;
+
+static aclSnapshot *ACLSnapshotBuild(void) {
+    uint64_t epoch = acl_mutation_epoch; /* The copies below bump it. */
+    aclSnapshot *s = zcalloc(sizeof(*s));
+    raxIterator ri;
+    raxStart(&ri, Users);
+    raxSeek(&ri, "^", NULL, 0);
+    while (raxNext(&ri) && s->nusers < ACL_SNAPSHOT_MAX_USERS) {
+        user *u = ri.data;
+        if (u->roles && listLength(u->roles)) continue;
+        s->live[s->nusers++] = u;
+    }
+    raxStop(&ri);
+    /* Copy after the walk: ACLCreateUnlinkedUser() changes Users. */
+    for (int i = 0; i < s->nusers; i++) {
+        s->copy[i] = ACLCreateUnlinkedUser();
+        ACLCopyUser(s->copy[i], s->live[i]);
+    }
+    acl_mutation_epoch = epoch;
+    s->epoch = epoch;
+    return s;
+}
+
+static void ACLSnapshotFree(aclSnapshot *s) {
+    uint64_t epoch = acl_mutation_epoch;
+    for (int i = 0; i < s->nusers; i++) ACLFreeUser(s->copy[i]);
+    acl_mutation_epoch = epoch;
+    zfree(s);
+}
+
+/* Main thread, once per event loop iteration. */
+void ACLSnapshotPublish(void) {
+    if (server.io_threads_num <= 1) return;
+    aclSnapshot *cur = atomic_load(&acl_snapshot_current);
+    if (!cur || cur->epoch != acl_mutation_epoch) {
+        atomic_store(&acl_snapshot_current, ACLSnapshotBuild());
+        if (cur) {
+            cur->next = acl_snapshot_retired;
+            acl_snapshot_retired = cur;
+        }
+    }
+
+    aclSnapshot **pp = &acl_snapshot_retired;
+    while (*pp) {
+        aclSnapshot *s = *pp;
+        int held = 0;
+        for (int i = 1; i < server.io_threads_num && !held; i++) held = atomic_load(&acl_snapshot_hazard[i].s) == s;
+        if (held) {
+            pp = &s->next;
+        } else {
+            *pp = s->next;
+            ACLSnapshotFree(s);
+        }
+    }
+}
+
+/* IO thread 'tid': pin the current snapshot until ACLSnapshotUnpin(). The
+ * load after the store makes sure the main thread either sees the hazard
+ * pointer or has not retired the snapshot yet. */
+aclSnapshot *ACLSnapshotPin(int tid) {
+    aclSnapshot *s;
+    do {
+        s = atomic_load(&acl_snapshot_current);
+        atomic_store(&acl_snapshot_hazard[tid].s, s);
+    } while (s != atomic_load(&acl_snapshot_current));
+    return s;
+}
+
+void ACLSnapshotUnpin(int tid) {
+    atomic_store(&acl_snapshot_hazard[tid].s, NULL);
+}
+
+uint64_t ACLSnapshotEpoch(aclSnapshot *s) {
+    return s->epoch;
+}
+
+/* The copy of the live user 'live' in 's', or NULL if it has none. */
+user *ACLSnapshotUser(aclSnapshot *s, user *live) {
+    for (int i = 0; i < s->nusers; i++)
+        if (s->live[i] == live) return s->copy[i];
+    return NULL;
 }
 
 /* =============================================================================
@@ -712,6 +836,7 @@ static int ACLSetUserRoles(user *u, const char *spec, size_t speclen) {
  * Returns NULL on success, or an SDS error string on failure. */
 static sds ACLStringSetRole(user *r, sds rolename, sds *argv, int argc) {
     sds error = NULL;
+    ACLBeginMutation(); /* Replaces r->selectors below. */
 
     /* Create a temporary role-flagged user to validate all changes */
     user *tempr = zmalloc(sizeof(*tempr));
@@ -1004,6 +1129,7 @@ static void ACLRecomputeCommandBitsFromCommandRulesInTable(rax *table) {
  * It uses the 'command_rules', a string representation of the ordered categories and commands,
  * to recompute the command bits. */
 void ACLRecomputeCommandBitsFromCommandRulesAllUsers(void) {
+    ACLBeginMutation();
     ACLRecomputeCommandBitsFromCommandRulesInTable(Users);
     ACLRecomputeCommandBitsFromCommandRulesInTable(Roles);
 }
@@ -1759,6 +1885,7 @@ static int ACLSetSelector(aclSelector *selector, const char *op, size_t oplen) {
  * ERANGE: A database ID provided with the db= rule is out of the supported range.
  */
 int ACLSetUser(user *u, const char *op, ssize_t oplen) {
+    ACLBeginMutation();
     /* as we are changing the ACL, the old generated string is now invalid */
     if (u->acl_string) {
         decrRefCount(u->acl_string);
@@ -3091,6 +3218,9 @@ static void ACLRemapSurvivingRoleMembers(rax *old_roles) {
 static sds ACLLoadFromFile(const char *filename) {
     FILE *fp;
     char buf[1024];
+
+    /* Replaces the users and roles and reassigns c->user of every client. */
+    ACLBeginMutation();
 
     /* Open the ACL file. */
     if ((fp = fopen(filename, "r")) == NULL) {

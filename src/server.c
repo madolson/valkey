@@ -1946,6 +1946,9 @@ static bool processPendingReplStreamDecode(void) {
 void beforeSleep(struct aeEventLoop *eventLoop) {
     UNUSED(eventLoop);
 
+    /* Give the IO threads the ACL users as of now, if they changed. */
+    ACLSnapshotPublish();
+
     /* When I/O threads are enabled and there are pending I/O jobs, the poll is offloaded to one of the I/O threads. */
     trySendPollJobToIOThreads();
 
@@ -4632,6 +4635,51 @@ void prepareCommandQueue(client *c) {
     }
 }
 
+/* Whether processCommand() would pass the auth, NO_MULTI and ACL checks for a
+ * prepared command, given the client's current session. Module commands are
+ * never checked here: their key extraction is module code (valkey#5054). */
+static int precheckCommand(client *c, user *u, robj **argv, int argc, int read_flags, struct serverCommand *cmd) {
+    if (!(read_flags & READ_FLAGS_PARSING_COMPLETED) || argc == 0 || !cmd) return 0;
+    if (read_flags & READ_FLAGS_BAD_ARITY) return 0;
+    if (cmd->flags & (CMD_MODULE | CMD_PROTECTED)) return 0;
+    if ((c->read_flags & READ_FLAGS_AUTH_REQUIRED) && !(cmd->flags & CMD_NO_AUTH)) return 0;
+    int idx;
+    return ACLCheckAllUserCommandPerm(u, cmd, argv, argc, c->precheck.dbid, &idx) == ACL_OK;
+}
+
+/* Called by an IO thread after prepareCommandQueue(). Runs the checks that
+ * depend only on the command, the client's session and the ACL users, and
+ * flags the commands that pass with READ_FLAGS_PRECHECKED. Of the client it
+ * reads only what the read job owns and c->precheck, which the main thread
+ * saved before the job and does not write during it: the main thread can
+ * change c->user and c->flag of a client in a read job (ACL LOAD, ACL
+ * DELUSER, module auth revocation). The users come from the pinned ACL
+ * snapshot. processCommand() trusts the flag only while acl_mutation_epoch
+ * equals the snapshot's epoch and the session still matches c->precheck. */
+void precheckCommandQueue(client *c) {
+    if (!c->precheck.user) return;
+    int tid = getCurTid();
+    aclSnapshot *s = ACLSnapshotPin(tid);
+    user *u = s ? ACLSnapshotUser(s, c->precheck.user) : NULL;
+    if (u) {
+        c->precheck.acl_epoch = ACLSnapshotEpoch(s);
+        if (precheckCommand(c, u, c->argv, c->argc, c->read_flags, c->parsed_cmd)) c->read_flags |= READ_FLAGS_PRECHECKED;
+        for (int i = c->cmd_queue.off; i < c->cmd_queue.len; i++) {
+            parsedCommand *p = &c->cmd_queue.cmds[i];
+            if (precheckCommand(c, u, p->argv, p->argc, p->read_flags, p->cmd)) p->read_flags |= READ_FLAGS_PRECHECKED;
+        }
+    }
+    ACLSnapshotUnpin(tid);
+}
+
+/* Main thread: whether the IO thread's precheck of the current command still
+ * holds, so processCommand() can skip the checks it covers. */
+static int precheckValid(client *c) {
+    return (c->read_flags & READ_FLAGS_PRECHECKED) && c->precheck.acl_epoch == acl_mutation_epoch &&
+           c->precheck.user == c->user && c->precheck.dbid == c->db->id &&
+           c->precheck.authenticated == c->flag.authenticated && !c->flag.multi && !moduleHasCommandFilters();
+}
+
 /* Undo prepareCommand(), to allow prepareCommand() again after applying command filters. */
 void unprepareCommand(client *c) {
     c->parsed_cmd = NULL;
@@ -4641,6 +4689,9 @@ void unprepareCommand(client *c) {
                        READ_FLAGS_NO_KEYS);
     c->slot = -1;
 }
+
+static int processCommandChecks(client *c);
+static int processCommandExecute(client *c, uint64_t cmd_flags);
 
 /* If this function gets called we already read a whole
  * command, arguments are in the client argv/argc fields.
@@ -4678,11 +4729,18 @@ int processCommand(client *c) {
         return C_OK;
     }
 
+    /* An IO thread already ran the auth, lookup, arity, protected, NO_MULTI
+     * and ACL checks and they still hold. */
+    int prechecked = !client_reprocessing_command && precheckValid(c);
+
     /* Now lookup the command and check ASAP about trivial error conditions
      * such as wrong arity, bad command name and so forth.
      * In case we are reprocessing a command after it was blocked,
      * we do not have to repeat the same checks */
-    if (!client_reprocessing_command) {
+    if (prechecked) {
+        c->cmd = c->lastcmd = c->realcmd = c->parsed_cmd;
+        c->flag.buffered_reply = 0;
+    } else if (!client_reprocessing_command) {
         struct serverCommand *cmd = c->parsed_cmd;
         if (!cmd) {
             /* Handle possible security attacks. */
@@ -4740,28 +4798,20 @@ int processCommand(client *c) {
 
     uint64_t cmd_flags = getCommandFlags(c);
 
-    int is_exec = (c->mstate && c->cmd->proc == execCommand);
-    int ms_flags = is_exec ? c->mstate->cmd_flags : 0;
-    int ms_inv_flags = is_exec ? c->mstate->cmd_inv_flags : 0;
-    int combined_flags = cmd_flags | ms_flags;
-    int combined_inv_flags = (~cmd_flags | ms_inv_flags);
+    if (!prechecked && !processCommandChecks(c)) return C_OK;
+    return processCommandExecute(c, cmd_flags);
+}
 
-    int is_read_command = (combined_flags & CMD_READONLY);
-    int is_write_command = (combined_flags & CMD_WRITE);
-    int is_denyoom_command = (combined_flags & CMD_DENYOOM);
-    int is_denystale_command = (combined_inv_flags & CMD_STALE);
-    int is_denyloading_command = (combined_inv_flags & CMD_LOADING);
-    int is_may_replicate_command = (combined_flags & (CMD_WRITE | CMD_MAY_REPLICATE));
-    int is_deny_async_loading_command = (combined_flags & CMD_NO_ASYNC_LOADING);
-
-    const int obey_client = mustObeyClient(c);
-
+/* The checks processCommand() runs after the command lookup that depend only
+ * on the command, its arguments, the client's session and the ACL users:
+ * NO_MULTI and ACL. Returns 0 if the command was rejected. */
+static int processCommandChecks(client *c) {
     if (c->flag.multi && c->cmd->flags & CMD_NO_MULTI) {
         sds nomulti_err =
             sdscatprintf(sdsempty(), "Command '%s' not allowed inside a transaction", c->cmd->fullname);
         sdsmapchars(nomulti_err, "\r\n", "  ", 2);
         rejectCommandSds(c, nomulti_err, 1);
-        return C_OK;
+        return 0;
     }
 
     /* Check if the user can run this command according to the current
@@ -4782,8 +4832,31 @@ int processCommand(client *c) {
         default: acl_subevent = VALKEYMODULE_ACL_LOG_CMD; break;
         }
         moduleFireCommandACLRejectedEvent(c, acl_subevent, acl_errpos);
-        return C_OK;
+        return 0;
     }
+
+    return 1;
+}
+
+/* The rest of processCommand(): the checks that read live server state
+ * (cluster routing, redirects, OOM, disk errors, replicas, loading, busy
+ * scripts, pause), then MULTI queueing or call(). */
+static int processCommandExecute(client *c, uint64_t cmd_flags) {
+    int is_exec = (c->mstate && c->cmd->proc == execCommand);
+    int ms_flags = is_exec ? c->mstate->cmd_flags : 0;
+    int ms_inv_flags = is_exec ? c->mstate->cmd_inv_flags : 0;
+    int combined_flags = cmd_flags | ms_flags;
+    int combined_inv_flags = (~cmd_flags | ms_inv_flags);
+
+    int is_read_command = (combined_flags & CMD_READONLY);
+    int is_write_command = (combined_flags & CMD_WRITE);
+    int is_denyoom_command = (combined_flags & CMD_DENYOOM);
+    int is_denystale_command = (combined_inv_flags & CMD_STALE);
+    int is_denyloading_command = (combined_inv_flags & CMD_LOADING);
+    int is_may_replicate_command = (combined_flags & (CMD_WRITE | CMD_MAY_REPLICATE));
+    int is_deny_async_loading_command = (combined_flags & CMD_NO_ASYNC_LOADING);
+
+    const int obey_client = mustObeyClient(c);
 
     /* If cluster is enabled perform the cluster redirection here.
      * However we don't perform the redirection if:
