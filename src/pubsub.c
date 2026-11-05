@@ -37,7 +37,7 @@ typedef struct pubsubtype {
     int shard;
     hashtable *(*clientPubSubChannels)(client *);
     int (*subscriptionCount)(client *);
-    kvstore **serverPubSubChannels;
+    kvstore *(*serverPubSubChannels)(void);
     robj **subscribeMsg;
     robj **unsubscribeMsg;
     robj **messageBulk;
@@ -70,6 +70,14 @@ hashtable *getClientPubSubShardChannels(client *c);
  */
 void channelList(client *c, sds pat, kvstore *pubsub_channels);
 
+static kvstore *getServerPubSubChannels(void) {
+    return server.pubsub_channels;
+}
+
+static kvstore *getServerPubSubShardChannels(void) {
+    return inst->pubsubshard_channels;
+}
+
 /*
  * Pub/Sub type for global channels.
  */
@@ -77,7 +85,7 @@ pubsubtype pubSubType = {
     .shard = 0,
     .clientPubSubChannels = getClientPubSubChannels,
     .subscriptionCount = clientSubscriptionsCount,
-    .serverPubSubChannels = &server.pubsub_channels,
+    .serverPubSubChannels = getServerPubSubChannels,
     .subscribeMsg = &shared.subscribebulk,
     .unsubscribeMsg = &shared.unsubscribebulk,
     .messageBulk = &shared.messagebulk,
@@ -90,7 +98,7 @@ pubsubtype pubSubShardType = {
     .shard = 1,
     .clientPubSubChannels = getClientPubSubShardChannels,
     .subscriptionCount = clientShardSubscriptionsCount,
-    .serverPubSubChannels = &server.pubsubshard_channels,
+    .serverPubSubChannels = getServerPubSubShardChannels,
     .subscribeMsg = &shared.ssubscribebulk,
     .unsubscribeMsg = &shared.sunsubscribebulk,
     .messageBulk = &shared.smessagebulk,
@@ -214,7 +222,7 @@ int serverPubsubSubscriptionCount(void) {
 
 /* Return the number of pubsub shard level channels is handled. */
 int serverPubsubShardSubscriptionCount(void) {
-    return kvstoreSize(server.pubsubshard_channels);
+    return kvstoreSize(inst->pubsubshard_channels);
 }
 
 /* Return the number of channels + patterns a client is subscribed to. */
@@ -307,7 +315,7 @@ int pubsubSubscribeChannel(client *c, robj *channel, pubsubtype type) {
 
         hashtablePosition pos;
         void *existing;
-        if (!kvstoreHashtableFindPositionForInsert(*type.serverPubSubChannels, slot, channel, &pos, &existing)) {
+        if (!kvstoreHashtableFindPositionForInsert(type.serverPubSubChannels(), slot, channel, &pos, &existing)) {
             clients = existing;
             channel = *(robj **)hashtableMetadata(clients);
         } else {
@@ -316,7 +324,7 @@ int pubsubSubscribeChannel(client *c, robj *channel, pubsubtype type) {
             *(robj **)hashtableMetadata(clients) = channel;
             incrRefCount(channel);
             /* Insert this dict in the kvstore at the position returned above. */
-            kvstoreHashtableInsertAtPosition(*type.serverPubSubChannels, slot, clients, &pos);
+            kvstoreHashtableInsertAtPosition(type.serverPubSubChannels(), slot, clients, &pos);
         }
 
         serverAssert(hashtableAdd(clients, c));
@@ -349,7 +357,7 @@ int pubsubUnsubscribeChannel(client *c, robj *channel, int notify, pubsubtype ty
             slot = keyHashSlot(objectGetVal(channel), (int)sdslen(objectGetVal(channel)));
         }
         void *found = NULL;
-        kvstoreHashtableFind(*type.serverPubSubChannels, slot, channel, &found);
+        kvstoreHashtableFind(type.serverPubSubChannels(), slot, channel, &found);
         serverAssertWithInfo(c, NULL, found);
         clients = found;
         serverAssertWithInfo(c, NULL, hashtableDelete(clients, c));
@@ -357,7 +365,7 @@ int pubsubUnsubscribeChannel(client *c, robj *channel, int notify, pubsubtype ty
             /* Free the dict and associated hash entry at all if this was
              * the latest client, so that it will be possible to abuse
              * PUBSUB creating millions of channels. */
-            kvstoreHashtableDelete(*type.serverPubSubChannels, slot, channel);
+            kvstoreHashtableDelete(type.serverPubSubChannels(), slot, channel);
         }
         c->pubsub_data->pubsub_object_mem -= getStringObjectMemory(popped);
         decrRefCount(popped);
@@ -372,9 +380,9 @@ int pubsubUnsubscribeChannel(client *c, robj *channel, int notify, pubsubtype ty
 
 /* Unsubscribe all shard channels in a slot. */
 void pubsubShardUnsubscribeAllChannelsInSlot(unsigned int slot) {
-    if (!kvstoreHashtableSize(server.pubsubshard_channels, slot)) return;
+    if (!kvstoreHashtableSize(inst->pubsubshard_channels, slot)) return;
 
-    kvstoreHashtableIterator *kvs_di = kvstoreGetHashtableIterator(server.pubsubshard_channels, slot, HASHTABLE_ITER_SAFE);
+    kvstoreHashtableIterator *kvs_di = kvstoreGetHashtableIterator(inst->pubsubshard_channels, slot, HASHTABLE_ITER_SAFE);
     void *element;
     while (kvstoreHashtableIteratorNext(kvs_di, &element)) {
         hashtable *clients = element;
@@ -396,7 +404,7 @@ void pubsubShardUnsubscribeAllChannelsInSlot(unsigned int slot) {
             c->pubsub_data->pubsub_object_mem -= getStringObjectMemory(channel);
         }
         hashtableCleanupIterator(&client_iter);
-        kvstoreHashtableDelete(server.pubsubshard_channels, slot, channel);
+        kvstoreHashtableDelete(inst->pubsubshard_channels, slot, channel);
     }
     kvstoreReleaseHashtableIterator(kvs_di);
 }
@@ -531,7 +539,7 @@ int pubsubPublishMessageInternal(robj *channel, robj *message, pubsubtype type) 
     if (server.cluster_enabled && type.shard) {
         slot = keyHashSlot(objectGetVal(channel), sdslen(objectGetVal(channel)));
     }
-    if (kvstoreHashtableFind(*type.serverPubSubChannels, (slot == -1) ? 0 : slot, channel, &element)) {
+    if (kvstoreHashtableFind(type.serverPubSubChannels(), (slot == -1) ? 0 : slot, channel, &element)) {
         hashtable *clients = element;
         hashtableIterator iter;
         hashtableInitIterator(&iter, clients, 0);
@@ -720,7 +728,7 @@ void pubsubCommand(client *c) {
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "shardchannels") && (c->argc == 2 || c->argc == 3)) {
         /* PUBSUB SHARDCHANNELS */
         sds pat = (c->argc == 2) ? NULL : objectGetVal(c->argv[2]);
-        channelList(c, pat, server.pubsubshard_channels);
+        channelList(c, pat, inst->pubsubshard_channels);
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "shardnumsub") && c->argc >= 2) {
         /* PUBSUB SHARDNUMSUB [ShardChannel_1 ... ShardChannel_N] */
         int j;
@@ -729,7 +737,7 @@ void pubsubCommand(client *c) {
             sds key = objectGetVal(c->argv[j]);
             unsigned int slot = server.cluster_enabled ? keyHashSlot(key, (int)sdslen(key)) : 0;
             void *found = NULL;
-            kvstoreHashtableFind(server.pubsubshard_channels, slot, c->argv[j], &found);
+            kvstoreHashtableFind(inst->pubsubshard_channels, slot, c->argv[j], &found);
             hashtable *clients = found;
             addReplyBulk(c, c->argv[j]);
             addReplyLongLong(c, clients ? hashtableSize(clients) : 0);
@@ -824,5 +832,5 @@ size_t pubsubMemOverhead(client *c) {
 
 int pubsubTotalSubscriptions(void) {
     return dictSize(server.pubsub_patterns) + kvstoreSize(server.pubsub_channels) +
-           kvstoreSize(server.pubsubshard_channels);
+           kvstoreSize(inst->pubsubshard_channels);
 }

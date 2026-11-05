@@ -47,7 +47,7 @@ class ClusterIOOffloadTest : public ::testing::Test {
         owned_conns_count = 0;
         owned_links_count = 0;
         memset(&server, 0, sizeof(server));
-        server.el = aeCreateEventLoop(1024);
+        inst->el = aeCreateEventLoop(1024);
         server.io_threads_num = 2;
         server.active_io_threads_num = 2;
         testOnlyInitIOThreadQueues();
@@ -75,9 +75,9 @@ class ClusterIOOffloadTest : public ::testing::Test {
          * forever and stall processIOThreadsResponses(). */
         EXPECT_EQ(testOnlyGetClusterIOPendingResponses(), 0u) << "leaked a cluster I/O pending response";
         testOnlyFreeIOThreadQueues();
-        if (server.el) {
-            aeDeleteEventLoop(server.el);
-            server.el = NULL;
+        if (inst->el) {
+            aeDeleteEventLoop(inst->el);
+            inst->el = NULL;
         }
     }
 

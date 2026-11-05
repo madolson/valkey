@@ -146,7 +146,7 @@ int sortCompare(const void *s1, const void *s2) {
     const serverSortObject *so1 = s1, *so2 = s2;
     int cmp;
 
-    if (!server.sort_alpha) {
+    if (!inst->sort_alpha) {
         /* Numeric sorting. Here it's trivial as we precomputed scores */
         if (so1->u.score > so2->u.score) {
             cmp = 1;
@@ -160,7 +160,7 @@ int sortCompare(const void *s1, const void *s2) {
         }
     } else {
         /* Alphanumeric sorting */
-        if (server.sort_bypattern) {
+        if (inst->sort_bypattern) {
             if (!so1->u.cmpobj || !so2->u.cmpobj) {
                 /* At least one compare object is NULL */
                 if (so1->u.cmpobj == so2->u.cmpobj)
@@ -171,7 +171,7 @@ int sortCompare(const void *s1, const void *s2) {
                     cmp = 1;
             } else {
                 /* We have both the objects, compare them. */
-                if (server.sort_store) {
+                if (inst->sort_store) {
                     cmp = compareStringObjects(so1->u.cmpobj, so2->u.cmpobj);
                 } else {
                     /* Here we can use strcoll() directly as we are sure that
@@ -181,14 +181,14 @@ int sortCompare(const void *s1, const void *s2) {
             }
         } else {
             /* Compare elements directly. */
-            if (server.sort_store) {
+            if (inst->sort_store) {
                 cmp = compareStringObjects(so1->obj, so2->obj);
             } else {
                 cmp = collateStringObjects(so1->obj, so2->obj);
             }
         }
     }
-    return server.sort_desc ? -cmp : cmp;
+    return inst->sort_desc ? -cmp : cmp;
 }
 
 /* The SORT command is the most complex command in Valkey. Warning: this code
@@ -507,10 +507,10 @@ void sortCommandGeneric(client *c, int readonly) {
             }
         }
 
-        server.sort_desc = desc;
-        server.sort_alpha = alpha;
-        server.sort_bypattern = sortby ? 1 : 0;
-        server.sort_store = storekey ? 1 : 0;
+        inst->sort_desc = desc;
+        inst->sort_alpha = alpha;
+        inst->sort_bypattern = sortby ? 1 : 0;
+        inst->sort_store = storekey ? 1 : 0;
         /* If the source keys are empty, we will have a vector length of zero,
          * so no need to sort. */
         if (vectorlen != 0) {
@@ -592,11 +592,11 @@ void sortCommandGeneric(client *c, int readonly) {
              * freeing it below. */
             sobj = NULL;
             notifyKeyspaceEvent(NOTIFY_LIST, "sortstore", storekey, c->db->id);
-            server.dirty += outputlen;
+            inst->dirty += outputlen;
         } else if (dbDelete(c->db, storekey)) {
             signalModifiedKey(c, c->db, storekey);
             notifyKeyspaceEvent(NOTIFY_GENERIC, "del", storekey, c->db->id);
-            server.dirty++;
+            inst->dirty++;
         }
         if (sobj != NULL) decrRefCount(sobj);
         addReplyLongLong(c, outputlen);

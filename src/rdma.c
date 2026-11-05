@@ -934,11 +934,11 @@ static void connRdmaAcceptHandler(aeEventLoop *el, int fd, void *privdata, int m
 static int connRdmaSetRwHandler(connection *conn) {
     /* IB channel only has POLLIN event */
     if (conn->read_handler || conn->write_handler) {
-        if (aeCreateFileEvent(server.el, conn->fd, AE_READABLE, conn->type->ae_handler, conn) == AE_ERR) {
+        if (aeCreateFileEvent(inst->el, conn->fd, AE_READABLE, conn->type->ae_handler, conn) == AE_ERR) {
             return C_ERR;
         }
     } else {
-        aeDeleteFileEvent(server.el, conn->fd, AE_READABLE);
+        aeDeleteFileEvent(inst->el, conn->fd, AE_READABLE);
     }
 
     return C_OK;
@@ -1210,7 +1210,7 @@ static int connRdmaConnect(connection *conn,
 
     cm_id = rdma_conn->cm_id;
     ctx = cm_id->context;
-    if (aeCreateFileEvent(server.el, ctx->cm_channel->fd, AE_READABLE, rdmaCMeventHandler, conn) == AE_ERR) {
+    if (aeCreateFileEvent(inst->el, ctx->cm_channel->fd, AE_READABLE, rdmaCMeventHandler, conn) == AE_ERR) {
         return C_ERR;
     }
 
@@ -1231,7 +1231,7 @@ static int connRdmaBlockingConnect(connection *conn, const char *addr, int port,
 
     cm_id = rdma_conn->cm_id;
     ctx = cm_id->context;
-    if (aeCreateFileEvent(server.el, ctx->cm_channel->fd, AE_READABLE, rdmaCMeventHandler, conn) == AE_ERR) {
+    if (aeCreateFileEvent(inst->el, ctx->cm_channel->fd, AE_READABLE, rdmaCMeventHandler, conn) == AE_ERR) {
         return C_ERR;
     }
 
@@ -1260,7 +1260,7 @@ static void connRdmaClose(connection *conn) {
     }
 
     if (conn->fd != -1) {
-        aeDeleteFileEvent(server.el, conn->fd, AE_READABLE);
+        aeDeleteFileEvent(inst->el, conn->fd, AE_READABLE);
         conn->fd = -1;
     }
 
@@ -1277,7 +1277,7 @@ static void connRdmaClose(connection *conn) {
     }
 
     ctx = cm_id->context;
-    rdmaDelKeepalive(server.el, ctx);
+    rdmaDelKeepalive(inst->el, ctx);
     rdma_disconnect(cm_id);
 
     /* poll all CQ before close */
@@ -1289,7 +1289,7 @@ static void connRdmaClose(connection *conn) {
 
     rdma_destroy_id(cm_id);
     if (ctx->cm_channel) {
-        aeDeleteFileEvent(server.el, ctx->cm_channel->fd, AE_READABLE);
+        aeDeleteFileEvent(inst->el, ctx->cm_channel->fd, AE_READABLE);
         rdma_destroy_event_channel(ctx->cm_channel);
     }
 
@@ -1682,7 +1682,7 @@ static void connRdmaCloseListener(connListener *listener) {
     for (int i = 0; i < listener->count; i++) {
         if (listener->fd[i] == -1) continue;
 
-        aeDeleteFileEvent(server.el, listener->fd[i], AE_READABLE);
+        aeDeleteFileEvent(inst->el, listener->fd[i], AE_READABLE);
         listener->fd[i] = -1;
         struct rdma_listener *rdma_listener = &rdma_listeners[i];
         rdma_destroy_id(rdma_listener->cm_id);

@@ -291,7 +291,7 @@ void restoreCommand(client *c) {
             rewriteClientCommandVector(c, 2, aux, key);
             signalModifiedKey(c, c->db, key);
             notifyKeyspaceEvent(NOTIFY_GENERIC, "del", key, c->db->id);
-            server.dirty++;
+            inst->dirty++;
         }
         decrRefCount(obj);
         addReply(c, shared.ok);
@@ -314,7 +314,7 @@ void restoreCommand(client *c) {
     signalModifiedKey(c, c->db, key);
     notifyKeyspaceEvent(NOTIFY_GENERIC, "restore", key, c->db->id);
     addReply(c, shared.ok);
-    server.dirty++;
+    inst->dirty++;
 }
 /* MIGRATE socket cache implementation.
  *
@@ -351,7 +351,7 @@ migrateCachedSocket *migrateGetSocket(client *c, robj *host, robj *port, long ti
     name = sdscatlen(name, objectGetVal(host), sdslen(objectGetVal(host)));
     name = sdscatlen(name, ":", 1);
     name = sdscatlen(name, objectGetVal(port), sdslen(objectGetVal(port)));
-    cs = dictFetchValue(server.migrate_cached_sockets, name);
+    cs = dictFetchValue(inst->migrate_cached_sockets, name);
     if (cs) {
         sdsfree(name);
         cs->last_use_time = server.unixtime;
@@ -359,13 +359,13 @@ migrateCachedSocket *migrateGetSocket(client *c, robj *host, robj *port, long ti
     }
 
     /* No cached socket, create one. */
-    if (dictSize(server.migrate_cached_sockets) == MIGRATE_SOCKET_CACHE_ITEMS) {
+    if (dictSize(inst->migrate_cached_sockets) == MIGRATE_SOCKET_CACHE_ITEMS) {
         /* Too many items, drop one at random. */
-        dictEntry *de = dictGetRandomKey(server.migrate_cached_sockets);
+        dictEntry *de = dictGetRandomKey(inst->migrate_cached_sockets);
         cs = dictGetVal(de);
         connClose(cs->conn);
         zfree(cs);
-        dictDelete(server.migrate_cached_sockets, dictGetKey(de));
+        dictDelete(inst->migrate_cached_sockets, dictGetKey(de));
     }
 
     /* Create the connection and tag as high-priority so key/slot migration
@@ -385,7 +385,7 @@ migrateCachedSocket *migrateGetSocket(client *c, robj *host, robj *port, long ti
 
     cs->last_dbid = -1;
     cs->last_use_time = server.unixtime;
-    dictAdd(server.migrate_cached_sockets, name, cs);
+    dictAdd(inst->migrate_cached_sockets, name, cs);
     return cs;
 }
 
@@ -397,7 +397,7 @@ void migrateCloseSocket(robj *host, robj *port) {
     name = sdscatlen(name, objectGetVal(host), sdslen(objectGetVal(host)));
     name = sdscatlen(name, ":", 1);
     name = sdscatlen(name, objectGetVal(port), sdslen(objectGetVal(port)));
-    cs = dictFetchValue(server.migrate_cached_sockets, name);
+    cs = dictFetchValue(inst->migrate_cached_sockets, name);
     if (!cs) {
         sdsfree(name);
         return;
@@ -405,12 +405,12 @@ void migrateCloseSocket(robj *host, robj *port) {
 
     connClose(cs->conn);
     zfree(cs);
-    dictDelete(server.migrate_cached_sockets, name);
+    dictDelete(inst->migrate_cached_sockets, name);
     sdsfree(name);
 }
 
 void migrateCloseTimedOutSockets(void) {
-    dictIterator *di = dictGetSafeIterator(server.migrate_cached_sockets);
+    dictIterator *di = dictGetSafeIterator(inst->migrate_cached_sockets);
     dictEntry *de;
 
     while ((de = dictNext(di)) != NULL) {
@@ -419,7 +419,7 @@ void migrateCloseTimedOutSockets(void) {
         if ((server.unixtime - cs->last_use_time) > MIGRATE_SOCKET_CACHE_TTL) {
             connClose(cs->conn);
             zfree(cs);
-            dictDelete(server.migrate_cached_sockets, dictGetKey(de));
+            dictDelete(inst->migrate_cached_sockets, dictGetKey(de));
         }
     }
     dictReleaseIterator(di);
@@ -676,7 +676,7 @@ try_again:
                 dbDelete(c->db, kv[j]);
                 signalModifiedKey(c, c->db, kv[j]);
                 notifyKeyspaceEvent(NOTIFY_GENERIC, "del", kv[j], c->db->id);
-                server.dirty++;
+                inst->dirty++;
 
                 /* Populate the argument vector to replace the old one. */
                 newargv[del_idx++] = kv[j];
@@ -832,12 +832,12 @@ void clusterCommandMyShardId(client *c) {
 /* When a cluster command is called, we need to decide whether to return TLS info or
  * non-TLS info by the client's connection type. However if the command is called by
  * a Lua script or RM_call, there is no connection in the fake client, so we use
- * server.current_client here to get the real client if available. And if it is not
+ * inst->current_client here to get the real client if available. And if it is not
  * available (modules may call commands without a real client), we return the default
  * info, which is determined by server.tls_cluster. */
 static int shouldReturnTlsInfo(void) {
-    if (server.current_client && server.current_client->conn) {
-        return connIsTLS(server.current_client->conn);
+    if (inst->current_client && inst->current_client->conn) {
+        return connIsTLS(inst->current_client->conn);
     } else {
         return server.tls_cluster;
     }
@@ -850,7 +850,7 @@ unsigned int countKeysInSlotForDb(unsigned int hashslot, serverDb *db) {
 unsigned int countKeysInSlot(unsigned int slot) {
     unsigned int result = 0;
     for (int i = 0; i < server.dbnum; i++) {
-        result += server.db[i] ? countKeysInSlotForDb(slot, server.db[i]) : 0;
+        result += inst->db[i] ? countKeysInSlotForDb(slot, inst->db[i]) : 0;
     }
     return result;
 }

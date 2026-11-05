@@ -360,7 +360,7 @@ void execCommand(client *c) {
     /* Exec all the queued commands */
     unwatchAllKeys(c); /* Unwatch ASAP otherwise we'll waste CPU cycles */
 
-    server.in_exec = 1;
+    inst->in_exec = 1;
 
     orig_argv = c->argv;
     orig_argv_len = c->argv_len;
@@ -425,7 +425,7 @@ void execCommand(client *c) {
     c->cmd = c->realcmd = orig_cmd;
     discardTransaction(c);
 
-    server.in_exec = 0;
+    inst->in_exec = 0;
 }
 
 /* ===================== WATCH (CAS alike for MULTI/EXEC) ===================
@@ -490,7 +490,7 @@ void watchForKey(client *c, robj *key) {
     list *clients = NULL;
     watchedKey *wk;
 
-    if (listLength(&c->mstate->watched_keys) == 0) server.watching_clients++;
+    if (listLength(&c->mstate->watched_keys) == 0) inst->watching_clients++;
 
     /* Lazily allocate the per-db hashtable array. */
     if (c->mstate->watched_keys_by_db == NULL) {
@@ -568,7 +568,7 @@ void unwatchAllKeys(client *c) {
         }
     }
 
-    server.watching_clients--;
+    inst->watching_clients--;
 }
 
 /* Iterates over the watched_keys list and looks for an expired key. Keys which

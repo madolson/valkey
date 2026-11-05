@@ -321,11 +321,6 @@ static list *moduleUnblockedClients;
  * costly. We manage a pool of clients to avoid this cost. Pool expands when
  * more clients are needed and shrinks when unused. Please see modulesCron()
  * for more details. */
-static client **moduleTempClients;
-static size_t moduleTempClientCap = 0;
-static size_t moduleTempClientCount = 0;    /* Client count in pool */
-static size_t moduleTempClientMinCount = 0; /* Min client count in pool since
-                                               the last cron. */
 
 /* We need a mutex that is unlocked / relocked in beforeSleep() in order to
  * allow thread safe contexts to execute commands at a safe moment. */
@@ -364,7 +359,6 @@ typedef struct ValkeyModulePostExecUnitJob {
 static list *moduleKeyspaceSubscribers;
 
 /* The module post keyspace jobs list */
-static list *modulePostExecUnitJobs;
 
 /* Data structures related to the exported dictionary data structure. */
 typedef struct ValkeyModuleDict {
@@ -759,9 +753,9 @@ sds moduleLoadQueueEntryToLoadmoduleOptionStr(ValkeyModule *module,
 client *moduleAllocTempClient(void) {
     client *c = NULL;
 
-    if (moduleTempClientCount > 0) {
-        c = moduleTempClients[--moduleTempClientCount];
-        if (moduleTempClientCount < moduleTempClientMinCount) moduleTempClientMinCount = moduleTempClientCount;
+    if (inst->moduleTempClientCount > 0) {
+        c = inst->moduleTempClients[--inst->moduleTempClientCount];
+        if (inst->moduleTempClientCount < inst->moduleTempClientMinCount) inst->moduleTempClientMinCount = inst->moduleTempClientCount;
     } else {
         c = createClient(NULL);
         c->flag.module = 1;
@@ -782,9 +776,9 @@ static void freeValkeyModuleAsyncRMCallPromise(ValkeyModuleAsyncRMCallPromise *p
 }
 
 void moduleReleaseTempClient(client *c) {
-    if (moduleTempClientCount == moduleTempClientCap) {
-        moduleTempClientCap = moduleTempClientCap ? moduleTempClientCap * 2 : 32;
-        moduleTempClients = zrealloc(moduleTempClients, sizeof(c) * moduleTempClientCap);
+    if (inst->moduleTempClientCount == inst->moduleTempClientCap) {
+        inst->moduleTempClientCap = inst->moduleTempClientCap ? inst->moduleTempClientCap * 2 : 32;
+        inst->moduleTempClients = zrealloc(inst->moduleTempClients, sizeof(c) * inst->moduleTempClientCap);
     }
     clearClientConnectionState(c);
     listEmpty(c->reply);
@@ -804,7 +798,7 @@ void moduleReleaseTempClient(client *c) {
         freeValkeyModuleAsyncRMCallPromise(promise);
         c->bstate->async_rm_call_handle = NULL;
     }
-    moduleTempClients[moduleTempClientCount++] = c;
+    inst->moduleTempClients[inst->moduleTempClientCount++] = c;
 }
 
 /* Create an empty key of the specified type. `key` must point to a key object
@@ -918,12 +912,12 @@ int VM_GetApi(const char *funcname, void **targetPtrPtr) {
 }
 
 void modulePostExecutionUnitOperations(void) {
-    if (server.execution_nesting) return;
+    if (inst->execution_nesting) return;
 
-    if (server.busy_module_yield_flags) {
+    if (inst->busy_module_yield_flags) {
         blockingOperationEnds();
-        server.busy_module_yield_flags = BUSY_MODULE_YIELD_NONE;
-        if (server.current_client) unprotectClient(server.current_client);
+        inst->busy_module_yield_flags = BUSY_MODULE_YIELD_NONE;
+        if (inst->current_client) unprotectClient(inst->current_client);
         unblockPostponedClients();
     }
 }
@@ -2540,7 +2534,7 @@ ustime_t VM_Microseconds(void) {
  * causing another notification, etc.
  * It makes sense that all this callbacks would use the same clock. */
 ustime_t VM_CachedMicroseconds(void) {
-    return server.ustime;
+    return inst->ustime;
 }
 
 /* Mark a point in time that will be used as the start time to calculate
@@ -2608,15 +2602,15 @@ void VM_Yield(ValkeyModuleCtx *ctx, int flags, const char *busy_reply) {
             /* Let the server process events */
             processEventsWhileBlocked();
         } else {
-            const char *prev_busy_module_yield_reply = server.busy_module_yield_reply;
-            server.busy_module_yield_reply = busy_reply;
+            const char *prev_busy_module_yield_reply = inst->busy_module_yield_reply;
+            inst->busy_module_yield_reply = busy_reply;
             /* start the blocking operation if not already started. */
-            if (!server.busy_module_yield_flags) {
-                server.busy_module_yield_flags = BUSY_MODULE_YIELD_EVENTS;
+            if (!inst->busy_module_yield_flags) {
+                inst->busy_module_yield_flags = BUSY_MODULE_YIELD_EVENTS;
                 blockingOperationStarts();
-                if (server.current_client) protectClient(server.current_client);
+                if (inst->current_client) protectClient(inst->current_client);
             }
-            if (flags & VALKEYMODULE_YIELD_FLAG_CLIENTS) server.busy_module_yield_flags |= BUSY_MODULE_YIELD_CLIENTS;
+            if (flags & VALKEYMODULE_YIELD_FLAG_CLIENTS) inst->busy_module_yield_flags |= BUSY_MODULE_YIELD_CLIENTS;
 
             /* Let the server process events */
             if (!onServerMainThread()) {
@@ -2631,7 +2625,7 @@ void VM_Yield(ValkeyModuleCtx *ctx, int flags, const char *busy_reply) {
                      * acquire the GIL. This avoids blocking the caller, allowing them to
                      * continue with unfinished tasks before the next yield.
                      * We assume the caller keeps the GIL locked. */
-                    if (write(server.module_pipe[1], "A", 1) != 1) {
+                    if (write(inst->module_pipe[1], "A", 1) != 1) {
                         /* Ignore the error, this is best-effort. */
                     }
                 } else {
@@ -2646,11 +2640,11 @@ void VM_Yield(ValkeyModuleCtx *ctx, int flags, const char *busy_reply) {
                 processEventsWhileBlocked();
             }
 
-            server.busy_module_yield_reply = prev_busy_module_yield_reply;
+            inst->busy_module_yield_reply = prev_busy_module_yield_reply;
             /* Possibly restore the previous flags in case of two nested contexts
              * that use this API with different flags, but keep the first bit
              * (PROCESS_EVENTS) set, so we know to call blockingOperationEnds on time. */
-            server.busy_module_yield_flags &= ~BUSY_MODULE_YIELD_CLIENTS;
+            inst->busy_module_yield_flags &= ~BUSY_MODULE_YIELD_CLIENTS;
         }
 
         /* decide when the next event should fire. */
@@ -3866,7 +3860,7 @@ int VM_Replicate(ValkeyModuleCtx *ctx, const char *cmdname, const char *fmt, ...
     /* Release the argv. */
     for (j = 0; j < argc; j++) decrRefCount(argv[j]);
     zfree(argv);
-    server.dirty++;
+    inst->dirty++;
     return VALKEYMODULE_OK;
 }
 
@@ -3888,7 +3882,7 @@ int VM_ReplicateVerbatim(ValkeyModuleCtx *ctx) {
     if (isPausedActions(PAUSE_ACTION_REPLICA)) return VALKEYMODULE_ERR;
 
     alsoPropagate(ctx->client->db->id, ctx->client->argv, ctx->client->argc, PROPAGATE_AOF | PROPAGATE_REPL, ctx->client->slot);
-    server.dirty++;
+    inst->dirty++;
     return VALKEYMODULE_OK;
 }
 
@@ -4070,8 +4064,8 @@ int modulePopulateReplicationInfoStructure(void *ri, int structver) {
  */
 int VM_GetClientInfoById(void *ci, uint64_t id) {
     client *client =
-        (server.executing_client && server.executing_client->id == id)
-            ? server.executing_client
+        (inst->executing_client && inst->executing_client->id == id)
+            ? inst->executing_client
             : lookupClientByID(id);
     if (client == NULL) return VALKEYMODULE_ERR;
     if (ci == NULL) return VALKEYMODULE_OK;
@@ -4239,7 +4233,7 @@ int VM_GetContextFlags(ValkeyModuleCtx *ctx) {
 
     if (scriptIsRunning()) flags |= VALKEYMODULE_CTX_FLAGS_LUA;
 
-    if (server.in_exec) flags |= VALKEYMODULE_CTX_FLAGS_MULTI;
+    if (inst->in_exec) flags |= VALKEYMODULE_CTX_FLAGS_MULTI;
 
     if (server.cluster_enabled) flags |= VALKEYMODULE_CTX_FLAGS_CLUSTER;
 
@@ -6887,12 +6881,12 @@ static void moduleCallCommandHelper(ValkeyModuleCtx *ctx, client *c, robj **argv
         if (cmd_flags & CMD_DENYOOM) {
             int oom_state;
             if (ctx->flags & VALKEYMODULE_CTX_THREAD_SAFE) {
-                /* On background thread we cannot count on server.pre_command_oom_state.
+                /* On background thread we cannot count on inst->pre_command_oom_state.
                  * Because it is only set on the main thread, in such case we will check
                  * the actual memory usage. */
                 oom_state = (getMaxmemoryState(NULL, NULL, NULL, NULL) == C_ERR);
             } else {
-                oom_state = server.pre_command_oom_state;
+                oom_state = inst->pre_command_oom_state;
             }
             if (oom_state) {
                 errno = ENOSPC;
@@ -7024,7 +7018,7 @@ static void moduleCallCommandHelper(ValkeyModuleCtx *ctx, client *c, robj **argv
             }
 
             int deny_write_type = writeCommandsDeniedByDiskError();
-            int obey_client = (server.current_client && mustObeyClient(server.current_client));
+            int obey_client = (inst->current_client && mustObeyClient(inst->current_client));
 
             if (deny_write_type != DISK_ERROR_TYPE_NONE && !obey_client) {
                 errno = ESPIPE;
@@ -7087,8 +7081,8 @@ static void moduleCallCommandHelper(ValkeyModuleCtx *ctx, client *c, robj **argv
      * 2. module2.bar internally calls VM_Call of INCR with '!'
      * 3. at the end of module1.foo we call VM_ReplicateVerbatim
      * We want the replica/AOF to see only module1.foo and not the INCR from module2.bar */
-    int prev_replication_allowed = server.replication_allowed;
-    server.replication_allowed = replicate && server.replication_allowed;
+    int prev_replication_allowed = inst->replication_allowed;
+    inst->replication_allowed = replicate && inst->replication_allowed;
 
     /* Run the command */
     int call_flags = CMD_CALL_FROM_MODULE;
@@ -7117,7 +7111,7 @@ static void moduleCallCommandHelper(ValkeyModuleCtx *ctx, client *c, robj **argv
      * operations that check errno. */
     errno = 0;
 
-    server.replication_allowed = prev_replication_allowed;
+    inst->replication_allowed = prev_replication_allowed;
 
     if (c->flag.blocked) {
         if (c->flag.deny_blocking) {
@@ -8627,7 +8621,7 @@ ValkeyModuleBlockedClient *moduleBlockClient(ValkeyModuleCtx *ctx,
         return NULL;
     }
     int islua = scriptIsRunning();
-    int ismulti = server.in_exec;
+    int ismulti = inst->in_exec;
     serverAssert(!c->flag.deny_blocking || (islua || ismulti));
     if ((islua || ismulti) && is_keyspace_notification) {
         /* Avoid blocking within transactions when context initiated by
@@ -9139,7 +9133,7 @@ int moduleUnblockClientByHandle(ValkeyModuleBlockedClient *bc, void *privdata) {
     if (!bc->blocked_on_keys) bc->privdata = privdata;
     bc->unblocked = 1;
     if (listLength(moduleUnblockedClients) == 0) {
-        if (write(server.module_pipe[1], "A", 1) != 1) {
+        if (write(inst->module_pipe[1], "A", 1) != 1) {
             /* Ignore the error, this is best-effort. */
         }
     }
@@ -9263,7 +9257,7 @@ void moduleHandleBlockedClients(void) {
          * was blocked on keys (VM_BlockClientOnKeys()), because we already
          * called such callback in moduleTryServeClientBlockedOnKey() when
          * the key was signaled as ready. */
-        long long prev_error_replies = server.stat_total_error_replies;
+        long long prev_error_replies = inst->stat_total_error_replies;
         uint64_t reply_us = 0;
         if (c && !bc->blocked_on_keys && bc->reply_callback) {
             ValkeyModuleCtx ctx;
@@ -9315,7 +9309,7 @@ void moduleHandleBlockedClients(void) {
          */
         if (c && !clientHasModuleAuthInProgress(c)) {
             int had_errors = c->deferred_reply_errors ? !!listLength(c->deferred_reply_errors)
-                                                      : (server.stat_total_error_replies != prev_error_replies);
+                                                      : (inst->stat_total_error_replies != prev_error_replies);
             updateStatsOnUnblock(c, bc->background_duration, reply_us, (had_errors ? ERROR_COMMAND_FAILED : 0));
         }
 
@@ -9391,7 +9385,7 @@ void moduleBlockedClientTimedOut(client *c, int from_module) {
     ctx.blocked_privdata = bc->privdata;
 
     long long prev_error_replies;
-    if (!from_module) prev_error_replies = server.stat_total_error_replies;
+    if (!from_module) prev_error_replies = inst->stat_total_error_replies;
 
     if (bc->timeout_callback) {
         /* In theory, the user should always pass the timeout handler as an
@@ -9403,7 +9397,7 @@ void moduleBlockedClientTimedOut(client *c, int from_module) {
 
     if (!from_module) {
         updateStatsOnUnblock(c, bc->background_duration, 0,
-                             ((server.stat_total_error_replies != prev_error_replies) ? ERROR_COMMAND_FAILED : 0));
+                             ((inst->stat_total_error_replies != prev_error_replies) ? ERROR_COMMAND_FAILED : 0));
     }
 
     /* For timeout events, we do not want to call the disconnect callback,
@@ -9529,7 +9523,7 @@ void VM_FreeThreadSafeContext(ValkeyModuleCtx *ctx) {
 void moduleGILAfterLock(void) {
     /* We should never get here if we already inside a module
      * code block which already opened a context. */
-    serverAssert(server.execution_nesting == 0);
+    serverAssert(inst->execution_nesting == 0);
     /* Bump up the nesting level to prevent immediate propagation
      * of possible VM_Call from th thread */
     enterExecutionUnit(1, 0);
@@ -9566,7 +9560,7 @@ void moduleGILBeforeUnlock(void) {
     /* We should never get here if we already inside a module
      * code block which already opened a context, except
      * the bump-up from moduleGILAcquired. */
-    serverAssert(server.execution_nesting == 1);
+    serverAssert(inst->execution_nesting == 1);
     /* Restore nesting level and propagate pending commands
      * (because it's unclear when thread safe contexts are
      * released we have to propagate here). */
@@ -9678,13 +9672,13 @@ int VM_SubscribeToKeyspaceEvents(ValkeyModuleCtx *ctx, int types, ValkeyModuleNo
 }
 
 /* Whether any module post-execution-unit job is pending. Kept as a tiny
- * accessor rather than exposing modulePostExecUnitJobs itself, so callers
+ * accessor rather than exposing inst->modulePostExecUnitJobs itself, so callers
  * outside this file (postExecutionUnitOperations()) don't need to know it's
  * backed by a list - if that representation ever changes, only this
  * function needs to change with it. It's trivial enough that LTO can inline
  * it at its (currently single) call site same as any other cross-TU call. */
 bool moduleHasPostExecUnitJobs(void) {
-    return listLength(modulePostExecUnitJobs) > 0;
+    return listLength(inst->modulePostExecUnitJobs) > 0;
 }
 
 void firePostExecutionUnitJobs(void) {
@@ -9694,10 +9688,10 @@ void firePostExecutionUnitJobs(void) {
      * This is a special case where we need to increase 'execution_nesting'
      * but we do not want to update the cached time */
     enterExecutionUnit(0, 0);
-    while (listLength(modulePostExecUnitJobs) > 0) {
-        listNode *ln = listFirst(modulePostExecUnitJobs);
+    while (listLength(inst->modulePostExecUnitJobs) > 0) {
+        listNode *ln = listFirst(inst->modulePostExecUnitJobs);
         ValkeyModulePostExecUnitJob *job = listNodeValue(ln);
-        listDelNode(modulePostExecUnitJobs, ln);
+        listDelNode(inst->modulePostExecUnitJobs, ln);
 
         ValkeyModuleCtx ctx;
         moduleCreateContext(&ctx, job->module, VALKEYMODULE_CTX_TEMP_CLIENT);
@@ -9743,7 +9737,7 @@ int VM_AddPostNotificationJob(ValkeyModuleCtx *ctx,
     job->free_pd = free_privdata;
     job->dbid = ctx->client->db->id;
 
-    listAddNodeTail(modulePostExecUnitJobs, job);
+    listAddNodeTail(inst->modulePostExecUnitJobs, job);
     return VALKEYMODULE_OK;
 }
 
@@ -9802,7 +9796,7 @@ void moduleNotifyKeyspaceEvent(int type, const char *event, robj *key, int dbid)
      * selected DB (e.g. MOVE/COPY notify on the destination DB), so save the
      * original DB and restore it afterwards to avoid leaving the client on the
      * wrong DB for subsequent commands. */
-    client *executing_client = server.executing_client;
+    client *executing_client = inst->executing_client;
     int origin_dbid = (executing_client != NULL) ? executing_client->db->id : -1;
 
     while ((ln = listNext(&li))) {
@@ -9812,11 +9806,11 @@ void moduleNotifyKeyspaceEvent(int type, const char *event, robj *key, int dbid)
         if ((sub->event_mask & type) &&
             (sub->active == 0 || (sub->module->options & VALKEYMODULE_OPTIONS_ALLOW_NESTED_KEYSPACE_NOTIFICATIONS))) {
             ValkeyModuleCtx ctx;
-            if (server.executing_client == NULL) {
+            if (inst->executing_client == NULL) {
                 moduleCreateContext(&ctx, sub->module, VALKEYMODULE_CTX_TEMP_CLIENT);
             } else {
                 moduleCreateContext(&ctx, sub->module, VALKEYMODULE_CTX_NONE);
-                ctx.client = server.executing_client;
+                ctx.client = inst->executing_client;
             }
             selectDb(ctx.client, dbid);
             ctx.flags |= VALKEYMODULE_CTX_KEYSPACE_NOTIFICATION;
@@ -9826,9 +9820,9 @@ void moduleNotifyKeyspaceEvent(int type, const char *event, robj *key, int dbid)
              * it will not be notified about it. */
             int prev_active = sub->active;
             sub->active = 1;
-            server.lazy_expire_disabled++;
+            inst->lazy_expire_disabled++;
             sub->notify_callback(&ctx, type, event, key);
-            server.lazy_expire_disabled--;
+            inst->lazy_expire_disabled--;
             sub->active = prev_active;
             moduleFreeContext(&ctx);
         }
@@ -10301,7 +10295,7 @@ ValkeyModuleTimerID VM_CreateTimer(ValkeyModuleCtx *ctx, mstime_t period, Valkey
         if (memcmp(ri.key, &key, sizeof(key)) == 0) {
             /* This is the first key, we need to re-install the timer according
              * to the just added event. */
-            aeDeleteTimeEvent(server.el, aeTimer);
+            aeDeleteTimeEvent(inst->el, aeTimer);
             aeTimer = -1;
         }
         raxStop(&ri);
@@ -10309,7 +10303,7 @@ ValkeyModuleTimerID VM_CreateTimer(ValkeyModuleCtx *ctx, mstime_t period, Valkey
 
     /* If we have no main timer (the old one was invalidated, or this is the
      * first module timer we have), install one. */
-    if (aeTimer == -1) aeTimer = aeCreateTimeEvent(server.el, period, moduleTimerHandler, NULL, NULL);
+    if (aeTimer == -1) aeTimer = aeCreateTimeEvent(inst->el, period, moduleTimerHandler, NULL, NULL);
 
     return key;
 }
@@ -10437,7 +10431,7 @@ static void eventLoopCbWritable(struct aeEventLoop *ae, int fd, void *user_data,
  *     VM_EventLoopAdd(fd, VALKEYMODULE_EVENTLOOP_READABLE, onReadable, NULL);
  */
 int VM_EventLoopAdd(int fd, int mask, ValkeyModuleEventLoopFunc func, void *user_data) {
-    if (fd < 0 || fd >= aeGetSetSize(server.el)) {
+    if (fd < 0 || fd >= aeGetSetSize(inst->el)) {
         errno = ERANGE;
         return VALKEYMODULE_ERR;
     }
@@ -10457,7 +10451,7 @@ int VM_EventLoopAdd(int fd, int mask, ValkeyModuleEventLoopFunc func, void *user
      * EventLoopData object and passing it to ae, later, we'll extract
      * 'callback' and 'user_data' from that.
      */
-    EventLoopData *data = aeGetFileClientData(server.el, fd);
+    EventLoopData *data = aeGetFileClientData(inst->el, fd);
     if (!data) data = zcalloc(sizeof(*data));
 
     aeFileProc *aeProc;
@@ -10468,8 +10462,8 @@ int VM_EventLoopAdd(int fd, int mask, ValkeyModuleEventLoopFunc func, void *user
 
     int aeMask = eventLoopToAeMask(mask);
 
-    if (aeCreateFileEvent(server.el, fd, aeMask, aeProc, data) != AE_OK) {
-        if (aeGetFileEvents(server.el, fd) == AE_NONE) zfree(data);
+    if (aeCreateFileEvent(inst->el, fd, aeMask, aeProc, data) != AE_OK) {
+        if (aeGetFileEvents(inst->el, fd) == AE_NONE) zfree(data);
         return VALKEYMODULE_ERR;
     }
 
@@ -10496,7 +10490,7 @@ int VM_EventLoopAdd(int fd, int mask, ValkeyModuleEventLoopFunc func, void *user
  * * EINVAL: `mask` value is invalid.
  */
 int VM_EventLoopDel(int fd, int mask) {
-    if (fd < 0 || fd >= aeGetSetSize(server.el)) {
+    if (fd < 0 || fd >= aeGetSetSize(inst->el)) {
         errno = ERANGE;
         return VALKEYMODULE_ERR;
     }
@@ -10508,9 +10502,9 @@ int VM_EventLoopDel(int fd, int mask) {
 
     /* After deleting the event, if fd does not have any registered event
      * anymore, we can free the EventLoopData object. */
-    EventLoopData *data = aeGetFileClientData(server.el, fd);
-    aeDeleteFileEvent(server.el, fd, eventLoopToAeMask(mask));
-    if (aeGetFileEvents(server.el, fd) == AE_NONE) zfree(data);
+    EventLoopData *data = aeGetFileClientData(inst->el, fd);
+    aeDeleteFileEvent(inst->el, fd, eventLoopToAeMask(mask));
+    if (aeGetFileEvents(inst->el, fd) == AE_NONE) zfree(data);
 
     errno = 0;
     return VALKEYMODULE_OK;
@@ -10535,7 +10529,7 @@ int VM_EventLoopAddOneShot(ValkeyModuleEventLoopOneShotFunc func, void *user_dat
     listAddNodeTail(moduleEventLoopOneShots, oneshot);
     pthread_mutex_unlock(&moduleEventLoopMutex);
 
-    if (write(server.module_pipe[1], "A", 1) != 1) {
+    if (write(inst->module_pipe[1], "A", 1) != 1) {
         /* Pipe is non-blocking, write() may fail if it's full. */
     }
 
@@ -13419,7 +13413,7 @@ void moduleUnsubscribeAllServerEvents(ValkeyModule *module) {
 }
 
 void processModuleLoadingProgressEvent(int is_aof) {
-    long long now = server.ustime;
+    long long now = inst->ustime;
     static long long next_event = 0;
     if (now >= next_event) {
         /* Fire the loading progress modules end event. */
@@ -13437,7 +13431,7 @@ void processModuleLoadingProgressEvent(int is_aof) {
 /* When a key is deleted (in dbAsyncDelete/dbSyncDelete/setKey), it
  *  will be called to tell the module which key is about to be released. */
 void moduleNotifyKeyUnlink(robj *key, robj *val, int dbid, int flags) {
-    server.lazy_expire_disabled++;
+    inst->lazy_expire_disabled++;
     int subevent = VALKEYMODULE_SUBEVENT_KEY_DELETED;
     if (flags & DB_FLAG_KEY_EXPIRED) {
         subevent = VALKEYMODULE_SUBEVENT_KEY_EXPIRED;
@@ -13460,7 +13454,7 @@ void moduleNotifyKeyUnlink(robj *key, robj *val, int dbid, int flags) {
             mt->unlink(key, mv->value);
         }
     }
-    server.lazy_expire_disabled--;
+    inst->lazy_expire_disabled--;
 }
 
 /* Return the free_effort of the module, it will automatically choose to call
@@ -13527,7 +13521,7 @@ void moduleRegisterCoreAPI(void);
 
 /* Currently, this function is just a placeholder for the module system
  * initialization steps that need to be run after server initialization.
- * A previous issue, selectDb() in createClient() requires that server.db has
+ * A previous issue, selectDb() in createClient() requires that inst->db has
  * been initialized, see #7323. */
 void moduleInitModulesSystemLast(void) {
 }
@@ -13551,7 +13545,7 @@ void moduleInitModulesSystem(void) {
     /* Set up the keyspace notification subscriber list and static client */
     moduleKeyspaceSubscribers = listCreate();
 
-    modulePostExecUnitJobs = listCreate();
+    inst->modulePostExecUnitJobs = listCreate();
 
     /* Set up filter list */
     moduleCommandFilters = listCreate();
@@ -13563,7 +13557,7 @@ void moduleInitModulesSystem(void) {
      * and we want to avoid blocking in both the read and write halves.
      * Enable close-on-exec flag on pipes in case of the fork-exec system calls in
      * sentinels or servers. */
-    if (anetPipe(server.module_pipe, O_CLOEXEC | O_NONBLOCK, O_CLOEXEC | O_NONBLOCK) == -1) {
+    if (anetPipe(inst->module_pipe, O_CLOEXEC | O_NONBLOCK, O_CLOEXEC | O_NONBLOCK) == -1) {
         serverLog(LL_WARNING, "Can't create the pipe for module threads: %s", strerror(errno));
         exit(1);
     }
@@ -13584,7 +13578,7 @@ void moduleInitModulesSystem(void) {
 
 void modulesCron(void) {
     /* Check number of temporary clients in the pool and free the unused ones
-     * since the last cron. moduleTempClientMinCount tracks minimum count of
+     * since the last cron. inst->moduleTempClientMinCount tracks minimum count of
      * clients in the pool since the last cron. This is the number of clients
      * that we didn't use for the last cron period. */
 
@@ -13594,18 +13588,18 @@ void modulesCron(void) {
      * small amount of clients to avoid client allocation costs if temporary
      * clients are required after some idle period. */
     const unsigned int min_client = 8;
-    while (iteration > 0 && moduleTempClientCount > 0 && moduleTempClientMinCount > min_client) {
-        client *c = moduleTempClients[--moduleTempClientCount];
+    while (iteration > 0 && inst->moduleTempClientCount > 0 && inst->moduleTempClientMinCount > min_client) {
+        client *c = inst->moduleTempClients[--inst->moduleTempClientCount];
         freeClient(c);
         iteration--;
-        moduleTempClientMinCount--;
+        inst->moduleTempClientMinCount--;
     }
-    moduleTempClientMinCount = moduleTempClientCount;
+    inst->moduleTempClientMinCount = inst->moduleTempClientCount;
 
-    /* Shrink moduleTempClients array itself if it is wasting some space */
-    if (moduleTempClientCap > 32 && moduleTempClientCap > moduleTempClientCount * 4) {
-        moduleTempClientCap /= 4;
-        moduleTempClients = zrealloc(moduleTempClients, sizeof(client *) * moduleTempClientCap);
+    /* Shrink inst->moduleTempClients array itself if it is wasting some space */
+    if (inst->moduleTempClientCap > 32 && inst->moduleTempClientCap > inst->moduleTempClientCount * 4) {
+        inst->moduleTempClientCap /= 4;
+        inst->moduleTempClients = zrealloc(inst->moduleTempClients, sizeof(client *) * inst->moduleTempClientCap);
     }
 }
 
@@ -14949,12 +14943,12 @@ int VM_RdbLoad(ValkeyModuleCtx *ctx, ValkeyModuleRdbStream *stream, int flags) {
      * VM_RdbLoad() is called inside a command callback, we don't want to
      * process the current client. Otherwise, we may free the client or try to
      * process next message while we are already in the command callback. */
-    if (server.current_client) protectClient(server.current_client);
+    if (inst->current_client) protectClient(inst->current_client);
 
     serverAssert(stream->type == VALKEYMODULE_RDB_STREAM_FILE);
     int ret = rdbLoad(stream->data.filename, NULL, RDBFLAGS_EMPTY_DATA);
 
-    if (server.current_client) unprotectClient(server.current_client);
+    if (inst->current_client) unprotectClient(inst->current_client);
 
     /* Here we need to decide whether to enable the AOF based on the aof_enabled,
      * since the previous stopAppendOnly sets aof_state to AOF_OFF. */

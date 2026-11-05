@@ -9,9 +9,10 @@ static const void *PROCESS_COMPLETE_ITEM = (void *)-1;
 static const int SNAPSHOT_FILE_CLOSE_MONITOR_INTERVAL_MS = 200;
 static const int REPLICATION_MONITOR_INTERVAL_MS = 100;
 
-typedef struct {
-    rio save_rio; /* Must be 1st to permit cast from rio back to forklessSaveInfo */
-    int cur_db;   /* Last selectDb issued */
+typedef struct forklessSaveInfo {
+    rio save_rio;                    /* Must be 1st to permit cast from rio back to forklessSaveInfo */
+    struct valkeyInstance *instance; /* Instance being saved */
+    int cur_db;                      /* Last selectDb issued */
     bgIterator *iterator;
     uint64_t bytes_written;
     int err_code;
@@ -36,7 +37,6 @@ typedef struct {
 } forklessSaveInfo;
 
 /* Keep a global indicator of the current iterator (for cancellation purposes). */
-static forklessSaveInfo *currentForklessSave = NULL;
 
 /* True while a socket forkless save's iterator is scanning the keyspace. During
  * that time the syncing replicas are not fed from the shared replication backlog
@@ -101,7 +101,7 @@ static int writeSelectDb(forklessSaveInfo *saveInfo, int new_db) {
 
 static int writeDbSizeHints(forklessSaveInfo *saveInfo) {
     for (int dbid = 0; dbid < server.dbnum; dbid++) {
-        serverDb *db = server.db[dbid];
+        serverDb *db = inst->db[dbid];
         if (db == NULL || dbSize(db) == 0) continue;
         if (writeSelectDb(saveInfo, dbid) != C_OK) return C_ERR;
         if (rdbSaveDbSizeHints(&saveInfo->save_rio, db, 0) < 0) return C_ERR;
@@ -258,6 +258,7 @@ static int writeSyncPreamble(forklessSaveInfo *saveInfo) {
 static void *forklessSaveProcessor(void *arg) {
     serverAssert(!onServerMainThread());
     forklessSaveInfo *saveInfo = arg;
+    inst = saveInfo->instance;
 
     /* Pin this background save thread to the configured bgsave CPU list, the
      * same way the fork-based bgsave child does */
@@ -506,7 +507,7 @@ static void cleanupSaveInfoAndEmitEndMetrics(forklessSaveInfo *saveInfo) {
     /* Notify replicas waiting for BGSAVE to complete */
     updateReplicasWaitingBgsave(success ? C_OK : C_ERR, saveInfo->write_target);
 
-    currentForklessSave = NULL;
+    inst->currentForklessSave = NULL;
     iteratorOwnsIncomingReplication = false;
     atomic_store_explicit(&server.stat_current_save_keys_processed, 0, memory_order_relaxed);
     atomic_store_explicit(&server.stat_current_save_keys_total, 0, memory_order_relaxed);
@@ -683,7 +684,7 @@ static void forklessSaveComplete(bool terminated, void *privdata) {
         saveInfo->bytes_written = saveInfo->save_rio.processed_bytes;
 
         /* Start a cron job to check for the background job completion */
-        aeCreateTimeEvent(server.el, SNAPSHOT_FILE_CLOSE_MONITOR_INTERVAL_MS, snapshotEndMonitorTimeProc, saveInfo, NULL);
+        aeCreateTimeEvent(inst->el, SNAPSHOT_FILE_CLOSE_MONITOR_INTERVAL_MS, snapshotEndMonitorTimeProc, saveInfo, NULL);
         /* Submit a background job to close and rename the snapshot file */
         saveInfo->foreground_queue = mutexQueueCreate(); // The monitor proc will delete this
         bioCreateLazyFreeJob(forklessSaveCloseSnapshotFile, 1, saveInfo);
@@ -724,6 +725,7 @@ static void startBackgroundThread(forklessSaveInfo *saveInfo) {
     serverInitThreadAttribute(&attr);
     pthread_rc = pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
     serverAssert(pthread_rc == 0);
+    saveInfo->instance = inst;
     pthread_rc = pthread_create(&thread_id, &attr, &forklessSaveProcessor, saveInfo);
     serverAssert(pthread_rc == 0);
     pthread_rc = pthread_attr_destroy(&attr);
@@ -737,7 +739,7 @@ static void forklessMarkSaveFailed(forklessSaveInfo *saveInfo) {
     }
     rdbClearSaveState(time(NULL));
     stopSaving(0);
-    currentForklessSave = NULL;
+    inst->currentForklessSave = NULL;
     iteratorOwnsIncomingReplication = false;
     serverLog(LL_WARNING, "forkless-save: save failed. %lld seconds.", (long long)server.rdb_save_time_last);
 }
@@ -747,7 +749,7 @@ static void forklessMarkSaveFailed(forklessSaveInfo *saveInfo) {
  * Writes to a temp file and renames to the final filename on completion. */
 int forklessSaveToDisk(const char *filename) {
     serverAssert(onServerMainThread());
-    serverAssert(currentForklessSave == NULL);
+    serverAssert(inst->currentForklessSave == NULL);
     serverAssert(!isSaveInProgress());
     serverAssert(filename);
     serverLog(LL_NOTICE, "Beginning forklessSaveToDisk");
@@ -788,7 +790,7 @@ int forklessSaveToDisk(const char *filename) {
         serverLog(LL_WARNING, "forkless-save: error creating iterator");
         goto werr;
     }
-    currentForklessSave = saveInfo;
+    inst->currentForklessSave = saveInfo;
 
     atomic_store_explicit(&server.stat_current_save_keys_total, dbTotalServerKeyCount(), memory_order_relaxed);
     atomic_store_explicit(&server.stat_current_save_keys_processed, 0, memory_order_relaxed);
@@ -820,13 +822,13 @@ werr:
 /* Cancels the currently running forkless save, if one is in progress. */
 void forklessSaveCancel(void) {
     serverAssert(onServerMainThread());
-    if (currentForklessSave == NULL) return;
-    if (currentForklessSave->iterator != NULL) {
-        bgIteratorTerminate(currentForklessSave->iterator);
+    if (inst->currentForklessSave == NULL) return;
+    if (inst->currentForklessSave->iterator != NULL) {
+        bgIteratorTerminate(inst->currentForklessSave->iterator);
     } else {
         /* Iteration is done and the snapshot file is being closed in the background. */
         pthread_mutex_lock(&forkless_rename_mutex);
-        currentForklessSave->cancel_requested = true;
+        inst->currentForklessSave->cancel_requested = true;
         pthread_mutex_unlock(&forkless_rename_mutex);
     }
 }
@@ -962,7 +964,7 @@ static bool forklessDoneIteratingKeyspace(void *privdata) {
 
 int forklessSaveToSockets(int req, int rdbver) {
     serverAssert(onServerMainThread());
-    serverAssert(currentForklessSave == NULL);
+    serverAssert(inst->currentForklessSave == NULL);
 
     forklessSaveInfo *saveInfo = zmalloc(sizeof(forklessSaveInfo));
     memset(saveInfo, 0, sizeof(forklessSaveInfo));
@@ -1028,7 +1030,7 @@ int forklessSaveToSockets(int req, int rdbver) {
      * The bg thread can't free clients directly — it queues them to
      * foreground_queue, and this timer frees them on the main thread. */
     saveInfo->foreground_queue = mutexQueueCreate();
-    long long timeProcId = aeCreateTimeEvent(server.el, REPLICATION_MONITOR_INTERVAL_MS,
+    long long timeProcId = aeCreateTimeEvent(inst->el, REPLICATION_MONITOR_INTERVAL_MS,
                                              replicationMonitorTimeProc, saveInfo->foreground_queue, NULL);
     if (timeProcId == AE_ERR) {
         mutexQueueRelease(saveInfo->foreground_queue);
@@ -1045,7 +1047,7 @@ int forklessSaveToSockets(int req, int rdbver) {
         serverLog(LL_WARNING, "forkless-save: error creating iterator");
         goto werr;
     }
-    currentForklessSave = saveInfo;
+    inst->currentForklessSave = saveInfo;
     iteratorOwnsIncomingReplication = true;
 
     startBackgroundThread(saveInfo);

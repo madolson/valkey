@@ -2378,7 +2378,7 @@ void sentinelReconnectInstance(sentinelValkeyInstance *ri) {
             link->pending_commands = 0;
             link->cc_conn_time = mstime();
             link->cc->data = link;
-            valkeyAeAttach(server.el, link->cc);
+            valkeyAeAttach(inst->el, link->cc);
             valkeyAsyncSetConnectCallback(link->cc, sentinelLinkEstablishedCallback);
             valkeyAsyncSetDisconnectCallback(link->cc, sentinelDisconnectCallback);
             sentinelSendAuthIfNeeded(ri, link->cc);
@@ -2403,7 +2403,7 @@ void sentinelReconnectInstance(sentinelValkeyInstance *ri) {
             int retval;
             link->pc_conn_time = mstime();
             link->pc->data = link;
-            valkeyAeAttach(server.el, link->pc);
+            valkeyAeAttach(inst->el, link->pc);
             valkeyAsyncSetConnectCallback(link->pc, sentinelLinkEstablishedCallback);
             valkeyAsyncSetDisconnectCallback(link->pc, sentinelDisconnectCallback);
             sentinelSendAuthIfNeeded(ri, link->pc);

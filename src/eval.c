@@ -383,7 +383,7 @@ static listNode *scriptsLRUAdd(sds sha) {
     while (listLength(evalCtx.scripts_lru_list) >= LRU_LIST_LENGTH) {
         sds oldest = listNodeValue(listFirst(evalCtx.scripts_lru_list));
         evalCtxDeleteScript(oldest);
-        server.stat_evictedscripts++;
+        inst->stat_evictedscripts++;
     }
 
     /* Add current. */
@@ -418,7 +418,6 @@ size_t getScriptsMemoryLimit(void) {
     return maxmemory_scripts_actual;
 }
 
-static int isScriptsEvictionProcRunning = 0;
 
 /* Script eviction return codes. */
 #define SCRIPTS_EVICT_OK 0      /* Memory is OK or eviction completed successfully. */
@@ -465,7 +464,7 @@ static int performScriptsEvictions(void) {
 
         sds sha = listNodeValue(node);
         evalCtxDeleteScript(sha);
-        server.stat_evictedscripts++;
+        inst->stat_evictedscripts++;
         scripts_evicted++;
 
         if (scripts_evicted % 16 == 0) {
@@ -494,15 +493,15 @@ static long long scriptsEvictionTimeProc(struct aeEventLoop *eventLoop, long lon
 
     if (performScriptsEvictions() == SCRIPTS_EVICT_RUNNING) return 0; /* Keep evicting */
 
-    isScriptsEvictionProcRunning = 0;
+    inst->isScriptsEvictionProcRunning = 0;
     return AE_NOMORE;
 }
 
 /* Start the scripts eviction time proc if not already running. */
 void startScriptsEvictionTimeProc(void) {
-    if (!isScriptsEvictionProcRunning) {
-        isScriptsEvictionProcRunning = 1;
-        aeCreateTimeEvent(server.el, 0, scriptsEvictionTimeProc, NULL, NULL);
+    if (!inst->isScriptsEvictionProcRunning) {
+        inst->isScriptsEvictionProcRunning = 1;
+        aeCreateTimeEvent(inst->el, 0, scriptsEvictionTimeProc, NULL, NULL);
     }
 }
 

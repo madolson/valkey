@@ -21,9 +21,7 @@ static const double EPSILON = 0.0001;                         /* values below th
 static const double TOKENS_BURST_RATE_SEC = 0.1;              /* burst capacity in seconds of sustained rate */
 static const double MIN_ADJUST_AFTER_DISABLE = 100.0;         /* initial rate when recovering from halted state */
 
-static hashtable *metrics_table = NULL;    /* Maps throtter type name to metricsEntry*. */
-static list *throttler_list = NULL;        /* all currently registered throttlers */
-static long long total_throttled_commands; /* framework-level cumulative throttled-command counter */
+static list *throttler_list = NULL; /* all currently registered throttlers */
 
 typedef struct metricsEntry {
     sds throttler_type;
@@ -73,14 +71,14 @@ static dictType guardrailAggDictType = {
 static metricsEntry *findMetrics(const char *name) {
     sds key = sdsnew(name);
     metricsEntry *found;
-    if (hashtableFind(metrics_table, key, (void **)&found)) {
+    if (hashtableFind(inst->metrics_table, key, (void **)&found)) {
         sdsfree(key);
         return found;
     }
     metricsEntry *m = zcalloc(sizeof(metricsEntry));
     m->throttler_type = key;
     m->incoming_tps = tpsCalculator_create(TPS_WINDOW_SEC);
-    hashtableAdd(metrics_table, m);
+    hashtableAdd(inst->metrics_table, m);
     return m;
 }
 
@@ -173,13 +171,13 @@ static void throttlerAddClient(throttler *t, client *c) {
 
     t->metrics->num_clients_throttled++;
     t->metrics->num_commands_throttled++;
-    total_throttled_commands++;
+    inst->total_throttled_commands++;
     c->throttler = t;
     c->throttle_node = listLast(t->client_queue);
 
     if (listLength(t->client_queue) == 1) {
         serverAssert(t->time_event_id == AE_DELETED_EVENT_ID);
-        t->time_event_id = aeCreateTimeEvent(server.el,
+        t->time_event_id = aeCreateTimeEvent(inst->el,
                                              waitTimeMs(t),
                                              throttlerTimeProc,
                                              t, NULL);
@@ -192,8 +190,8 @@ void throttle_init(void) {
     if (throttler_list == NULL) {
         throttler_list = listCreate();
     }
-    if (metrics_table == NULL) {
-        metrics_table = hashtableCreate(&metricsHashtableType);
+    if (inst->metrics_table == NULL) {
+        inst->metrics_table = hashtableCreate(&metricsHashtableType);
     }
 }
 
@@ -294,7 +292,7 @@ void throttle_removeClient(client *c) {
 
     if (listLength(t->client_queue) == 0) {
         serverAssert(t->time_event_id != AE_DELETED_EVENT_ID);
-        aeDeleteTimeEvent(server.el, t->time_event_id);
+        aeDeleteTimeEvent(inst->el, t->time_event_id);
         t->time_event_id = AE_DELETED_EVENT_ID;
         if (t->cleanup) freeThrottler(t);
     }
@@ -371,7 +369,7 @@ void throttle_getMetrics(const char *metrics_name, throttleMetrics *metrics) {
 }
 
 sds throttle_sdscatInfoMetrics(sds info) {
-    info = sdscatprintf(info, "total_throttled_commands:%lld\r\n", total_throttled_commands);
+    info = sdscatprintf(info, "total_throttled_commands:%lld\r\n", inst->total_throttled_commands);
 
     /* Report the longest-below-guardrail throttler per metrics type. */
     dict *guardrail_agg = NULL;

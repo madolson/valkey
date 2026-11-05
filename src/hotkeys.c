@@ -34,10 +34,10 @@ static spaceSavingManager *hotkeysCreateManager(void) {
  * ==========================================================================*/
 
 void hotkeysPurgeAll(void) {
-    if (!server.hotkeys_manager) return;
+    if (!inst->hotkeys_manager) return;
     /* Reset preserves the live window's sampling percentage, so there is nothing
      * to re-establish here. */
-    spaceSavingManagerReset(server.hotkeys_manager, getMonotonicUs());
+    spaceSavingManagerReset(inst->hotkeys_manager, getMonotonicUs());
 }
 
 /* Periodic maintenance from serverCron: close any window that has fully elapsed
@@ -46,7 +46,7 @@ void hotkeysPurgeAll(void) {
  * hang). Cheap: a subtract and a compare unless a boundary was actually crossed.
  * No-op when detection is disabled. */
 void hotkeysCron(void) {
-    if (server.hotkeys_manager) spaceSavingManagerRotate(server.hotkeys_manager, getMonotonicUs());
+    if (inst->hotkeys_manager) spaceSavingManagerRotate(inst->hotkeys_manager, getMonotonicUs());
 }
 
 /* The cluster hash slot is not stored per entry — it is derived from the key
@@ -64,12 +64,12 @@ static int hotkeysItemInDb(sds key, int dbid, void *arg) {
 /* Drop every entry on `slot` from both windows, so a removed slot's keys
  * disappear from reports immediately and do not resurface on rotation. */
 void hotkeysPurgeSlot(int slot) {
-    if (server.hotkeys_manager) spaceSavingManagerRemoveIf(server.hotkeys_manager, hotkeysItemInSlot, &slot);
+    if (inst->hotkeys_manager) spaceSavingManagerRemoveIf(inst->hotkeys_manager, hotkeysItemInSlot, &slot);
 }
 
 /* Drop every entry in database `dbid` from both windows. */
 void hotkeysPurgeDb(int dbid) {
-    if (server.hotkeys_manager) spaceSavingManagerRemoveIf(server.hotkeys_manager, hotkeysItemInDb, &dbid);
+    if (inst->hotkeys_manager) spaceSavingManagerRemoveIf(inst->hotkeys_manager, hotkeysItemInDb, &dbid);
 }
 
 /* Note: RENAME / MOVE / SWAPDB are intentionally NOT re-attributed. An entry is
@@ -87,7 +87,7 @@ void hotkeysPurgeDb(int dbid) {
 
 /* Record one sampled access (read or write) of `key` in database `dbid`. */
 static void hotkeysRecordSample(robj *key, int dbid) {
-    spaceSavingManager *m = server.hotkeys_manager;
+    spaceSavingManager *m = inst->hotkeys_manager;
     if (!m || !key) return;
     sds k = objectGetVal(key);
     if (!k) return;
@@ -101,9 +101,9 @@ static void hotkeysRecordSample(robj *key, int dbid) {
  * user key access and must not feed or evict the sampler). Importing traffic is
  * user-driven load and is counted. */
 static bool hotkeysShouldRecord(void) {
-    client *c = server.current_client;
+    client *c = inst->current_client;
     return c != NULL && c->flag.executing_command && !mustObeyClient(c) && !server.loading &&
-           !server.server_del_keys_in_slot;
+           !inst->server_del_keys_in_slot;
 }
 
 /* Charge a sampled read/write access of `key` in `dbid`, for a lookup carrying
@@ -195,7 +195,7 @@ void hotkeysGetCommand(client *c) {
     }
     /* Detection is enabled, so the manager must already exist (created by
      * hotkeysInit / the config callbacks whenever top-k is turned on). */
-    spaceSavingManager *m = server.hotkeys_manager;
+    spaceSavingManager *m = inst->hotkeys_manager;
     serverAssert(m != NULL);
 
     /* Close any window that has fully elapsed so we report the latest
@@ -272,7 +272,7 @@ bool hotkeysEnabled(void) {
  * above N/K are guaranteed tracked, so operators use it to gauge the detection
  * floor and how much to trust a given entry. 0 when detection is disabled. */
 static uint64_t hotkeysLastWindowSamples(void) {
-    return server.hotkeys_manager ? spaceSavingManagerFrozenTotal(server.hotkeys_manager) : 0;
+    return inst->hotkeys_manager ? spaceSavingManagerFrozenTotal(inst->hotkeys_manager) : 0;
 }
 
 /* Real duration of the last completed window, in microseconds. 0 means there is
@@ -280,7 +280,7 @@ static uint64_t hotkeysLastWindowSamples(void) {
  * was dropped for spanning more than twice the configured length — those cases
  * are not distinguishable from this value alone. */
 static uint64_t hotkeysLastWindowDurationUs(void) {
-    return server.hotkeys_manager ? spaceSavingManagerFrozenDurationUs(server.hotkeys_manager) : 0;
+    return inst->hotkeys_manager ? spaceSavingManagerFrozenDurationUs(inst->hotkeys_manager) : 0;
 }
 
 /* Append the fields of the INFO "hotkeys" section. The caller emits the section
@@ -302,19 +302,19 @@ sds genHotkeysInfoString(sds info) {
  * produced it, so an operator's in-flight HOTKEYS GET still sees it. No-op when
  * detection is disabled (no manager). Use HOTKEYS RESET to discard everything. */
 static void hotkeysManagerReconfigure(void) {
-    if (!server.hotkeys_manager) return;
-    spaceSavingManagerReconfigure(server.hotkeys_manager, server.hotkeys_top_k,
+    if (!inst->hotkeys_manager) return;
+    spaceSavingManagerReconfigure(inst->hotkeys_manager, server.hotkeys_top_k,
                                   (uint64_t)server.hotkeys_window_seconds * 1000000ULL, getMonotonicUs());
-    spaceSavingManagerSetLiveSamplingPercentage(server.hotkeys_manager, server.hotkeys_sampling_percentage);
+    spaceSavingManagerSetLiveSamplingPercentage(inst->hotkeys_manager, server.hotkeys_sampling_percentage);
 }
 
 /* Create or free the manager to match the enabled state. */
 static void hotkeysManagerSetEnabled(int enabled) {
-    if (enabled && !server.hotkeys_manager) {
-        server.hotkeys_manager = hotkeysCreateManager();
-    } else if (!enabled && server.hotkeys_manager) {
-        spaceSavingManagerRelease(server.hotkeys_manager);
-        server.hotkeys_manager = NULL;
+    if (enabled && !inst->hotkeys_manager) {
+        inst->hotkeys_manager = hotkeysCreateManager();
+    } else if (!enabled && inst->hotkeys_manager) {
+        spaceSavingManagerRelease(inst->hotkeys_manager);
+        inst->hotkeys_manager = NULL;
     }
 }
 
@@ -340,7 +340,7 @@ int hotkeysSamplingCallback(const char **err) {
  * reconfigures in place and keeps the last completed window. */
 int hotkeysTopKCallback(const char **err) {
     UNUSED(err);
-    if (hotkeysEnabled() && server.hotkeys_manager)
+    if (hotkeysEnabled() && inst->hotkeys_manager)
         hotkeysManagerReconfigure();
     else
         hotkeysManagerSetEnabled(hotkeysEnabled());

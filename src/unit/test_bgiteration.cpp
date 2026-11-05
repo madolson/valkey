@@ -72,8 +72,8 @@ static bool iteratorRepldoneFnNotBeingReadyInitially(void *privdata) {
  * starting with the same letter will be returned in a single call. */
 static size_t mockHashtableScan(hashtable *ht, size_t cursor, hashtableScanFunction fn, void *privdata) {
     // Just in case, if it's not one of our hashtables, use the unmocked function
-    bool our_ht = (server.db[0]->keys && ht == kvstoreGetHashtable(server.db[0]->keys, 0)) ||
-                  (server.db[1]->keys && ht == kvstoreGetHashtable(server.db[1]->keys, 0));
+    bool our_ht = (inst->db[0]->keys && ht == kvstoreGetHashtable(inst->db[0]->keys, 0)) ||
+                  (inst->db[1]->keys && ht == kvstoreGetHashtable(inst->db[1]->keys, 0));
     if (!our_ht) return __real_hashtableScan(ht, cursor, fn, privdata);
 
     // Collect all entries from the hashtable
@@ -121,8 +121,8 @@ static size_t mockHashtableScan(hashtable *ht, size_t cursor, hashtableScanFunct
 static bool mockHashtableScanHasPassedKey(hashtable *ht, const void *key, size_t cursor) {
     // If it's one of our tables, use the mock logic
     bool itsOurs = false;
-    if (server.db[0]->keys && ht == kvstoreGetHashtable(server.db[0]->keys, 0)) itsOurs = true;
-    if (server.db[1]->keys && ht == kvstoreGetHashtable(server.db[1]->keys, 0)) itsOurs = true;
+    if (inst->db[0]->keys && ht == kvstoreGetHashtable(inst->db[0]->keys, 0)) itsOurs = true;
+    if (inst->db[1]->keys && ht == kvstoreGetHashtable(inst->db[1]->keys, 0)) itsOurs = true;
 
     // Mock logic uses a lexicographic cursor
     if (itsOurs) return ((const char *)key)[0] < (char)('A' + cursor);
@@ -234,11 +234,11 @@ class BgIterationTest : public ::testing::Test {
 
 
     void initializeServerDb(int dbid, int slot_count_bits = 0) {
-        server.db[dbid] = static_cast<serverDb *>(zcalloc(sizeof(serverDb)));
-        server.db[dbid]->id = dbid;
-        server.db[dbid]->keys = kvstoreCreate(&kvstoreKeysHashtableType, slot_count_bits, 0);
-        server.db[dbid]->expires = kvstoreCreate(&kvstoreExpiresHashtableType, slot_count_bits, 0);
-        server.db[dbid]->watched_keys = dictCreate(&keylistDictType);
+        inst->db[dbid] = static_cast<serverDb *>(zcalloc(sizeof(serverDb)));
+        inst->db[dbid]->id = dbid;
+        inst->db[dbid]->keys = kvstoreCreate(&kvstoreKeysHashtableType, slot_count_bits, 0);
+        inst->db[dbid]->expires = kvstoreCreate(&kvstoreExpiresHashtableType, slot_count_bits, 0);
+        inst->db[dbid]->watched_keys = dictCreate(&keylistDictType);
     }
 
 
@@ -250,7 +250,7 @@ class BgIterationTest : public ::testing::Test {
     void addKeyToDb(int dbid, const char *key, const char *val) {
         robj *key_obj = createStringObjectFromCString(key);
         robj *val_obj = createStringObjectFromCString(val);
-        dbAdd(server.db[dbid], key_obj, &val_obj);
+        dbAdd(inst->db[dbid], key_obj, &val_obj);
         decrRefCount(key_obj);
     }
 
@@ -261,7 +261,7 @@ class BgIterationTest : public ::testing::Test {
 
         server.dbnum = DB_COUNT;
         server.cluster_enabled = false;
-        server.db = static_cast<serverDb **>(zcalloc(sizeof(serverDb *) * server.dbnum));
+        inst->db = static_cast<serverDb **>(zcalloc(sizeof(serverDb *) * server.dbnum));
 
         for (int dbid = 0; dbid < server.dbnum; dbid++) {
             initializeServerDb(dbid);
@@ -309,15 +309,15 @@ class BgIterationTest : public ::testing::Test {
         bgIteration_feedIterators(); // process returning stuff before deleting DB
         bgIteration_feedIterators(); // in case an iterator was closed there might be more
         for (int i = 0; i < server.dbnum; i++) {
-            if (server.db[i]->keys) kvstoreRelease(server.db[i]->keys);
-            if (server.db[i]->expires) kvstoreRelease(server.db[i]->expires);
-            dictRelease(server.db[i]->watched_keys);
-            zfree(server.db[i]);
+            if (inst->db[i]->keys) kvstoreRelease(inst->db[i]->keys);
+            if (inst->db[i]->expires) kvstoreRelease(inst->db[i]->expires);
+            dictRelease(inst->db[i]->watched_keys);
+            zfree(inst->db[i]);
         }
-        zfree(server.db);
+        zfree(inst->db);
 
         if (c != NULL) freeTestClient(c);
-        EXPECT_EQ(server.in_call, 0); // make sure tests are handling this properly
+        EXPECT_EQ(inst->in_call, 0); // make sure tests are handling this properly
     }
 
 
@@ -327,7 +327,7 @@ class BgIterationTest : public ::testing::Test {
         int db = getDbFromItemNum(itemNum);
 
         sds delKey = sdsnew(keyStr(itemNum));
-        int rc = kvstoreHashtableDelete(server.db[db]->keys, 0, delKey);
+        int rc = kvstoreHashtableDelete(inst->db[db]->keys, 0, delKey);
         ASSERT_EQ(rc, 1);
         sdsfree(delKey);
     }
@@ -337,7 +337,7 @@ class BgIterationTest : public ::testing::Test {
     dbEntry *getItem(int itemNum) {
         int db = getDbFromItemNum(itemNum);
         sds key = sdsnew(keyStr(itemNum));
-        dbEntry *de = dbFind(server.db[db], key);
+        dbEntry *de = dbFind(inst->db[db], key);
         sdsfree(key);
         return de;
     }
@@ -606,9 +606,9 @@ class BgIterationTest : public ::testing::Test {
     void debugPrintBucketInfo() {
         printf("*******DEBUG*******\n");
         for (int db = 0; db < server.dbnum; db++) {
-            int num_ht = kvstoreNumHashtables(server.db[db]->keys);
+            int num_ht = kvstoreNumHashtables(inst->db[db]->keys);
             for (int slot = 0; slot < num_ht; slot++) {
-                hashtable *ht = kvstoreGetHashtable(server.db[db]->keys, slot);
+                hashtable *ht = kvstoreGetHashtable(inst->db[db]->keys, slot);
                 if (!ht) continue;
 
                 printf("DB: %d, slot: %d\n", db, slot);
@@ -630,7 +630,7 @@ class BgIterationTest : public ::testing::Test {
         client *c = static_cast<client *>(zcalloc(sizeof(client)));
 
         c->cmd = lookupCommandByCString("set");
-        c->db = server.db[db];
+        c->db = inst->db[db];
 
         c->argc = 3;
         c->argv = static_cast<robj **>(zcalloc(sizeof(robj *) * c->argc));
@@ -657,7 +657,7 @@ class BgIterationTest : public ::testing::Test {
 
         c->cmd = lookupCommandByCString(cmdName);
         assert(c->cmd != nullptr);
-        c->db = server.db[db];
+        c->db = inst->db[db];
 
         c->argc = 2 + srcItemsNum.size();
         c->argv = static_cast<robj **>(zcalloc(sizeof(robj *) * c->argc));
@@ -690,7 +690,7 @@ class BgIterationTest : public ::testing::Test {
         char *token, *tokenSave;
 
         client *c = static_cast<client *>(zcalloc(sizeof(client)));
-        c->db = server.db[dbid];
+        c->db = inst->db[dbid];
         initClientMultiState(c);
         c->flag.multi = 1;
         c->mstate->cmd_flags |= CMD_WRITE;
@@ -763,7 +763,7 @@ class BgIterationTest : public ::testing::Test {
         cmd->legacy_range_key_spec.fk.range.keystep = 2;
 
         c->cmd = cmd;
-        c->db = server.db[db];
+        c->db = inst->db[db];
 
         c->argc = 4;
         c->argv = static_cast<robj **>(zcalloc(sizeof(robj *) * c->argc));
@@ -789,7 +789,7 @@ class BgIterationTest : public ::testing::Test {
         cmd->legacy_range_key_spec.begin_search_type = KSPEC_BS_INVALID; // No keys
 
         c->cmd = cmd;
-        c->db = server.db[0];
+        c->db = inst->db[0];
 
         c->argc = 1;
         c->argv = static_cast<robj **>(zcalloc(sizeof(robj *) * c->argc));
@@ -852,7 +852,7 @@ class BgIterationTest : public ::testing::Test {
         EXPECT_CALL(mock, blockClientInUseOnKeys(c, _, _)).Times(0);
         bool blocked = bgIteration_blockClientIfRequired(c);
         EXPECT_FALSE(blocked);
-        server.in_call++;
+        inst->in_call++;
     }
 
 
@@ -877,7 +877,7 @@ class BgIterationTest : public ::testing::Test {
         EXPECT_EQ(md_after_setkey, *md);      // the md value should still be the same
 
         bgIteration_handleCommandReplication(c->db->id, c->cmd, c->argc, c->argv);
-        server.in_call--;
+        inst->in_call--;
     }
 
 
@@ -918,7 +918,7 @@ class BgIterationTest : public ::testing::Test {
         simpleDelItem(itemNum); // Simulate the actual del
 
         // Replication happens after the deletion occurs
-        ASSERT_EQ(server.in_call, 0); // test sanity check
+        ASSERT_EQ(inst->in_call, 0); // test sanity check
         bgIteration_handleCommandReplication(db, cmd, 2, argv);
         decrRefCount(argv[0]);
         decrRefCount(argv[1]);
@@ -970,7 +970,7 @@ class BgIterationTest : public ::testing::Test {
         client *c = static_cast<client *>(zcalloc(sizeof(client)));
 
         c->cmd = lookupCommandByCString("swapdb");
-        c->db = server.db[0];
+        c->db = inst->db[0];
 
         c->argc = 3;
         c->argv = static_cast<robj **>(zcalloc(sizeof(robj *) * c->argc));
@@ -983,13 +983,13 @@ class BgIterationTest : public ::testing::Test {
         simulateUnblockedWrite_inCall(c); // SWAPDB should never block
 
         // The real SWAP does more than this, but this is enough for unit tests
-        serverDb *aux = server.db[dbid0];
-        server.db[dbid0] = server.db[dbid1];
-        server.db[dbid1] = aux;
+        serverDb *aux = inst->db[dbid0];
+        inst->db[dbid0] = inst->db[dbid1];
+        inst->db[dbid1] = aux;
         bgIteration_swapdb(dbid0, dbid1);
 
         bgIteration_handleCommandReplication(0, c->cmd, c->argc, c->argv);
-        server.in_call--;
+        inst->in_call--;
 
         freeTestClient(c);
     }
@@ -1001,10 +1001,10 @@ class BgIterationTest : public ::testing::Test {
 
         if (db == -1) {
             c->cmd = lookupCommandByCString("flushall");
-            c->db = server.db[0];
+            c->db = inst->db[0];
         } else {
             c->cmd = lookupCommandByCString("flushdb");
-            c->db = server.db[db];
+            c->db = inst->db[db];
         }
 
         c->argc = 1;
@@ -1024,8 +1024,8 @@ class BgIterationTest : public ::testing::Test {
         // Now flush the items
         for (int d = 0; d < server.dbnum; d++) {
             if (db == -1 || db == d) {
-                kvstoreRelease(server.db[d]->keys);
-                server.db[d]->keys = NULL;
+                kvstoreRelease(inst->db[d]->keys);
+                inst->db[d]->keys = NULL;
             }
         }
 
@@ -1036,7 +1036,7 @@ class BgIterationTest : public ::testing::Test {
         // and replicate
 
         bgIteration_handleCommandReplication(0, c->cmd, c->argc, c->argv);
-        server.in_call--;
+        inst->in_call--;
 
         freeTestClient(c);
     }
@@ -1954,7 +1954,7 @@ TEST_F(BgIterationTest, expireKeys_eventual_FutureKeyCreatedThenExpiredDuringSet
 
     // Finally, replication will be sent because this is creating a new key
     bgIteration_handleCommandReplication(getDbFromItemNum(8), c->cmd, c->argc, c->argv);
-    server.in_call--;
+    inst->in_call--;
 
     // Test that everything comes as expected
     expectReadKeySequence(it, 1, 2); // All one bucket - queued after key 0 read
@@ -2112,7 +2112,7 @@ TEST_F(BgIterationTest, writeWith2Keys_eventual_keyDeletedDuringSetReplace) {
 
     // Finally, we are letting bgIteration know that the write command was executed
     bgIteration_handleCommandReplication(getDbFromItemNum(12), c->cmd, c->argc, c->argv);
-    server.in_call--;
+    inst->in_call--;
 
     // Since the write command was not replicated, we expect all the keys to be read in the normal
     //  order from the dictionary.
@@ -2398,7 +2398,7 @@ TEST_F(BgIterationTest, copyHandlesProperDb_eventual) {
     // COPY B1 H0 DB 1 REPLACE
     c = static_cast<client *>(zcalloc(sizeof(client)));
     c->cmd = lookupCommandByCString("copy");
-    c->db = server.db[0];
+    c->db = inst->db[0];
     c->argc = 6;
     c->argv = static_cast<robj **>(zcalloc(sizeof(robj *) * c->argc));
     c->argv[0] = createStringObjectFromCString(c->cmd->fullname);
@@ -2429,7 +2429,7 @@ TEST_F(BgIterationTest, copyHandlesProperDb_eventual) {
 
     // And finally the replication (this should queue replication)
     bgIteration_handleCommandReplication(c->db->id, c->cmd, c->argc, c->argv);
-    server.in_call--;
+    inst->in_call--;
 
     expectReadKey(it, 3);
     expectReadKey(it, 4); // Queued along with key 3
@@ -2728,7 +2728,7 @@ TEST_F(BgIterationTest, multiBlocksOnFutureKey) {
     freeTestClient(c);
     c = getMultiClient("SET B0 xxx");
     simulateUnblockedWrite_inCall(c);
-    server.in_call--;
+    inst->in_call--;
 
     // and clean up the rest...
     expectReadKeySequence(it, 1, 5);
@@ -2755,7 +2755,7 @@ TEST_F(BgIterationTest, multiNotReplicatedButDelRecreateAccess) {
     simulateUnblockedWrite_inCall(c); // the EXEC
 
     // Simulate the DEL H1
-    server.in_exec = 1; // Simulate actual execution of the MULTI/EXEC
+    inst->in_exec = 1; // Simulate actual execution of the MULTI/EXEC
 
     advanceMultiClientToCommand(c, 0); // DEL H1
     EXPECT_CALL(mock, blockClientInUseOnKeys(c, _, _)).Times(0);
@@ -2777,8 +2777,8 @@ TEST_F(BgIterationTest, multiNotReplicatedButDelRecreateAccess) {
     // Now write to another existing future key - this should work if we weren't confused by the DEL
     advanceMultiClientToCommand(c, 2); // SET H2 yyy
     simulateUnblockedWriteWithModification(c);
-    server.in_exec = 0;
-    server.in_call--;
+    inst->in_exec = 0;
+    inst->in_call--;
 
     // Now we can continue iterating, and we should pick up keys 1...  (and no replication!)
     expectReadKeySequence(it, 1, 5);
@@ -2806,12 +2806,12 @@ TEST_F(BgIterationTest, multiCreatesNewKey_eventual) {
     int dbid = c->db->id;
     simulateUnblockedWrite_inCall(c); // the EXEC
 
-    server.in_exec = 1;
+    inst->in_exec = 1;
     advanceMultiClientToCommand(c, 0); // SET W0 xxx
     EXPECT_CALL(mock, blockClientInUseOnKeys(c, _, _)).Times(0);
     bool blocked = bgIteration_blockClientIfRequired(c);
     EXPECT_FALSE(blocked);
-    server.in_call++;
+    inst->in_call++;
     robj *value = dupStringObject(c->argv[2]);
     setKey(c, c->db, c->argv[1], &value, SETKEY_ADD_OR_UPDATE);
 
@@ -2819,13 +2819,13 @@ TEST_F(BgIterationTest, multiCreatesNewKey_eventual) {
     struct serverCommand *cmd_multi = lookupCommandByCString("multi");
     bgIteration_handleCommandReplication(dbid, cmd_multi, 1, &shared.multi);
     bgIteration_handleCommandReplication(dbid, c->cmd, c->argc, c->argv);
-    server.in_call--;
-    server.in_exec = 0;
+    inst->in_call--;
+    inst->in_exec = 0;
 
     // propagatePendingCommands() closes the transaction with EXEC
     struct serverCommand *cmd_exec = lookupCommandByCString("exec");
     bgIteration_handleCommandReplication(dbid, cmd_exec, 1, &shared.exec);
-    server.in_call--;
+    inst->in_call--;
 
     expectReadKeySequence(it, 1, 2); // already queued (same bucket as key 0)
     expectReadMultiReplication(it);
@@ -2853,24 +2853,24 @@ TEST_F(BgIterationTest, multiHandlesSelectProperly) {
     // These cases should NOT block...  (they access B0 in DB0)
     c = getMultiClient("SET B0 xxx");
     simulateUnblockedWrite_inCall(c);
-    server.in_call--;
+    inst->in_call--;
     freeTestClient(c);
     c = getMultiClient("SELECT 0; SET B0 xxx");
     simulateUnblockedWrite_inCall(c);
-    server.in_call--;
+    inst->in_call--;
     freeTestClient(c);
     c = getMultiClient("SET B0 xxx; SELECT 1");
     simulateUnblockedWrite_inCall(c);
-    server.in_call--;
+    inst->in_call--;
     freeTestClient(c);
     c = getMultiClient("SELECT 1; SELECT 0; SET B0 xxx; SELECT 1");
     simulateUnblockedWrite_inCall(c);
-    server.in_call--;
+    inst->in_call--;
     freeTestClient(c);
 
     // These cases SHOULD block...  (they access B0 in DB1)
     c = getMultiClient("SET B0 xxx");
-    c->db = server.db[1];
+    c->db = inst->db[1];
     simulateBlockedWrite(c);
     freeTestClient(c);
     c = getMultiClient("SELECT 1; SET B0 xxx");
@@ -2907,37 +2907,37 @@ TEST_F(BgIterationTest, multiHandlesSelectNoPermissionProperly) {
     //  The SELECTs below are inconsequential - with/without select, same result.
     c = getMultiClient("SET B0 xxx");
     simulateUnblockedWrite_inCall(c);
-    server.in_call--;
+    inst->in_call--;
     freeTestClient(c);
     c = getMultiClient("SELECT 0; SET B0 xxx");
     simulateUnblockedWrite_inCall(c);
-    server.in_call--;
+    inst->in_call--;
     freeTestClient(c);
     c = getMultiClient("SET B0 xxx; SELECT 1");
     simulateUnblockedWrite_inCall(c);
-    server.in_call--;
+    inst->in_call--;
     freeTestClient(c);
     c = getMultiClient("SELECT 1; SELECT 0; SET B0 xxx; SELECT 1");
     simulateUnblockedWrite_inCall(c);
-    server.in_call--;
+    inst->in_call--;
     freeTestClient(c);
 
     // These cases SHOULD block IF SELECT IS WORKING...  (they access B0 in DB1)
     c = getMultiClient("SET B0 xxx");
-    c->db = server.db[1];    // already starting on DB1
+    c->db = inst->db[1];     // already starting on DB1
     simulateBlockedWrite(c); // will block, no select
     freeTestClient(c);
     c = getMultiClient("SELECT 1; SET B0 xxx");
     simulateUnblockedWrite_inCall(c); // will not block because accessing DB0 (select fails)
-    server.in_call--;
+    inst->in_call--;
     freeTestClient(c);
     c = getMultiClient("SELECT 1; SET B0 xxx; SELECT 0");
     simulateUnblockedWrite_inCall(c); // will not block because accessing DB0 (select fails)
-    server.in_call--;
+    inst->in_call--;
     freeTestClient(c);
     c = getMultiClient("SELECT 0; SELECT 1; SET B0 xxx; SELECT 1");
     simulateUnblockedWrite_inCall(c); // will not block because accessing DB0 (select fails)
-    server.in_call--;
+    inst->in_call--;
 
     expectAnythingCleanup(it);
 }
@@ -2957,24 +2957,24 @@ TEST_F(BgIterationTest, multiHandlesSwapdbProperly) {
     // These cases should NOT block...  (they access B0 in DB0)
     c = getMultiClient("SET B0 xxx");
     simulateUnblockedWrite_inCall(c);
-    server.in_call--;
+    inst->in_call--;
     freeTestClient(c);
     c = getMultiClient("SET B0 xxx; SWAPDB 0 1");
     simulateUnblockedWrite_inCall(c);
-    server.in_call--;
+    inst->in_call--;
     freeTestClient(c);
     c = getMultiClient("SET B0 xxx; SWAPDB 0 1; SWAPDB 0 1; SET B0 xxx");
     simulateUnblockedWrite_inCall(c);
-    server.in_call--;
+    inst->in_call--;
     freeTestClient(c);
     c = getMultiClient("SWAPDB 0 1; SELECT 1; SET B0 xxx");
     simulateUnblockedWrite_inCall(c);
-    server.in_call--;
+    inst->in_call--;
     freeTestClient(c);
 
     // These cases SHOULD block...  (they access B0 in DB1)
     c = getMultiClient("SET B0 xxx");
-    c->db = server.db[1];
+    c->db = inst->db[1];
     simulateBlockedWrite(c);
     freeTestClient(c);
     c = getMultiClient("SWAPDB 1 0; SET B0 xxx; SWAPDB 0 1");
@@ -3011,37 +3011,37 @@ TEST_F(BgIterationTest, multiHandlesSwapdbNoPermissionProperly) {
     //  The SELECTs & SWAPDBs below are inconsequential - with/without select/swapdb, same result.
     c = getMultiClient("SET B0 xxx");
     simulateUnblockedWrite_inCall(c);
-    server.in_call--;
+    inst->in_call--;
     freeTestClient(c);
     c = getMultiClient("SET B0 xxx; SWAPDB 0 1");
     simulateUnblockedWrite_inCall(c);
-    server.in_call--;
+    inst->in_call--;
     freeTestClient(c);
     c = getMultiClient("SET B0 xxx; SWAPDB 0 1; SWAPDB 0 1; SET B0 xxx");
     simulateUnblockedWrite_inCall(c);
-    server.in_call--;
+    inst->in_call--;
     freeTestClient(c);
     c = getMultiClient("SWAPDB 0 1; SELECT 1; SET B0 xxx");
     simulateUnblockedWrite_inCall(c);
-    server.in_call--;
+    inst->in_call--;
     freeTestClient(c);
 
     // These cases SHOULD block IF SELECT/SWAPDB IS WORKING...  (they access B0 in DB1)
     c = getMultiClient("SET B0 xxx");
-    c->db = server.db[1];
+    c->db = inst->db[1];
     simulateBlockedWrite(c);
     freeTestClient(c);
     c = getMultiClient("SWAPDB 1 0; SET B0 xxx; SWAPDB 0 1");
     simulateUnblockedWrite_inCall(c); // will not block because accessing DB0 (swapdb fails)
-    server.in_call--;
+    inst->in_call--;
     freeTestClient(c);
     c = getMultiClient("SWAPDB 1 0; SELECT 0; SET B0 xxx; SWAPDB 0 1");
     simulateUnblockedWrite_inCall(c); // will not block because accessing DB0 (swapdb/select fails)
-    server.in_call--;
+    inst->in_call--;
     freeTestClient(c);
     c = getMultiClient("SWAPDB 1 0; SWAPDB 1 0; SELECT 1; SET B0 xxx; SELECT 1");
     simulateUnblockedWrite_inCall(c); // will not block because accessing DB0 (swapdb/select fails)
-    server.in_call--;
+    inst->in_call--;
 
     expectAnythingCleanup(it);
 }
@@ -3097,7 +3097,7 @@ TEST_F(BgIterationTest, testLuaWithUndeclaredKey) {
     monotime blockTimer;
     elapsedStart(&blockTimer);
     simulateUnblockedWrite_inCall(c); // Not blocked, but delays internally
-    server.in_call--;
+    inst->in_call--;
     // Must have delayed at least 150ms (some time may have passed before timer start)
     EXPECT_GT(elapsedMs(blockTimer), 150u);
 
@@ -3211,7 +3211,7 @@ TEST_F(BgIterationTest, checkNoKeysWriteIsReplicated) {
     c = getNoKeysWriteClient();
     simulateUnblockedWrite_inCall(c);
     bgIteration_handleCommandReplication(c->db->id, c->cmd, c->argc, c->argv);
-    server.in_call--;
+    inst->in_call--;
 
     expectReadKeySequence(it, 1, 2); // These were already in queue
 

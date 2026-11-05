@@ -41,10 +41,9 @@ scriptFlag scripts_flags_def[] = {
 };
 
 /* On script invocation, holding the current run context */
-static scriptRunCtx *curr_run_ctx = NULL;
 
 static void exitScriptTimedOutMode(scriptRunCtx *run_ctx) {
-    serverAssert(run_ctx == curr_run_ctx);
+    serverAssert(run_ctx == inst->curr_run_ctx);
     serverAssert(scriptIsTimedOut());
     run_ctx->flags &= ~SCRIPT_TIMEDOUT;
     blockingOperationEnds();
@@ -55,7 +54,7 @@ static void exitScriptTimedOutMode(scriptRunCtx *run_ctx) {
 }
 
 static void enterScriptTimedOutMode(scriptRunCtx *run_ctx) {
-    serverAssert(run_ctx == curr_run_ctx);
+    serverAssert(run_ctx == inst->curr_run_ctx);
     serverAssert(!scriptIsTimedOut());
     /* Mark script as timed out */
     run_ctx->flags |= SCRIPT_TIMEDOUT;
@@ -63,12 +62,12 @@ static void enterScriptTimedOutMode(scriptRunCtx *run_ctx) {
 }
 
 int scriptIsTimedOut(void) {
-    return scriptIsRunning() && (curr_run_ctx->flags & SCRIPT_TIMEDOUT);
+    return scriptIsRunning() && (inst->curr_run_ctx->flags & SCRIPT_TIMEDOUT);
 }
 
 client *scriptGetCaller(void) {
     serverAssert(scriptIsRunning());
-    return curr_run_ctx->original_client;
+    return inst->curr_run_ctx->original_client;
 }
 
 /* interrupt function for scripts, should be call
@@ -132,7 +131,7 @@ int scriptPrepareForRun(scriptRunCtx *run_ctx,
                         const char *funcname,
                         uint64_t script_flags,
                         int ro) {
-    serverAssert(!curr_run_ctx);
+    serverAssert(!inst->curr_run_ctx);
     int client_allow_oom = !!(caller->flag.allow_oom);
 
     int running_stale =
@@ -197,7 +196,7 @@ int scriptPrepareForRun(scriptRunCtx *run_ctx,
 
         /* Check OOM state. the no-writes flag imply allow-oom. we tested it
          * after the no-write error, so no need to mention it in the error reply. */
-        if (!client_allow_oom && server.pre_command_oom_state && server.maxmemory &&
+        if (!client_allow_oom && inst->pre_command_oom_state && server.maxmemory &&
             !(script_flags & (SCRIPT_FLAG_ALLOW_OOM | SCRIPT_FLAG_NO_WRITES))) {
             addReplyError(caller, "-OOM allow-oom flag is not set on the script, "
                                   "can not run it when used memory > 'maxmemory'");
@@ -240,15 +239,15 @@ int scriptPrepareForRun(scriptRunCtx *run_ctx,
         run_ctx->flags |= SCRIPT_ALLOW_CROSS_SLOT;
     }
 
-    /* set the curr_run_ctx so we can use it to kill the script if needed */
-    curr_run_ctx = run_ctx;
+    /* set the inst->curr_run_ctx so we can use it to kill the script if needed */
+    inst->curr_run_ctx = run_ctx;
 
     return C_OK;
 }
 
 /* Reset the given run ctx after execution */
 void scriptResetRun(scriptRunCtx *run_ctx) {
-    serverAssert(curr_run_ctx);
+    serverAssert(inst->curr_run_ctx);
 
     if (scriptIsTimedOut()) {
         exitScriptTimedOutMode(run_ctx);
@@ -263,110 +262,110 @@ void scriptResetRun(scriptRunCtx *run_ctx) {
 
     preventCommandPropagation(run_ctx->original_client);
 
-    /*  unset curr_run_ctx so we will know there is no running script */
-    curr_run_ctx = NULL;
+    /*  unset inst->curr_run_ctx so we will know there is no running script */
+    inst->curr_run_ctx = NULL;
 }
 
 /* return true if a script is currently running */
 int scriptIsRunning(void) {
-    return curr_run_ctx != NULL;
+    return inst->curr_run_ctx != NULL;
 }
 
 const char *scriptCurrFunction(void) {
     serverAssert(scriptIsRunning());
-    return curr_run_ctx->funcname;
+    return inst->curr_run_ctx->funcname;
 }
 
 int scriptIsEval(void) {
     serverAssert(scriptIsRunning());
-    return curr_run_ctx->flags & SCRIPT_EVAL_MODE;
+    return inst->curr_run_ctx->flags & SCRIPT_EVAL_MODE;
 }
 
 /* Kill the current running script */
 void scriptKill(client *c, int is_eval) {
-    if (!curr_run_ctx) {
+    if (!inst->curr_run_ctx) {
         addReplyError(c, "-NOTBUSY No scripts in execution right now.");
         return;
     }
-    if (mustObeyClient(curr_run_ctx->original_client)) {
+    if (mustObeyClient(inst->curr_run_ctx->original_client)) {
         addReplyError(c, "-UNKILLABLE The busy script was sent by a master instance in the context of replication and "
                          "cannot be killed.");
         return;
     }
-    if (curr_run_ctx->flags & SCRIPT_WRITE_DIRTY) {
+    if (inst->curr_run_ctx->flags & SCRIPT_WRITE_DIRTY) {
         addReplyError(c, "-UNKILLABLE Sorry the script already executed write "
                          "commands against the dataset. You can either wait the "
                          "script termination or kill the server in a hard way "
                          "using the SHUTDOWN NOSAVE command.");
         return;
     }
-    if (is_eval && !(curr_run_ctx->flags & SCRIPT_EVAL_MODE)) {
+    if (is_eval && !(inst->curr_run_ctx->flags & SCRIPT_EVAL_MODE)) {
         /* Kill a function with 'SCRIPT KILL' is not allow */
         addReplyErrorObject(c, shared.slowscripterr);
         return;
     }
-    if (!is_eval && (curr_run_ctx->flags & SCRIPT_EVAL_MODE)) {
+    if (!is_eval && (inst->curr_run_ctx->flags & SCRIPT_EVAL_MODE)) {
         /* Kill an eval with 'FUNCTION KILL' is not allow */
         addReplyErrorObject(c, shared.slowevalerr);
         return;
     }
-    curr_run_ctx->flags |= SCRIPT_KILLED;
+    inst->curr_run_ctx->flags |= SCRIPT_KILLED;
     addReply(c, shared.ok);
 }
 
 long long scriptRunDuration(void) {
     serverAssert(scriptIsRunning());
-    return elapsedMs(curr_run_ctx->start_time);
+    return elapsedMs(inst->curr_run_ctx->start_time);
 }
 
 int scriptAllowsOOM(void) {
     serverAssert(scriptIsRunning());
-    return curr_run_ctx->flags & SCRIPT_ALLOW_OOM;
+    return inst->curr_run_ctx->flags & SCRIPT_ALLOW_OOM;
 }
 
 int scriptIsReadOnly(void) {
     serverAssert(scriptIsRunning());
-    return curr_run_ctx->flags & SCRIPT_READ_ONLY;
+    return inst->curr_run_ctx->flags & SCRIPT_READ_ONLY;
 }
 
 int scriptIsWriteDirty(void) {
     serverAssert(scriptIsRunning());
-    return curr_run_ctx->flags & SCRIPT_WRITE_DIRTY;
+    return inst->curr_run_ctx->flags & SCRIPT_WRITE_DIRTY;
 }
 
 void scriptSetWriteDirtyFlag(void) {
     serverAssert(scriptIsRunning());
-    curr_run_ctx->flags |= SCRIPT_WRITE_DIRTY;
+    inst->curr_run_ctx->flags |= SCRIPT_WRITE_DIRTY;
 }
 
 int scriptAllowsCrossSlot(void) {
     serverAssert(scriptIsRunning());
-    return curr_run_ctx->flags & SCRIPT_ALLOW_CROSS_SLOT;
+    return inst->curr_run_ctx->flags & SCRIPT_ALLOW_CROSS_SLOT;
 }
 
 int scriptGetSlot(void) {
     serverAssert(scriptIsRunning());
-    return curr_run_ctx->slot;
+    return inst->curr_run_ctx->slot;
 }
 
 void scriptSetSlot(int slot) {
     serverAssert(scriptIsRunning());
-    curr_run_ctx->slot = slot;
+    inst->curr_run_ctx->slot = slot;
 }
 
 void scriptSetOriginalClientSlot(int slot) {
     serverAssert(scriptIsRunning());
-    curr_run_ctx->original_client->slot = slot;
+    inst->curr_run_ctx->original_client->slot = slot;
 }
 
 sds scriptGetRunningEngineName(void) {
     serverAssert(scriptIsRunning());
-    return scriptingEngineGetName(curr_run_ctx->engine);
+    return scriptingEngineGetName(inst->curr_run_ctx->engine);
 }
 
 /* For cross-slot scripting, its caller client's slot must be invalidated,
  * such that its slot-stats aggregation is bypassed. */
 void scriptClusterSlotStatsInvalidateSlotIfApplicable(void) {
     if (!scriptAllowsCrossSlot()) return;
-    curr_run_ctx->original_client->slot = -1;
+    inst->curr_run_ctx->original_client->slot = -1;
 }

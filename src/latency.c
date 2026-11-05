@@ -269,10 +269,10 @@ sds createLatencyReport(void) {
 
         /* Potentially commands. */
         if (!strcasecmp(event, "command")) {
-            if (server.commandlog[COMMANDLOG_TYPE_SLOW].threshold < 0 || server.commandlog[COMMANDLOG_TYPE_SLOW].max_len == 0) {
+            if (server.commandlog_threshold[COMMANDLOG_TYPE_SLOW] < 0 || server.commandlog_max_len[COMMANDLOG_TYPE_SLOW] == 0) {
                 advise_slowlog_enabled = 1;
                 advices++;
-            } else if (server.commandlog[COMMANDLOG_TYPE_SLOW].threshold / 1000 > server.latency_monitor_threshold) {
+            } else if (server.commandlog_threshold[COMMANDLOG_TYPE_SLOW] / 1000 > server.latency_monitor_threshold) {
                 advise_slowlog_tuning = 1;
                 advices++;
             }
@@ -767,7 +767,7 @@ void durationAddSample(int type, monotime duration) {
     if (type >= EL_DURATION_TYPE_NUM) {
         return;
     }
-    durationStats *ds = &server.duration_stats[type];
+    durationStats *ds = &inst->duration_stats[type];
     ds->cnt++;
     ds->sum += duration;
     if (duration > ds->max) {

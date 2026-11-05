@@ -91,7 +91,7 @@ class NetworkingTest : public ::testing::Test {
   protected:
     void SetUp() override {
         /* Initialize server fields that are accessed by networking functions */
-        server.commandlog[COMMANDLOG_TYPE_LARGE_REPLY].threshold = -1; /* Disable tracking */
+        server.commandlog_threshold[COMMANDLOG_TYPE_LARGE_REPLY] = -1; /* Disable tracking */
         server.debug_client_enforce_reply_list = 0;
     }
 };

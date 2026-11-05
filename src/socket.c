@@ -122,7 +122,7 @@ static int connSocketConnect(connection *conn,
 
     conn->conn_handler = connect_handler;
     int priority_flag = connGetAEPriorityFlag(conn);
-    if (aeCreateFileEvent(server.el, conn->fd, AE_WRITABLE | priority_flag, conn->type->ae_handler, conn) == AE_ERR)
+    if (aeCreateFileEvent(inst->el, conn->fd, AE_WRITABLE | priority_flag, conn->type->ae_handler, conn) == AE_ERR)
         goto error;
 
     return C_OK;
@@ -148,7 +148,7 @@ static void connSocketShutdown(connection *conn) {
 /* Close the connection and free resources. */
 static void connSocketClose(connection *conn) {
     if (conn->fd != -1) {
-        aeDeleteFileEvent(server.el, conn->fd, AE_READABLE | AE_WRITABLE);
+        aeDeleteFileEvent(inst->el, conn->fd, AE_READABLE | AE_WRITABLE);
         close(conn->fd);
         conn->fd = -1;
     }
@@ -252,8 +252,8 @@ static int connSocketSetWriteHandler(connection *conn, ConnectionCallbackFunc fu
         conn->flags &= ~CONN_FLAG_WRITE_BARRIER;
     int priority_flag = connGetAEPriorityFlag(conn);
     if (!conn->write_handler)
-        aeDeleteFileEvent(server.el, conn->fd, AE_WRITABLE);
-    else if (aeCreateFileEvent(server.el, conn->fd, AE_WRITABLE | priority_flag, conn->type->ae_handler, conn) == AE_ERR)
+        aeDeleteFileEvent(inst->el, conn->fd, AE_WRITABLE);
+    else if (aeCreateFileEvent(inst->el, conn->fd, AE_WRITABLE | priority_flag, conn->type->ae_handler, conn) == AE_ERR)
         return C_ERR;
     return C_OK;
 }
@@ -267,8 +267,8 @@ static int connSocketSetReadHandler(connection *conn, ConnectionCallbackFunc fun
     conn->read_handler = func;
     int priority_flag = connGetAEPriorityFlag(conn);
     if (!conn->read_handler)
-        aeDeleteFileEvent(server.el, conn->fd, AE_READABLE);
-    else if (aeCreateFileEvent(server.el, conn->fd, AE_READABLE | priority_flag, conn->type->ae_handler, conn) == AE_ERR)
+        aeDeleteFileEvent(inst->el, conn->fd, AE_READABLE);
+    else if (aeCreateFileEvent(inst->el, conn->fd, AE_READABLE | priority_flag, conn->type->ae_handler, conn) == AE_ERR)
         return C_ERR;
     return C_OK;
 }
@@ -376,7 +376,7 @@ static void connSocketCloseListener(connListener *listener) {
     for (j = 0; j < listener->count; j++) {
         if (listener->fd[j] == -1) continue;
 
-        aeDeleteFileEvent(server.el, listener->fd[j], AE_READABLE);
+        aeDeleteFileEvent(inst->el, listener->fd[j], AE_READABLE);
         close(listener->fd[j]);
     }
 

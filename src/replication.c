@@ -2236,7 +2236,7 @@ void rdbPipeWriteHandlerConnRemoved(struct connection *conn) {
     server.rdb_pipe_numconns_writing--;
     /* if there are no more writes for now for this conn, or write error: */
     if (server.rdb_pipe_numconns_writing == 0) {
-        if (aeCreateFileEvent(server.el, server.rdb_pipe_read, AE_READABLE, rdbPipeReadHandler, NULL) == AE_ERR) {
+        if (aeCreateFileEvent(inst->el, server.rdb_pipe_read, AE_READABLE, rdbPipeReadHandler, NULL) == AE_ERR) {
             serverPanic("Unrecoverable error creating server.rdb_pipe_read file event.");
         }
     }
@@ -2293,7 +2293,7 @@ void rdbPipeReadHandler(struct aeEventLoop *eventLoop, int fd, void *clientData,
         if (server.rdb_pipe_bufflen == 0) {
             /* EOF - write end was closed. */
             int stillUp = 0;
-            aeDeleteFileEvent(server.el, server.rdb_pipe_read, AE_READABLE);
+            aeDeleteFileEvent(inst->el, server.rdb_pipe_read, AE_READABLE);
             for (i = 0; i < server.rdb_pipe_numconns; i++) {
                 connection *conn = server.rdb_pipe_conns[i];
                 if (!conn) continue;
@@ -2343,7 +2343,7 @@ void rdbPipeReadHandler(struct aeEventLoop *eventLoop, int fd, void *clientData,
 
         /*  Remove the pipe read handler if at least one write handler was set. */
         if (server.rdb_pipe_numconns_writing) {
-            aeDeleteFileEvent(server.el, server.rdb_pipe_read, AE_READABLE);
+            aeDeleteFileEvent(inst->el, server.rdb_pipe_read, AE_READABLE);
             break;
         }
     }
@@ -2373,7 +2373,7 @@ void slotMigrationPipeWriteHandler(struct connection *conn) {
     /* Remove the write handler and set up the pipe read handler. */
     connSetWriteHandler(conn, NULL);
     target->repl_data->repl_last_partial_write = 0;
-    if (aeCreateFileEvent(server.el, server.slot_migration_pipe_read, AE_READABLE, slotMigrationPipeReadHandler, NULL) == AE_ERR) {
+    if (aeCreateFileEvent(inst->el, server.slot_migration_pipe_read, AE_READABLE, slotMigrationPipeReadHandler, NULL) == AE_ERR) {
         serverPanic("Unrecoverable error creating server.slot_migration_pipe_read file event.");
     }
 }
@@ -2401,7 +2401,7 @@ void slotMigrationPipeReadHandler(struct aeEventLoop *eventLoop, int fd, void *c
 
         if (server.slot_migration_pipe_bufflen == 0) {
             /* EOF - write end was closed. */
-            aeDeleteFileEvent(server.el, server.slot_migration_pipe_read, AE_READABLE);
+            aeDeleteFileEvent(inst->el, server.slot_migration_pipe_read, AE_READABLE);
             /* Now that the target have finished reading, notify the child that it's safe to exit.
              * When the server detects the child has exited, it can mark the target as online, and
              * start streaming the slot replication buffers. */
@@ -2433,7 +2433,7 @@ void slotMigrationPipeReadHandler(struct aeEventLoop *eventLoop, int fd, void *c
          * setup write handler and disable pipe read handler. */
         if (nwritten != server.slot_migration_pipe_bufflen) {
             connSetWriteHandler(conn, slotMigrationPipeWriteHandler);
-            aeDeleteFileEvent(server.el, server.slot_migration_pipe_read, AE_READABLE);
+            aeDeleteFileEvent(inst->el, server.slot_migration_pipe_read, AE_READABLE);
             return;
         }
     }
@@ -2943,7 +2943,7 @@ int replicaLoadPrimaryRDBFromSocket(connection *conn, char *buf, char *eofmark, 
         /* We will soon start loading the RDB from socket, the replication history is changed,
          * we must discard the cached primary structure and force resync of sub-replicas. */
         replicationAttachToNewPrimary();
-        dbarray = server.db;
+        dbarray = inst->db;
         functions_lib_ctx = functionsLibCtxGetCurrent();
     }
 
@@ -3027,7 +3027,7 @@ int replicaLoadPrimaryRDBFromSocket(connection *conn, char *buf, char *eofmark, 
     }
 
     /* Inform about db change, as replication was diskless and didn't cause a save. */
-    server.dirty++;
+    inst->dirty++;
 
     stopLoading(1);
 
@@ -5107,7 +5107,7 @@ void replicationSetPrimary(char *ip, int port, int full_sync_required, bool disc
         server.primary->flag.dont_cache_primary = full_sync_required;
         /* The primary may be the client running this command, which is still
          * in use until the command returns. */
-        if (server.primary == server.current_client)
+        if (server.primary == inst->current_client)
             freeClientAsync(server.primary);
         else
             freeClient(server.primary);
@@ -5170,7 +5170,7 @@ void replicationUnsetPrimary(void) {
      * replicationHandlePrimaryDisconnection which can attempt to re-connect. */
     sdsfree(server.primary_host);
     server.primary_host = NULL;
-    if (server.primary && server.primary == server.current_client) {
+    if (server.primary && server.primary == inst->current_client) {
         /* The primary is running this command, so it is still in use until the
          * command returns. Free it then instead of caching it. */
         server.primary->flag.dont_cache_primary = 1;
@@ -6395,7 +6395,7 @@ void failoverCommand(client *c) {
  */
 void updateFailoverStatus(void) {
     if (server.failover_state != FAILOVER_WAIT_FOR_SYNC) return;
-    mstime_t now = server.mstime;
+    mstime_t now = inst->mstime;
 
     /* Check if failover operation has timed out */
     if (server.failover_end_time && server.failover_end_time <= now) {

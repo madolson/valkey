@@ -1704,7 +1704,7 @@ void pfaddCommand(client *c) {
         HLL_INVALIDATE_CACHE(hdr);
         signalModifiedKey(c, c->db, c->argv[1]);
         notifyKeyspaceEvent(NOTIFY_STRING, "pfadd", c->argv[1], c->db->id);
-        server.dirty += updated;
+        inst->dirty += updated;
     }
     if (invalid)
         addReplyError(c, invalid_hll_err);
@@ -1802,7 +1802,7 @@ void pfcountCommand(client *c) {
              * may be modified and given that the HLL is a string
              * we need to propagate the change. */
             signalModifiedKey(c, c->db, c->argv[1]);
-            server.dirty++;
+            inst->dirty++;
         }
         addReplyLongLong(c, card);
     }
@@ -1883,7 +1883,7 @@ void pfmergeCommand(client *c) {
     /* We generate a PFADD event for PFMERGE for semantical simplicity
      * since in theory this is a mass-add of elements. */
     notifyKeyspaceEvent(NOTIFY_STRING, "pfadd", c->argv[1], c->db->id);
-    server.dirty++;
+    inst->dirty++;
     addReply(c, shared.ok);
 }
 
@@ -2044,7 +2044,7 @@ void pfdebugCommand(client *c) {
                 addReplyError(c, invalid_hll_err);
                 return;
             }
-            server.dirty++; /* Force propagation on encoding change. */
+            inst->dirty++; /* Force propagation on encoding change. */
         }
 
         hdr = objectGetVal(o);
@@ -2115,7 +2115,7 @@ void pfdebugCommand(client *c) {
                 return;
             }
             conv = 1;
-            server.dirty++; /* Force propagation on encoding change. */
+            inst->dirty++; /* Force propagation on encoding change. */
         }
         addReply(c, conv ? shared.cone : shared.czero);
     } else {

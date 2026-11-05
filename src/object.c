@@ -104,10 +104,10 @@ void objectSetMetadataSize(size_t size) {
     serverAssert(object_metadata_size == 0);
 
     /* Check that all databases are empty */
-    if (server.db != NULL) {
+    if (inst->db != NULL) {
         for (int j = 0; j < server.dbnum; j++) {
-            if (server.db[j] != NULL) {
-                serverAssert(kvstoreSize(server.db[j]->keys) == 0);
+            if (inst->db[j] != NULL) {
+                serverAssert(kvstoreSize(inst->db[j]->keys) == 0);
             }
         }
     }
@@ -995,7 +995,7 @@ void trimStringObjectIfNeeded(robj *o, int trim_small_values) {
      * 3. When calling from RM_TrimStringAllocation (trim_small_values is true). */
     size_t len = sdslen(o->val_ptr);
     if (len >= PROTO_MBULK_BIG_ARG || trim_small_values ||
-        (server.executing_client && server.executing_client->flag.script && len < LUA_CMD_OBJCACHE_MAX_LEN)) {
+        (inst->executing_client && inst->executing_client->flag.script && len < LUA_CMD_OBJCACHE_MAX_LEN)) {
         if (sdsavail(o->val_ptr) > len / 10) {
             o->val_ptr = sdsRemoveFreeSpace(o->val_ptr, 0);
         }
@@ -1591,7 +1591,7 @@ struct serverMemOverhead *getMemoryOverheadData(void) {
     mem_total += mh->functions_caches;
 
     for (j = 0; j < server.dbnum; j++) {
-        serverDb *db = server.db[j];
+        serverDb *db = inst->db[j];
         if (db == NULL) continue;
 
         unsigned long long keyscount = kvstoreSize(db->keys);

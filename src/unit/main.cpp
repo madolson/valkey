@@ -12,6 +12,10 @@
 extern "C" {
 #include "sha256.h"
 #include "util.h"
+
+struct valkeyInstance;
+extern struct valkeyInstance server_instance;
+extern __thread struct valkeyInstance *inst;
 }
 
 
@@ -37,6 +41,7 @@ char *getFlagValue(int argc, char **argv, const char *flag) {
 }
 
 int main(int argc, char **argv) {
+    inst = &server_instance;
     accurate = hasFlag(argc, argv, "--accurate");
     large_memory = hasFlag(argc, argv, "--large-memory");
     valgrind = hasFlag(argc, argv, "--valgrind");

@@ -30,17 +30,17 @@ class BlockedInuseTest : public ::testing::Test {
     }
 
     void SetUp() override {
-        server.unblocked_clients = listCreate();
-        ASSERT_EQ(server.blocked_clients_by_type[BLOCKED_INUSE], 0u);
+        inst->unblocked_clients = listCreate();
+        ASSERT_EQ(inst->blocked_clients_by_type[BLOCKED_INUSE], 0u);
         ASSERT_EQ(getBlockInUseKeyCount(), 0);
     }
 
     void TearDown() override {
-        ASSERT_EQ(server.blocked_clients_by_type[BLOCKED_INUSE], 0u);
+        ASSERT_EQ(inst->blocked_clients_by_type[BLOCKED_INUSE], 0u);
         ASSERT_EQ(getBlockInUseKeyCount(), 0);
-        ASSERT_EQ(listLength(server.unblocked_clients), 0UL);
-        listRelease(server.unblocked_clients);
-        server.unblocked_clients = NULL;
+        ASSERT_EQ(listLength(inst->unblocked_clients), 0UL);
+        listRelease(inst->unblocked_clients);
+        inst->unblocked_clients = NULL;
     }
 
 
@@ -80,10 +80,10 @@ using BlockedInuseDeathTest = BlockedInuseTest;
 
 
 TEST_F(BlockedInuseTest, blockInitialState) {
-    EXPECT_EQ(server.blocked_clients_by_type[BLOCKED_INUSE], 0u);
+    EXPECT_EQ(inst->blocked_clients_by_type[BLOCKED_INUSE], 0u);
     EXPECT_EQ(getBlockInUseKeyCount(), 0);
-    EXPECT_EQ(listLength(server.unblocked_clients), 0UL);
-    ASSERT_NE(server.unblocked_clients, nullptr);
+    EXPECT_EQ(listLength(inst->unblocked_clients), 0UL);
+    ASSERT_NE(inst->unblocked_clients, nullptr);
 }
 
 TEST_F(BlockedInuseTest, blockClientOnSingleKey) {
@@ -94,18 +94,18 @@ TEST_F(BlockedInuseTest, blockClientOnSingleKey) {
     // Block
     blockClientInUseOnKeys(c, 1, keys);
     verifyClientBlockState(c, 1, 0);
-    EXPECT_EQ(server.blocked_clients_by_type[BLOCKED_INUSE], 1u);
+    EXPECT_EQ(inst->blocked_clients_by_type[BLOCKED_INUSE], 1u);
     EXPECT_EQ(getBlockInUseKeyCount(), 1);
     EXPECT_EQ(key->refcount, 3u);
 
     // Unblock
     unblockClientsInUseOnKey(key);
     verifyClientBlockState(c, 0, 1);
-    EXPECT_EQ(server.blocked_clients_by_type[BLOCKED_INUSE], 0u);
+    EXPECT_EQ(inst->blocked_clients_by_type[BLOCKED_INUSE], 0u);
     EXPECT_EQ(getBlockInUseKeyCount(), 0);
     EXPECT_EQ(key->refcount, 1u);
-    EXPECT_EQ(listLength(server.unblocked_clients), 1UL);
-    EXPECT_EQ(listFirst(server.unblocked_clients)->value, c);
+    EXPECT_EQ(listLength(inst->unblocked_clients), 1UL);
+    EXPECT_EQ(listFirst(inst->unblocked_clients)->value, c);
 
     // Process unblocked client in event loop
     EXPECT_CALL(mock, processPendingCommandAndInputBuffer(c)).WillOnce(Return(C_OK));
@@ -113,7 +113,7 @@ TEST_F(BlockedInuseTest, blockClientOnSingleKey) {
     processUnblockedClients();
     verifyClientBlockState(c, 0, 0);
     EXPECT_EQ(key->refcount, 1u);
-    EXPECT_EQ(listLength(server.unblocked_clients), 0UL);
+    EXPECT_EQ(listLength(inst->unblocked_clients), 0UL);
     decrRefCount(key);
     freeFakeClient(c);
 }
@@ -146,7 +146,7 @@ TEST_F(BlockedInuseTest, blockClientOnMultipleKeys) {
     // Block
     blockClientInUseOnKeys(c, 2, keys);
     verifyClientBlockState(c, 1, 0);
-    EXPECT_EQ(server.blocked_clients_by_type[BLOCKED_INUSE], 1u);
+    EXPECT_EQ(inst->blocked_clients_by_type[BLOCKED_INUSE], 1u);
     EXPECT_EQ(getBlockInUseKeyCount(), 2);
     EXPECT_EQ(key1->refcount, 3u);
     EXPECT_EQ(key2->refcount, 3u);
@@ -154,7 +154,7 @@ TEST_F(BlockedInuseTest, blockClientOnMultipleKeys) {
     // Unblock key1
     unblockClientsInUseOnKey(key1);
     verifyClientBlockState(c, 1, 0);
-    EXPECT_EQ(server.blocked_clients_by_type[BLOCKED_INUSE], 1u);
+    EXPECT_EQ(inst->blocked_clients_by_type[BLOCKED_INUSE], 1u);
     EXPECT_EQ(getBlockInUseKeyCount(), 1);
     EXPECT_EQ(key1->refcount, 1u);
     EXPECT_EQ(key2->refcount, 3u);
@@ -162,19 +162,19 @@ TEST_F(BlockedInuseTest, blockClientOnMultipleKeys) {
     // Unblock key2, client gets unblocked
     unblockClientsInUseOnKey(key2);
     verifyClientBlockState(c, 0, 1);
-    EXPECT_EQ(server.blocked_clients_by_type[BLOCKED_INUSE], 0u);
+    EXPECT_EQ(inst->blocked_clients_by_type[BLOCKED_INUSE], 0u);
     EXPECT_EQ(getBlockInUseKeyCount(), 0);
     EXPECT_EQ(key1->refcount, 1u);
     EXPECT_EQ(key2->refcount, 1u);
-    EXPECT_EQ(listLength(server.unblocked_clients), 1UL);
-    EXPECT_EQ(listFirst(server.unblocked_clients)->value, c);
+    EXPECT_EQ(listLength(inst->unblocked_clients), 1UL);
+    EXPECT_EQ(listFirst(inst->unblocked_clients)->value, c);
 
     // Process unblocked client in event loop
     EXPECT_CALL(mock, processPendingCommandAndInputBuffer(c)).WillOnce(Return(C_OK));
     EXPECT_CALL(mock, beforeNextClient(c)).Times(1);
     processUnblockedClients();
     verifyClientBlockState(c, 0, 0);
-    EXPECT_EQ(listLength(server.unblocked_clients), 0UL);
+    EXPECT_EQ(listLength(inst->unblocked_clients), 0UL);
 
     EXPECT_EQ(key1->refcount, 1u);
     EXPECT_EQ(key2->refcount, 1u);
@@ -194,7 +194,7 @@ TEST_F(BlockedInuseTest, blockMultipleClientsOnSameKey) {
     blockClientInUseOnKeys(c2, 1, keys);
     verifyClientBlockState(c1, 1, 0);
     verifyClientBlockState(c2, 1, 0);
-    EXPECT_EQ(server.blocked_clients_by_type[BLOCKED_INUSE], 2u);
+    EXPECT_EQ(inst->blocked_clients_by_type[BLOCKED_INUSE], 2u);
     EXPECT_EQ(getBlockInUseKeyCount(), 1);
     EXPECT_EQ(key->refcount, 4u);
 
@@ -202,10 +202,10 @@ TEST_F(BlockedInuseTest, blockMultipleClientsOnSameKey) {
     unblockClientsInUseOnKey(key);
     verifyClientBlockState(c1, 0, 1);
     verifyClientBlockState(c2, 0, 1);
-    EXPECT_EQ(server.blocked_clients_by_type[BLOCKED_INUSE], 0u);
+    EXPECT_EQ(inst->blocked_clients_by_type[BLOCKED_INUSE], 0u);
     EXPECT_EQ(getBlockInUseKeyCount(), 0);
     EXPECT_EQ(key->refcount, 1u);
-    EXPECT_EQ(listLength(server.unblocked_clients), 2UL);
+    EXPECT_EQ(listLength(inst->unblocked_clients), 2UL);
 
     // Process client in event loop
     EXPECT_CALL(mock, processPendingCommandAndInputBuffer(c1)).WillOnce(Return(C_OK));
@@ -215,7 +215,7 @@ TEST_F(BlockedInuseTest, blockMultipleClientsOnSameKey) {
     processUnblockedClients();
     verifyClientBlockState(c1, 0, 0);
     verifyClientBlockState(c2, 0, 0);
-    EXPECT_EQ(listLength(server.unblocked_clients), 0UL);
+    EXPECT_EQ(listLength(inst->unblocked_clients), 0UL);
 
     EXPECT_EQ(key->refcount, 1u);
     decrRefCount(key);
@@ -231,16 +231,16 @@ TEST_F(BlockedInuseTest, unblockBlockedClient) {
     // Block
     blockClientInUseOnKeys(c, 1, keys);
     verifyClientBlockState(c, 1, 0);
-    EXPECT_EQ(server.blocked_clients_by_type[BLOCKED_INUSE], 1u);
+    EXPECT_EQ(inst->blocked_clients_by_type[BLOCKED_INUSE], 1u);
     EXPECT_EQ(getBlockInUseKeyCount(), 1);
     EXPECT_EQ(key->refcount, 3u);
 
     // Unblock client, simulate freeClient
     unblockClient(c, 0);
     EXPECT_FALSE(c->flag.blocked);
-    EXPECT_EQ(server.blocked_clients_by_type[BLOCKED_INUSE], 0u);
+    EXPECT_EQ(inst->blocked_clients_by_type[BLOCKED_INUSE], 0u);
     EXPECT_EQ(getBlockInUseKeyCount(), 0);
-    EXPECT_EQ(listLength(server.unblocked_clients), 0UL);
+    EXPECT_EQ(listLength(inst->unblocked_clients), 0UL);
     EXPECT_EQ(key->refcount, 1u);
     decrRefCount(key);
     freeFakeClient(c);
@@ -255,7 +255,7 @@ TEST_F(BlockedInuseTest, blockClientOnDuplicateKeys) {
     // Block
     blockClientInUseOnKeys(c, 2, keys);
     verifyClientBlockState(c, 1, 0);
-    EXPECT_EQ(server.blocked_clients_by_type[BLOCKED_INUSE], 1u);
+    EXPECT_EQ(inst->blocked_clients_by_type[BLOCKED_INUSE], 1u);
     EXPECT_EQ(getBlockInUseKeyCount(), 1);
     EXPECT_EQ(key1->refcount, 3u);
     EXPECT_EQ(key2->refcount, 1u); // Key is deduplicated, only blocked once
@@ -263,17 +263,17 @@ TEST_F(BlockedInuseTest, blockClientOnDuplicateKeys) {
     // Unblock
     unblockClientsInUseOnKey(key1);
     verifyClientBlockState(c, 0, 1);
-    EXPECT_EQ(server.blocked_clients_by_type[BLOCKED_INUSE], 0u);
+    EXPECT_EQ(inst->blocked_clients_by_type[BLOCKED_INUSE], 0u);
     EXPECT_EQ(getBlockInUseKeyCount(), 0);
-    EXPECT_EQ(listLength(server.unblocked_clients), 1UL);
-    EXPECT_EQ(listFirst(server.unblocked_clients)->value, c);
+    EXPECT_EQ(listLength(inst->unblocked_clients), 1UL);
+    EXPECT_EQ(listFirst(inst->unblocked_clients)->value, c);
 
     // Process client in event loop
     EXPECT_CALL(mock, processPendingCommandAndInputBuffer(c)).WillOnce(Return(C_OK));
     EXPECT_CALL(mock, beforeNextClient(c)).Times(1);
     processUnblockedClients();
     verifyClientBlockState(c, 0, 0);
-    EXPECT_EQ(listLength(server.unblocked_clients), 0UL);
+    EXPECT_EQ(listLength(inst->unblocked_clients), 0UL);
     EXPECT_EQ(key1->refcount, 1u);
     EXPECT_EQ(key2->refcount, 1u);
     decrRefCount(key1);
@@ -294,7 +294,7 @@ TEST_F(BlockedInuseTest, unblockAllKeys) {
     blockClientInUseOnKeys(c2, 1, keys2);
     verifyClientBlockState(c1, 1, 0);
     verifyClientBlockState(c2, 1, 0);
-    EXPECT_EQ(server.blocked_clients_by_type[BLOCKED_INUSE], 2u);
+    EXPECT_EQ(inst->blocked_clients_by_type[BLOCKED_INUSE], 2u);
     EXPECT_EQ(getBlockInUseKeyCount(), 2);
     EXPECT_EQ(key1->refcount, 3u);
     EXPECT_EQ(key2->refcount, 3u);
@@ -303,9 +303,9 @@ TEST_F(BlockedInuseTest, unblockAllKeys) {
     unblockClientsInUseOnAllKeys();
     verifyClientBlockState(c1, 0, 1);
     verifyClientBlockState(c2, 0, 1);
-    EXPECT_EQ(server.blocked_clients_by_type[BLOCKED_INUSE], 0u);
+    EXPECT_EQ(inst->blocked_clients_by_type[BLOCKED_INUSE], 0u);
     EXPECT_EQ(getBlockInUseKeyCount(), 0);
-    EXPECT_EQ(listLength(server.unblocked_clients), 2UL);
+    EXPECT_EQ(listLength(inst->unblocked_clients), 2UL);
 
     // Process clients
     EXPECT_CALL(mock, processPendingCommandAndInputBuffer(c1)).WillOnce(Return(C_OK));
@@ -315,7 +315,7 @@ TEST_F(BlockedInuseTest, unblockAllKeys) {
     processUnblockedClients();
     verifyClientBlockState(c1, 0, 0);
     verifyClientBlockState(c2, 0, 0);
-    EXPECT_EQ(listLength(server.unblocked_clients), 0UL);
+    EXPECT_EQ(listLength(inst->unblocked_clients), 0UL);
     EXPECT_EQ(key1->refcount, 1u);
     EXPECT_EQ(key2->refcount, 1u);
     decrRefCount(key1);
@@ -333,7 +333,7 @@ TEST_F(BlockedInuseTest, blockingOnKeysPrimaryClient) {
     blockClientInUseOnKeys(c, 1, keys);
     EXPECT_TRUE(c->flag.blocked);
     unblockClientsInUseOnKey(key);
-    listEmpty(server.unblocked_clients);
+    listEmpty(inst->unblocked_clients);
     decrRefCount(key);
     freeFakeClient(c);
 }

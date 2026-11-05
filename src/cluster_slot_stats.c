@@ -148,7 +148,7 @@ void clusterSlotStatsAddNetworkBytesOutForUserClient(client *c) {
 
 /* Accumulates egress bytes upon sending replication stream. This only applies for primary nodes. */
 static void clusterSlotStatsUpdateNetworkBytesOutForReplication(long long len) {
-    client *c = server.current_client;
+    client *c = inst->current_client;
     if (c == NULL || !clusterSlotStatsEnabled(c->slot)) return;
 
     /* We multiply the bytes len by the number of replicas to account for us broadcasting to multiple replicas at once. */
@@ -216,8 +216,8 @@ void clusterSlotStatResetAll(void) {
  */
 static int canAddCpuDuration(client *c) {
     return clusterSlotStatsEnabled(c->slot) &&
-           (!server.execution_nesting ||         /* Either; */
-            (server.execution_nesting &&         /* 1) Command should not be nested, or */
+           (!inst->execution_nesting ||          /* Either; */
+            (inst->execution_nesting &&          /* 1) Command should not be nested, or */
              c->realcmd->flags & CMD_BLOCKING)); /* 2) If command is nested, it must be due to unblocking. */
 }
 
@@ -234,7 +234,7 @@ static int canAddNetworkBytesIn(client *c) {
      * Third, blocked client is not aggregated, to avoid duplicate aggregation upon unblocking.
      * Fourth, the server is not under a MULTI/EXEC transaction, to avoid duplicate aggregation of
      * EXEC's 14 bytes RESP upon nested call()'s afterCommand(). */
-    return clusterSlotStatsEnabled(c->slot) && !(c->flag.blocked) && !server.in_exec;
+    return clusterSlotStatsEnabled(c->slot) && !(c->flag.blocked) && !inst->in_exec;
 }
 
 /* Adds network ingress bytes of the current command in execution,

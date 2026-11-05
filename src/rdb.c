@@ -75,7 +75,7 @@
 #define rdbReportReadError(...) rdbReportError(0, __LINE__, __VA_ARGS__)
 
 /* This macro tells if we are in the context of a RESTORE command, and not loading an RDB or AOF. */
-#define isRestoreContext() ((server.current_client == NULL || server.current_client->id == CLIENT_ID_AOF) ? 0 : 1)
+#define isRestoreContext() ((inst->current_client == NULL || inst->current_client->id == CLIENT_ID_AOF) ? 0 : 1)
 
 char *rdbFileBeingLoaded = NULL; /* used for rdb checking on read error */
 extern int rdbCheckMode;
@@ -1519,7 +1519,7 @@ ssize_t rdbSaveDb(rio *rdb, int dbid, int rdbflags, int rdbver, long *key_counte
     static long long info_updated_time = 0;
     char *pname = (rdbflags & RDBFLAGS_AOF_PREAMBLE) ? "AOF rewrite" : "RDB";
 
-    serverDb *db = server.db[dbid];
+    serverDb *db = inst->db[dbid];
     if (db == NULL) return 0;
     unsigned long long int db_size = kvstoreSize(db->keys) + kvstoreImportingSize(db->keys);
     if (db_size == 0) return 0;
@@ -1837,7 +1837,7 @@ int rdbSave(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
     }
 
     serverLog(LL_NOTICE, "DB saved on disk");
-    server.dirty = 0;
+    inst->dirty = 0;
     server.lastsave = time(NULL);
     server.lastbgsave_status = C_OK;
     stopSaving(1);
@@ -2699,7 +2699,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error, int rd
 
             if (rdbtype == RDB_TYPE_LIST_QUICKLIST_2) {
                 lp = data;
-                server.stat_dump_payload_sanitizations++;
+                inst->stat_dump_payload_sanitizations++;
                 if (!lpValidateIntegrity(lp, encoded_len, NULL, NULL, 0)) {
                     rdbReportCorruptRDB("Listpack integrity check failed.");
                     decrRefCount(o);
@@ -2831,7 +2831,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error, int rd
             break;
         }
         case RDB_TYPE_SET_INTSET:
-            server.stat_dump_payload_sanitizations++;
+            inst->stat_dump_payload_sanitizations++;
             if (!intsetValidateIntegrity(encoded, encoded_len, 1)) {
                 rdbReportCorruptRDB("Intset integrity check failed.");
                 zfree(encoded);
@@ -2844,7 +2844,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error, int rd
             if (intsetLen(objectGetVal(o)) > server.set_max_intset_entries) setTypeConvert(o, OBJ_ENCODING_HASHTABLE);
             break;
         case RDB_TYPE_SET_LISTPACK:
-            server.stat_dump_payload_sanitizations++;
+            inst->stat_dump_payload_sanitizations++;
             if (!lpValidateIntegrityAndDups(encoded, encoded_len, 0, 0)) {
                 rdbReportCorruptRDB("Set listpack integrity check failed.");
                 zfree(encoded);
@@ -2902,7 +2902,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error, int rd
             break;
         }
         case RDB_TYPE_ZSET_LISTPACK:
-            server.stat_dump_payload_sanitizations++;
+            inst->stat_dump_payload_sanitizations++;
             if (!lpValidateIntegrityAndDups(encoded, encoded_len, 1, 0)) {
                 rdbReportCorruptRDB("Zset listpack integrity check failed.");
                 zfree(encoded);
@@ -2960,7 +2960,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error, int rd
         case RDB_TYPE_HASH_LISTPACK: {
             /* Tagged metadata (field TTLs) never appears in this type;
              * it indicates corruption. */
-            server.stat_dump_payload_sanitizations++;
+            inst->stat_dump_payload_sanitizations++;
             if (!lpValidateIntegrityAndDups(encoded, encoded_len, 1, 0)) {
                 rdbReportCorruptRDB("Hash listpack integrity check failed.");
                 zfree(encoded);
@@ -3028,7 +3028,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error, int rd
                 decrRefCount(o);
                 return NULL;
             }
-            server.stat_dump_payload_sanitizations++;
+            inst->stat_dump_payload_sanitizations++;
             if (!streamValidateListpackIntegrity(lp, lp_size, &valid_entries)) {
                 rdbReportCorruptRDB("Stream listpack integrity check failed.");
                 sdsfree(nodekey);
@@ -3665,7 +3665,7 @@ int rdbLoadRioWithLoadingCtx(rio *rdb,
  * The filename is used only for diagnostic messages. */
 int rdbLoadRio(rio *rdb, int rdbflags, rdbSaveInfo *rsi, const char *filename) {
     functionsLibCtx *functions_lib_ctx = functionsLibCtxGetCurrent();
-    rdbLoadingCtx loading_ctx = {.dbarray = server.db, .functions_lib_ctx = functions_lib_ctx};
+    rdbLoadingCtx loading_ctx = {.dbarray = inst->db, .functions_lib_ctx = functions_lib_ctx};
     return rdbLoadRioWithLoadingCtx(rdb, rdbflags, rsi, &loading_ctx, filename);
 }
 
@@ -3813,7 +3813,7 @@ static int rdbLoadRioInternal(rio *rdb, int rdbflags, rdbSaveInfo *rsi, rdbLoadi
                 serverLog(LL_WARNING, "Opcode %d requires RDB version 81 or newer", type);
                 goto loaderr;
             }
-            if (rdb_loading_ctx->dbarray != server.db) {
+            if (rdb_loading_ctx->dbarray != inst->db) {
                 serverLog(LL_WARNING, "Inline RDB commands are not supported with swapdb loading");
                 goto loaderr;
             }
@@ -4371,7 +4371,7 @@ static void backgroundSaveDoneHandlerSocket(int exitcode, int bysignal) {
     }
     if (server.rdb_child_exit_pipe != -1) close(server.rdb_child_exit_pipe);
     if (server.rdb_pipe_read > 0) {
-        aeDeleteFileEvent(server.el, server.rdb_pipe_read, AE_READABLE);
+        aeDeleteFileEvent(inst->el, server.rdb_pipe_read, AE_READABLE);
         close(server.rdb_pipe_read);
     }
     server.rdb_child_exit_pipe = -1;
@@ -4590,7 +4590,7 @@ int rdbSaveToReplicasSockets(int req, int rdbver, compressionAlgo compr, rdbSave
                 zfree(conns);
             } else {
                 close(rdb_pipe_write); /* close write in parent so that it can detect the close on the child. */
-                if (aeCreateFileEvent(server.el, server.rdb_pipe_read, AE_READABLE, rdbPipeReadHandler, NULL) ==
+                if (aeCreateFileEvent(inst->el, server.rdb_pipe_read, AE_READABLE, rdbPipeReadHandler, NULL) ==
                     AE_ERR) {
                     serverPanic("Unrecoverable error creating server.rdb_pipe_read file event.");
                 }
@@ -4667,8 +4667,8 @@ void bgsaveCommand(client *c) {
 
     if (isSaveInProgress()) {
         addReplyError(c, "Background save already in progress");
-    } else if (hasActiveChildProcess() || server.in_exec) {
-        if (schedule || server.in_exec) {
+    } else if (hasActiveChildProcess() || inst->in_exec) {
+        if (schedule || inst->in_exec) {
             /* The save method is chosen when the scheduled save starts. */
             server.rdb_bgsave_scheduled = 1;
             if (schedule) {
@@ -4845,7 +4845,7 @@ int rdbWriteEofAndChecksum(rio *rdb) {
 /* Common state updates when a background save starts. */
 void rdbRecordStartMetrics(int bgsave_type, int write_target) {
     if (write_target == RDB_WRITE_TARGET_DISK) {
-        server.dirty_before_bgsave = server.dirty;
+        server.dirty_before_bgsave = inst->dirty;
         server.lastbgsave_try = time(NULL);
     }
     server.rdb_save_time_start = time(NULL);
@@ -4867,7 +4867,7 @@ void rdbRecordEndMetrics(int bgsave_type, int status, time_t save_end) {
     server.lastbgsave_status = status;
     server.lastbgsave_type = bgsave_type;
     if (status == C_OK) {
-        server.dirty = server.dirty - server.dirty_before_bgsave;
+        inst->dirty = inst->dirty - server.dirty_before_bgsave;
         server.lastsave = save_end;
     }
 }
