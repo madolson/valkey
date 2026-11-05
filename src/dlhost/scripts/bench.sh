@@ -37,7 +37,7 @@ dlhost)
   N=$1; M=$2; shift 2
   RUN=$W/run; mkdir -p $RUN
   taskset -c $SCPU /tmp/chunky-dlmopen/src/valkey-dlhost --so /tmp/chunky-dlmopen/src/libvalkey-engine.so --engines $N --io-threads $M --port 10100 --rundir $RUN "$@" > $D/host.log 2>&1 &
-  PIDS+=($!); waitping -p 10100; BARGS=(-p 10100); TARGET=10100 ;;
+  PIDS+=($!); waitping -p 10100; BARGS=(${CLUSTERCLIENT:+--cluster} -p 10100); TARGET=10100 ;;
 esac
 echo "${PIDS[@]}" >> /tmp/chunky-dlmopen-pids
 echo "$LABEL $KIND $* pids=${PIDS[*]} $(date -u +%FT%TZ)" > $D/meta.txt

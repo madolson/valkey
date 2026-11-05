@@ -17,6 +17,10 @@
  *   --pin-io "cpu,cpu,..."   pin IO thread k to the k-th cpu
  *   --pin-engines "cpu,..."  pin engine i to the i-th cpu (sets server-cpulist)
  *   --copy-dlopen            dlopen a private copy per engine instead of dlmopen
+ *   --node-ports             also listen on port+1..port+N-1 and answer CLUSTER
+ *                            SLOTS with engine i's range on port+i, so a
+ *                            cluster client sends each connection one engine's
+ *                            keys (no mixed pipelines)
  *   --raw                    hand engines raw RESP to re-parse on their main
  *                            thread, instead of argv built on the IO thread
  */
@@ -45,6 +49,7 @@
 #include "dlhost.h"
 
 #define MAXN 16
+#define HOSTE MAXN /* pseudo-engine: replies the host generates itself */
 #define MAXIO 64
 #define DLHOST_MSG_REPLY 3
 #define DLHOST_MSG_ECLOSED 4
@@ -66,7 +71,7 @@ typedef struct hconn {
     int close_engine; /* 1 + engine that closed its client (QUIT, kill) */
     struct hconn *dirty_next;
     buf in, out;
-    buf rep[MAXN];
+    buf rep[MAXN + 1];
     uint8_t *order;
     size_t ohead, otail, ocap; /* ring of engine ids, one per request */
     void *eslot[MAXN];
@@ -75,7 +80,7 @@ typedef struct hconn {
 typedef struct iothread {
     int id;
     int ep;
-    int lfd;
+    int lfd[MAXN];
     dlhostInbox inbox; /* replies from engines */
     pthread_t tid;
     int cpu;
@@ -88,6 +93,7 @@ static const char *so_path = "./libvalkey-engine.so";
 static const char *rundir = "/tmp/chunky-dlmopen-run";
 static int copy_dlopen = 0;
 static int raw_mode = 0;
+static int node_ports = 0;
 static dlhostEngineParseFn eng_parse[MAXN];
 static void (*ns_ctype_init[MAXN])(void);
 
@@ -163,6 +169,7 @@ static void hconnRelease(hconn *hc) {
     free(hc->in.p);
     free(hc->out.p);
     for (int i = 0; i < N; i++) free(hc->rep[i].p);
+    free(hc->rep[HOSTE].p);
     free(hc->order);
     free(hc);
 }
@@ -345,6 +352,10 @@ static long parseRequest(const char *p, size_t len, int *engine) {
         if (i == 1) a1 = p + o + hl, l1 = al;
         o += hl + al + 2;
     }
+    if (argc == 2 && l0 == 7 && l1 == 5 && !strncasecmp(a0, "cluster", 7) && !strncasecmp(a1, "slots", 5)) {
+        *engine = HOSTE;
+        return (long)o;
+    }
     if (argc >= 2 && N > 1 && !isKeyless(a0, l0)) *engine = keyHashSlot(a1, (int)l1) * N / 16384;
     return (long)o;
 }
@@ -396,6 +407,23 @@ static void connClose(iothread *t, hconn *hc) {
     if (!hc->dirty) hconnRelease(hc);
 }
 
+/* CLUSTER SLOTS as the host presents itself: one node owning everything, or
+ * with --node-ports, engine i's range served on port+i. */
+static void appendClusterSlots(buf *b) {
+    char tmp[256];
+    int nodes = node_ports ? N : 1;
+    int l = snprintf(tmp, sizeof(tmp), "*%d\r\n", nodes);
+    bufAppend(b, tmp, l);
+    for (int i = 0; i < nodes; i++) {
+        int from = i * 16384 / nodes, to = (i + 1) * 16384 / nodes - 1;
+        char id[41];
+        snprintf(id, sizeof(id), "%040d", i + 1);
+        l = snprintf(tmp, sizeof(tmp), "*3\r\n:%d\r\n:%d\r\n*3\r\n$9\r\n127.0.0.1\r\n:%d\r\n$40\r\n%s\r\n", from, to,
+                     port + i, id);
+        bufAppend(b, tmp, l);
+    }
+}
+
 #define MAXSPANS 1024
 static void connRead(iothread *t, hconn *hc) {
     if (hc->close_engine) return; /* nothing after QUIT runs */
@@ -415,7 +443,7 @@ static void connRead(iothread *t, hconn *hc) {
     int eng[MAXSPANS];
     for (;;) {
         int ns = 0;
-        size_t tot[MAXN] = {0};
+        size_t tot[MAXN + 1] = {0};
         size_t o = hc->in.off;
         while (ns < MAXSPANS && o < hc->in.len) {
             int e;
@@ -433,8 +461,8 @@ static void connRead(iothread *t, hconn *hc) {
             o += l;
         }
         if (ns == 0) break;
-        dlhostMsg *m[MAXN] = {0};
-        int inl[MAXN] = {0};
+        dlhostMsg *m[MAXN + 1] = {0};
+        int inl[MAXN + 1] = {0};
         for (int i = 0; i < ns; i++)
             if (hc->in.p[start[i]] != '*') inl[eng[i]] = 1;
         for (int e = 0; e < N; e++) {
@@ -460,6 +488,12 @@ static void connRead(iothread *t, hconn *hc) {
             m[e]->len = 0;
         }
         for (int i = 0; i < ns; i++) {
+            if (eng[i] == HOSTE) {
+                appendClusterSlots(&hc->rep[HOSTE]);
+                markDirty(t, hc);
+                orderPush(hc, HOSTE);
+                continue;
+            }
             dlhostMsg *x = m[eng[i]];
             if (x->type == DLHOST_MSG_DATA) {
                 memcpy(x->data + x->len, hc->in.p + start[i], len[i]);
@@ -553,9 +587,9 @@ static void *ioMain(void *arg) {
         int n = epoll_wait(t->ep, evs, 256, -1);
         for (int i = 0; i < n; i++) {
             void *p = evs[i].data.ptr;
-            if (p == &t->lfd) {
+            if (p >= (void *)t->lfd && p < (void *)(t->lfd + MAXN)) {
                 for (;;) {
-                    int fd = accept4(t->lfd, NULL, NULL, SOCK_NONBLOCK);
+                    int fd = accept4(*(int *)p, NULL, NULL, SOCK_NONBLOCK);
                     if (fd < 0) break;
                     int one = 1;
                     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
@@ -736,6 +770,8 @@ int main(int argc, char **argv) {
             parseCpus(argv[++i], pin_io, &npin_io);
         else if (!strcmp(argv[i], "--pin-engines") && i + 1 < argc)
             parseCpus(argv[++i], pin_eng, &npin_eng);
+        else if (!strcmp(argv[i], "--node-ports"))
+            node_ports = 1;
         else if (!strcmp(argv[i], "--raw"))
             raw_mode = 1;
         else if (!strcmp(argv[i], "--copy-dlopen"))
@@ -785,17 +821,22 @@ int main(int argc, char **argv) {
         t->ep = epoll_create1(EPOLL_CLOEXEC);
         t->inbox.wake_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
         atomic_init(&t->inbox.head, NULL);
-        t->lfd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
-        int one = 1;
-        setsockopt(t->lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-        setsockopt(t->lfd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one));
-        struct sockaddr_in sa = {.sin_family = AF_INET, .sin_port = htons(port), .sin_addr.s_addr = htonl(0x7f000001)};
-        if (bind(t->lfd, (struct sockaddr *)&sa, sizeof(sa)) < 0 || listen(t->lfd, 1024) < 0) {
-            perror("bind/listen");
-            return 1;
+        struct epoll_event ev = {.events = EPOLLIN};
+        for (int pi = 0; pi < (node_ports ? N : 1); pi++) {
+            t->lfd[pi] = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+            int one = 1;
+            setsockopt(t->lfd[pi], SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+            setsockopt(t->lfd[pi], SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one));
+            struct sockaddr_in sa = {.sin_family = AF_INET,
+                                     .sin_port = htons(port + pi),
+                                     .sin_addr.s_addr = htonl(0x7f000001)};
+            if (bind(t->lfd[pi], (struct sockaddr *)&sa, sizeof(sa)) < 0 || listen(t->lfd[pi], 1024) < 0) {
+                perror("bind/listen");
+                return 1;
+            }
+            ev.data.ptr = &t->lfd[pi];
+            epoll_ctl(t->ep, EPOLL_CTL_ADD, t->lfd[pi], &ev);
         }
-        struct epoll_event ev = {.events = EPOLLIN, .data.ptr = &t->lfd};
-        epoll_ctl(t->ep, EPOLL_CTL_ADD, t->lfd, &ev);
         ev.data.ptr = &t->inbox;
         epoll_ctl(t->ep, EPOLL_CTL_ADD, t->inbox.wake_fd, &ev);
         pthread_create(&t->tid, NULL, ioMain, t);
