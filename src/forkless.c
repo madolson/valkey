@@ -9,9 +9,10 @@ static const void *PROCESS_COMPLETE_ITEM = (void *)-1;
 static const int SNAPSHOT_FILE_CLOSE_MONITOR_INTERVAL_MS = 200;
 static const int REPLICATION_MONITOR_INTERVAL_MS = 100;
 
-typedef struct {
-    rio save_rio; /* Must be 1st to permit cast from rio back to forklessSaveInfo */
-    int cur_db;   /* Last selectDb issued */
+typedef struct forklessSaveInfo {
+    rio save_rio;                    /* Must be 1st to permit cast from rio back to forklessSaveInfo */
+    struct valkeyInstance *instance; /* Instance being saved */
+    int cur_db;                      /* Last selectDb issued */
     bgIterator *iterator;
     uint64_t bytes_written;
     int err_code;
@@ -258,6 +259,7 @@ static int writeSyncPreamble(forklessSaveInfo *saveInfo) {
 static void *forklessSaveProcessor(void *arg) {
     serverAssert(!onServerMainThread());
     forklessSaveInfo *saveInfo = arg;
+    inst = saveInfo->instance;
 
     /* Pin this background save thread to the configured bgsave CPU list, the
      * same way the fork-based bgsave child does */
@@ -724,6 +726,7 @@ static void startBackgroundThread(forklessSaveInfo *saveInfo) {
     serverInitThreadAttribute(&attr);
     pthread_rc = pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
     serverAssert(pthread_rc == 0);
+    saveInfo->instance = inst;
     pthread_rc = pthread_create(&thread_id, &attr, &forklessSaveProcessor, saveInfo);
     serverAssert(pthread_rc == 0);
     pthread_rc = pthread_attr_destroy(&attr);
