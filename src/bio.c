@@ -130,8 +130,9 @@ typedef union bio_job {
 
     struct {
         int type;
-        lazy_free_fn *free_fn; /* Function that will free the provided arguments */
-        void *free_args[];     /* List of arguments to be passed to the free function */
+        struct valkeyInstance *instance; /* Instance that owns the objects being freed */
+        lazy_free_fn *free_fn;           /* Function that will free the provided arguments */
+        void *free_args[];               /* List of arguments to be passed to the free function */
     } free_args;
 
     struct {
@@ -198,6 +199,7 @@ void bioCreateLazyFreeJob(lazy_free_fn free_fn, int arg_count, ...) {
     /* Allocate memory for the job structure and all required
      * arguments */
     bio_job *job = allocBioJob(sizeof(void *) * (arg_count));
+    job->free_args.instance = inst;
     job->free_args.free_fn = free_fn;
 
     va_start(valist, arg_count);
@@ -317,6 +319,8 @@ void *bioProcessBackgroundJobs(void *arg) {
             }
             if (job_type == BIO_CLOSE_AOF) close(job->fd_args.fd);
         } else if (job_type == BIO_LAZY_FREE) {
+            /* Freeing can run instance code, e.g. a scripting engine releasing its clients. */
+            inst = job->free_args.instance;
             job->free_args.free_fn(job->free_args.free_args);
         } else if (job_type == BIO_RDB_SAVE) {
             replicaReceiveRDBFromPrimaryToDisk(job->save_to_disk_args.conn, job->save_to_disk_args.is_dual_channel,
