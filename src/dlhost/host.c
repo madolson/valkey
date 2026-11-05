@@ -748,6 +748,10 @@ static void loadEngine(int i) {
     }
 }
 
+static void *noopThread(void *arg) {
+    return arg;
+}
+
 static void onTerm(int sig) {
     (void)sig;
     _exit(0);
@@ -793,6 +797,14 @@ int main(int argc, char **argv) {
      * namespace's malloc, from threads the engines' libpthread created.
      * Those threads never ran this libc's __ctype_init, and arena_get2()
      * parses /sys with isspace() via get_nprocs() unless arena_max is set. */
+    /* This libc's internal locks (malloc arenas included) skip the lock
+     * prefix until its own libpthread has created a thread. Engine threads
+     * come from the namespaces' libpthread, yet ld.so allocates their TLS
+     * and DTVs with this libc's malloc, concurrently. Create one thread now
+     * so this libc knows it is multithreaded. */
+    pthread_t noop;
+    pthread_create(&noop, NULL, noopThread, NULL);
+    pthread_join(noop, NULL);
     mallopt(M_ARENA_MAX, 2 * MAXIO);
     /* Every libc copy caches the program break in its own __curbrk, so two
      * copies growing their main arena with brk shrink each other's heap.
