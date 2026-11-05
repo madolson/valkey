@@ -1946,6 +1946,9 @@ static bool processPendingReplStreamDecode(void) {
 void beforeSleep(struct aeEventLoop *eventLoop) {
     UNUSED(eventLoop);
 
+    /* Give the IO threads the ACL users as of now, if they changed. */
+    ACLSnapshotPublish();
+
     /* When I/O threads are enabled and there are pending I/O jobs, the poll is offloaded to one of the I/O threads. */
     trySendPollJobToIOThreads();
 
@@ -4635,34 +4638,38 @@ void prepareCommandQueue(client *c) {
 /* Whether processCommand() would pass the auth, NO_MULTI and ACL checks for a
  * prepared command, given the client's current session. Module commands are
  * never checked here: their key extraction is module code (valkey#5054). */
-static int precheckCommand(client *c, robj **argv, int argc, int read_flags, struct serverCommand *cmd) {
+static int precheckCommand(client *c, user *u, robj **argv, int argc, int read_flags, struct serverCommand *cmd) {
     if (!(read_flags & READ_FLAGS_PARSING_COMPLETED) || argc == 0 || !cmd) return 0;
     if (read_flags & READ_FLAGS_BAD_ARITY) return 0;
     if (cmd->flags & (CMD_MODULE | CMD_PROTECTED)) return 0;
     if ((c->read_flags & READ_FLAGS_AUTH_REQUIRED) && !(cmd->flags & CMD_NO_AUTH)) return 0;
     int idx;
-    return ACLCheckAllUserCommandPerm(c->precheck.user, cmd, argv, argc, c->precheck.dbid, &idx) == ACL_OK;
+    return ACLCheckAllUserCommandPerm(u, cmd, argv, argc, c->precheck.dbid, &idx) == ACL_OK;
 }
 
 /* Called by an IO thread after prepareCommandQueue(). Runs the checks that
  * depend only on the command, the client's session and the ACL users, and
- * flags the commands that pass with READ_FLAGS_PRECHECKED. The main thread
- * owns no part of the client while the IO job runs, and changes users only
- * after draining the IO threads (ACLBeginMutation), so both are stable here.
- * processCommand() trusts the flag only while acl_mutation_epoch and the
- * session still match what is recorded here. */
+ * flags the commands that pass with READ_FLAGS_PRECHECKED. Of the client it
+ * reads only what the read job owns and c->precheck, which the main thread
+ * saved before the job and does not write during it: the main thread can
+ * change c->user and c->flag of a client in a read job (ACL LOAD, ACL
+ * DELUSER, module auth revocation). The users come from the pinned ACL
+ * snapshot. processCommand() trusts the flag only while acl_mutation_epoch
+ * equals the snapshot's epoch and the session still matches c->precheck. */
 void precheckCommandQueue(client *c) {
-    if (c->flag.multi) return; /* ACL checks MULTI commands against the transaction db. */
-    c->precheck.acl_epoch = acl_mutation_epoch;
-    c->precheck.user = c->user;
-    c->precheck.dbid = c->db->id;
-    c->precheck.authenticated = c->flag.authenticated;
-
-    if (precheckCommand(c, c->argv, c->argc, c->read_flags, c->parsed_cmd)) c->read_flags |= READ_FLAGS_PRECHECKED;
-    for (int i = c->cmd_queue.off; i < c->cmd_queue.len; i++) {
-        parsedCommand *p = &c->cmd_queue.cmds[i];
-        if (precheckCommand(c, p->argv, p->argc, p->read_flags, p->cmd)) p->read_flags |= READ_FLAGS_PRECHECKED;
+    if (!c->precheck.user) return;
+    int tid = getCurTid();
+    aclSnapshot *s = ACLSnapshotPin(tid);
+    user *u = s ? ACLSnapshotUser(s, c->precheck.user) : NULL;
+    if (u) {
+        c->precheck.acl_epoch = ACLSnapshotEpoch(s);
+        if (precheckCommand(c, u, c->argv, c->argc, c->read_flags, c->parsed_cmd)) c->read_flags |= READ_FLAGS_PRECHECKED;
+        for (int i = c->cmd_queue.off; i < c->cmd_queue.len; i++) {
+            parsedCommand *p = &c->cmd_queue.cmds[i];
+            if (precheckCommand(c, u, p->argv, p->argc, p->read_flags, p->cmd)) p->read_flags |= READ_FLAGS_PRECHECKED;
+        }
     }
+    ACLSnapshotUnpin(tid);
 }
 
 /* Main thread: whether the IO thread's precheck of the current command still

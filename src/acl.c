@@ -35,7 +35,6 @@
 #include <ctype.h>
 
 #include "script.h"
-#include "io_threads.h"
 
 /* =============================================================================
  * Global state for ACLs
@@ -507,11 +506,10 @@ static user *ACLCreateUser(const char *name, size_t namelen) {
 }
 
 /* Call before changing a user or role, or which user a client has. IO threads
- * run ACLCheckAllUserCommandPerm() on c->user in precheckCommandQueue(), so
- * wait for them first. Commands they prechecked at an older epoch are checked
- * again in full on the main thread. */
+ * check commands against a copy of the users (see ACLSnapshotPublish()), never
+ * the live ones, so nothing waits for them. Commands they prechecked at an
+ * older epoch are checked again in full on the main thread. */
 static void ACLBeginMutation(void) {
-    drainIOThreadsQueue();
     acl_mutation_epoch++;
 }
 
@@ -635,6 +633,114 @@ static void ACLCopyUser(user *dst, user *src) {
     } else {
         dst->roles = NULL;
     }
+}
+
+/* =============================================================================
+ * Copy-on-write snapshot of the users, for the precheck in IO threads
+ * ==========================================================================*/
+
+/* IO threads check commands against private deep copies of the users, so ACL
+ * changes never wait for them. The main thread builds a new snapshot when
+ * acl_mutation_epoch moved, at most once per event loop iteration. An IO
+ * thread pins the current one for a read job with a hazard pointer, and the
+ * main thread frees a retired snapshot once no IO thread holds it. Users that
+ * hold roles are left out, since their copies would point at the live roles,
+ * and so are module users, which are not in Users. Their commands get the
+ * full check on the main thread. */
+#define ACL_SNAPSHOT_MAX_USERS 64
+
+struct aclSnapshot {
+    uint64_t epoch; /* The acl_mutation_epoch the copies reflect. */
+    int nusers;
+    user *live[ACL_SNAPSHOT_MAX_USERS]; /* Identity only, never dereferenced off the main thread. */
+    user *copy[ACL_SNAPSHOT_MAX_USERS]; /* Read-only once published. */
+    struct aclSnapshot *next;           /* Retired list. */
+};
+
+static _Atomic(aclSnapshot *) acl_snapshot_current;
+static _Atomic(aclSnapshot *) acl_snapshot_hazard[IO_THREADS_MAX_NUM];
+static aclSnapshot *acl_snapshot_retired;
+
+static aclSnapshot *ACLSnapshotBuild(void) {
+    uint64_t epoch = acl_mutation_epoch; /* The copies below bump it. */
+    aclSnapshot *s = zcalloc(sizeof(*s));
+    raxIterator ri;
+    raxStart(&ri, Users);
+    raxSeek(&ri, "^", NULL, 0);
+    while (raxNext(&ri) && s->nusers < ACL_SNAPSHOT_MAX_USERS) {
+        user *u = ri.data;
+        if (u->roles && listLength(u->roles)) continue;
+        s->live[s->nusers++] = u;
+    }
+    raxStop(&ri);
+    /* Copy after the walk: ACLCreateUnlinkedUser() changes Users. */
+    for (int i = 0; i < s->nusers; i++) {
+        s->copy[i] = ACLCreateUnlinkedUser();
+        ACLCopyUser(s->copy[i], s->live[i]);
+    }
+    acl_mutation_epoch = epoch;
+    s->epoch = epoch;
+    return s;
+}
+
+static void ACLSnapshotFree(aclSnapshot *s) {
+    uint64_t epoch = acl_mutation_epoch;
+    for (int i = 0; i < s->nusers; i++) ACLFreeUser(s->copy[i]);
+    acl_mutation_epoch = epoch;
+    zfree(s);
+}
+
+/* Main thread, once per event loop iteration. */
+void ACLSnapshotPublish(void) {
+    if (server.io_threads_num <= 1) return;
+    aclSnapshot *cur = atomic_load(&acl_snapshot_current);
+    if (!cur || cur->epoch != acl_mutation_epoch) {
+        atomic_store(&acl_snapshot_current, ACLSnapshotBuild());
+        if (cur) {
+            cur->next = acl_snapshot_retired;
+            acl_snapshot_retired = cur;
+        }
+    }
+
+    aclSnapshot **pp = &acl_snapshot_retired;
+    while (*pp) {
+        aclSnapshot *s = *pp;
+        int held = 0;
+        for (int i = 1; i < server.io_threads_num && !held; i++) held = atomic_load(&acl_snapshot_hazard[i]) == s;
+        if (held) {
+            pp = &s->next;
+        } else {
+            *pp = s->next;
+            ACLSnapshotFree(s);
+        }
+    }
+}
+
+/* IO thread 'tid': pin the current snapshot until ACLSnapshotUnpin(). The
+ * load after the store makes sure the main thread either sees the hazard
+ * pointer or has not retired the snapshot yet. */
+aclSnapshot *ACLSnapshotPin(int tid) {
+    aclSnapshot *s;
+    do {
+        s = atomic_load(&acl_snapshot_current);
+        atomic_store(&acl_snapshot_hazard[tid], s);
+    } while (s != atomic_load(&acl_snapshot_current));
+    return s;
+}
+
+void ACLSnapshotUnpin(int tid) {
+    atomic_store(&acl_snapshot_hazard[tid], NULL);
+}
+
+uint64_t ACLSnapshotEpoch(aclSnapshot *s) {
+    return s->epoch;
+}
+
+/* The copy of the live user 'live' in 's', or NULL if it has none. */
+user *ACLSnapshotUser(aclSnapshot *s, user *live) {
+    for (int i = 0; i < s->nusers; i++)
+        if (s->live[i] == live) return s->copy[i];
+    return NULL;
 }
 
 /* =============================================================================

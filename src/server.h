@@ -1500,7 +1500,9 @@ typedef struct client {
     int nread;                                    /* Number of bytes of the last read. */
     int read_flags;                               /* Client Read flags - used to communicate the client read state. */
     int slot;                                     /* The slot the client is executing against. Set to -1 if no slot is being used */
-    /* The state the IO thread prechecked the queued commands against. See precheckCommandQueue(). */
+    /* The session the IO thread prechecks the queued commands against, saved by the
+     * main thread before the read job, and the epoch of the ACL snapshot it used.
+     * See precheckCommandQueue(). */
     struct {
         uint64_t acl_epoch;
         user *user;
@@ -3585,6 +3587,12 @@ extern rax *Users;
 extern rax *Roles;
 extern user *DefaultUser;
 extern uint64_t acl_mutation_epoch;
+typedef struct aclSnapshot aclSnapshot;
+void ACLSnapshotPublish(void);
+aclSnapshot *ACLSnapshotPin(int tid);
+void ACLSnapshotUnpin(int tid);
+uint64_t ACLSnapshotEpoch(aclSnapshot *s);
+user *ACLSnapshotUser(aclSnapshot *s, user *live);
 void ACLInit(void);
 int ACLModuleHasCommandRules(const struct ValkeyModule *module, sds *rule_out);
 /* Return values for ACLCheckAllPerm(). */
