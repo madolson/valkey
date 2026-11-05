@@ -28,6 +28,7 @@
  */
 
 #include "server.h"
+#include "rust_read.h"
 #include "cluster.h"
 #include "cluster_slot_stats.h"
 #include "cluster_migrateslots.h"
@@ -155,12 +156,14 @@ static int clientMatchesIpFilter(client *c, sds ip);
 static int clientMatchesCapaFilter(client *c, sds capa_filter);
 static void freeClientFilter(clientFilter *filter);
 static bool consumeCommandQueue(client *c);
+#ifndef USE_RUST_IO /* Rust: src/rust/valkey-read/src/read.rs */
 static int parseMultibulk(client *c,
                           int *argc,
                           robj ***argv,
                           int *argv_len,
                           size_t *argv_len_sum,
                           unsigned long long *net_input_bytes_curr_cmd);
+#endif /* !USE_RUST_IO */
 
 int ProcessingEventsWhileBlocked = 0; /* See processEventsWhileBlocked(). */
 _Thread_local sds thread_shared_qb = NULL;
@@ -2582,6 +2585,7 @@ void logInvalidUseAndFreeClientAsync(client *c, const char *fmt, ...) {
     freeClientAsync(c);
 }
 
+#ifndef USE_RUST_IO /* resetSharedQueryBuf() in Rust */
 /* Resets the shared query buffer used by the given client.
  * If any data remained in the buffer, the client will take ownership of the buffer
  * and a new empty buffer will be allocated for the shared buffer. */
@@ -2600,6 +2604,8 @@ void resetSharedQueryBuf(client *c) {
     c->qb_pos = 0;
     c->qb_applied = 0;
 }
+
+#endif /* !USE_RUST_IO */
 
 /* Trims the client query buffer to the current position. */
 void trimClientQueryBuffer(client *c) {
@@ -3617,6 +3623,7 @@ void handleQbLimitReached(client *c) {
     server.stat_client_qbuf_limit_disconnections++;
 }
 
+#ifndef USE_RUST_IO /* handleReadResult() in Rust */
 /* Handle read errors and update statistics.
  *
  * Called only from the main thread.
@@ -3668,6 +3675,8 @@ int handleReadResult(client *c) {
     }
     return C_OK;
 }
+
+#endif /* !USE_RUST_IO */
 
 
 void handleParseError(client *c) {
@@ -3919,6 +3928,7 @@ void resetClientIOState(client *c) {
     c->io_last_reply_block = NULL;
 }
 
+#ifndef USE_RUST_IO /* initSharedQueryBuf()/freeSharedQueryBuf() in Rust */
 /* Initializes the shared query buffer to a new sds with the default capacity.
  * Need to ensure the initlen is not less than readlen in readToQueryBuf. */
 void initSharedQueryBuf(void) {
@@ -3933,6 +3943,31 @@ void freeSharedQueryBuf(void) {
     thread_shared_qb = NULL;
     atomic_store_explicit(&shared_querybuf_registry[getCurTid()], NULL, memory_order_relaxed);
 }
+
+#endif /* !USE_RUST_IO */
+
+#ifdef USE_RUST_IO
+/* Fails the build if the checked-in Rust bindings disagree with these structs. */
+#include "rust/valkey-read/layout.h"
+
+/* Called by the Rust initSharedQueryBuf(). C cannot check bitfield positions
+ * at compile time, so layout.h checks them here. */
+void rustReadCheckLayout(void) {
+    const char *moved = rustLayoutCheckBits();
+    if (moved) serverPanic("stale src/rust/valkey-read/src/bindings.rs: %s moved; run make rust-bindings", moved);
+}
+
+sds rustReadGetThreadSharedQb(void) {
+    return thread_shared_qb;
+}
+
+/* The C half of initSharedQueryBuf()/freeSharedQueryBuf(): the thread-local
+ * and the fork registry are C state. */
+void rustReadSetThreadSharedQb(sds qb) {
+    atomic_store_explicit(&shared_querybuf_registry[getCurTid()], qb, memory_order_relaxed);
+    thread_shared_qb = qb;
+}
+#endif
 
 int isSharedQueryBufRegistered(int tid) {
     return atomic_load_explicit(&shared_querybuf_registry[tid], memory_order_relaxed) != NULL;
@@ -3971,6 +4006,7 @@ void unprotectClient(client *c) {
     }
 }
 
+#ifndef USE_RUST_IO /* parseInlineBuffer() in Rust */
 /* Like parseMultibulkBuffer(), but for the inline protocol instead of RESP,
  * this function consumes the client query buffer and creates a command ready
  * to be executed inside the client structure.
@@ -4070,6 +4106,8 @@ void parseInlineBuffer(client *c) {
     c->reqtype = 0;
 }
 
+#endif /* !USE_RUST_IO */
+
 /* Helper function. Record protocol error details in server log,
  * and set the client as CLIENT_CLOSE_AFTER_REPLY and
  * CLIENT_PROTOCOL_ERROR. */
@@ -4108,6 +4146,7 @@ static void setProtocolError(const char *errstr, client *c) {
     c->flag.protocol_error = 1;
 }
 
+#ifndef USE_RUST_IO /* parseMultibulkBuffer()/parseMultibulk() in Rust */
 /* Process the query buffer for client 'c', setting up the client argument
  * vector for command execution and parses additional commands into a queue.
  * Sets the client's read_flags to indicate the parsing outcome.
@@ -4383,6 +4422,8 @@ static int parseMultibulk(client *c,
     return 0;
 }
 
+#endif /* !USE_RUST_IO */
+
 /* Perform necessary tasks after a command was executed:
  *
  * 1. The client is reset unless there are reasons to avoid doing it.
@@ -4509,6 +4550,7 @@ int processPendingCommandAndInputBuffer(client *c) {
     return C_OK;
 }
 
+#ifndef USE_RUST_IO /* parseInputBuffer() in Rust */
 /* Parse one or more commands from the query buf.
  *
  * This function may be called from the main thread or from the I/O thread.
@@ -4547,6 +4589,8 @@ void parseInputBuffer(client *c) {
      * without a later handleReadJobs/connUpdateState clear stalls RDMA rx. */
     if (conn) connSetPostponeUpdateState(conn, clientConnPostponeMaskFromIOState(c));
 }
+
+#endif /* !USE_RUST_IO */
 
 /* Free unused memory in a client's queue of parsed commands. */
 void trimCommandQueue(client *c) {
@@ -4795,6 +4839,7 @@ int processInputBuffer(client *c) {
     return C_OK;
 }
 
+#ifndef USE_RUST_IO /* readToQueryBuf()/readAndDecodePrimaryStream()/readQueryFromClient() in Rust */
 /* This function can be called from the main-thread or from the IO-thread.
  * The function allocates query-buf for the client if required and reads to it from the network.
  * It will set c->nread to the bytes read from the network.
@@ -4950,6 +4995,8 @@ void readQueryFromClient(connection *conn) {
         beforeNextClient(c);
     } while (repeat);
 }
+
+#endif /* !USE_RUST_IO */
 
 /* An "Address String" is a colon separated ip:port pair.
  * For IPv4 it's in the form x.y.z.k:port, example: "127.0.0.1:1234".

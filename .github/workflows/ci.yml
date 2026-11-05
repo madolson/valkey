@@ -31,6 +31,22 @@ jobs:
           git diff --exit-code -- src/commands.def
           git ls-files --error-unmatch src/commands.def > /dev/null
 
+  validate-rust-bindings:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Valkey
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Validate src/rust/valkey-read bindings are up to date
+        run: |
+          # Pin libclang so the generated bindings do not depend on the runner image.
+          python3 -m venv "$RUNNER_TEMP/libclang"
+          "$RUNNER_TEMP/libclang/bin/pip" install libclang==18.1.1
+          export LIBCLANG_PATH=$("$RUNNER_TEMP/libclang/bin/python" -c 'import clang, os; print(os.path.dirname(clang.__file__) + "/native")')
+          make -C src check-rust-bindings
+      - name: Build with the Rust read path
+        # No libclang needed: the bindings are checked in.
+        run: make -j4 BUILD_RUST_IO=yes SERVER_CFLAGS='-Werror'
+
   test-ubuntu-latest:
     runs-on: ubuntu-latest
     steps:

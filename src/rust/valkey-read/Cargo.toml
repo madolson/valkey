@@ -1,0 +1,15 @@
+[package]
+name = "valkey-read"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["staticlib"]
+
+[profile.release]
+opt-level = 3
+debug = 1
+panic = "abort"
+codegen-units = 1
+lto = true

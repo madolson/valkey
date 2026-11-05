@@ -1,0 +1,13 @@
+# Regenerates ../src/bindings.rs and ../layout.h. Not part of the server
+# build: only `make rust-bindings` and `make check-rust-bindings` run it, and
+# only they need libclang. Versions are pinned by Cargo.lock (--locked).
+[package]
+name = "valkey-read-bindgen"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+bindgen = { version = "=0.70.1", default-features = false, features = ["runtime", "prettyplease"] }
+
+[workspace]
