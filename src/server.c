@@ -4642,6 +4642,9 @@ void unprepareCommand(client *c) {
     c->slot = -1;
 }
 
+static int processCommandChecks(client *c);
+static int processCommandExecute(client *c, uint64_t cmd_flags);
+
 /* If this function gets called we already read a whole
  * command, arguments are in the client argv/argc fields.
  * processCommand() execute the command or prepare the
@@ -4740,28 +4743,20 @@ int processCommand(client *c) {
 
     uint64_t cmd_flags = getCommandFlags(c);
 
-    int is_exec = (c->mstate && c->cmd->proc == execCommand);
-    int ms_flags = is_exec ? c->mstate->cmd_flags : 0;
-    int ms_inv_flags = is_exec ? c->mstate->cmd_inv_flags : 0;
-    int combined_flags = cmd_flags | ms_flags;
-    int combined_inv_flags = (~cmd_flags | ms_inv_flags);
+    if (!processCommandChecks(c)) return C_OK;
+    return processCommandExecute(c, cmd_flags);
+}
 
-    int is_read_command = (combined_flags & CMD_READONLY);
-    int is_write_command = (combined_flags & CMD_WRITE);
-    int is_denyoom_command = (combined_flags & CMD_DENYOOM);
-    int is_denystale_command = (combined_inv_flags & CMD_STALE);
-    int is_denyloading_command = (combined_inv_flags & CMD_LOADING);
-    int is_may_replicate_command = (combined_flags & (CMD_WRITE | CMD_MAY_REPLICATE));
-    int is_deny_async_loading_command = (combined_flags & CMD_NO_ASYNC_LOADING);
-
-    const int obey_client = mustObeyClient(c);
-
+/* The checks processCommand() runs after the command lookup that depend only
+ * on the command, its arguments, the client's session and the ACL users:
+ * NO_MULTI and ACL. Returns 0 if the command was rejected. */
+static int processCommandChecks(client *c) {
     if (c->flag.multi && c->cmd->flags & CMD_NO_MULTI) {
         sds nomulti_err =
             sdscatprintf(sdsempty(), "Command '%s' not allowed inside a transaction", c->cmd->fullname);
         sdsmapchars(nomulti_err, "\r\n", "  ", 2);
         rejectCommandSds(c, nomulti_err, 1);
-        return C_OK;
+        return 0;
     }
 
     /* Check if the user can run this command according to the current
@@ -4782,8 +4777,31 @@ int processCommand(client *c) {
         default: acl_subevent = VALKEYMODULE_ACL_LOG_CMD; break;
         }
         moduleFireCommandACLRejectedEvent(c, acl_subevent, acl_errpos);
-        return C_OK;
+        return 0;
     }
+
+    return 1;
+}
+
+/* The rest of processCommand(): the checks that read live server state
+ * (cluster routing, redirects, OOM, disk errors, replicas, loading, busy
+ * scripts, pause), then MULTI queueing or call(). */
+static int processCommandExecute(client *c, uint64_t cmd_flags) {
+    int is_exec = (c->mstate && c->cmd->proc == execCommand);
+    int ms_flags = is_exec ? c->mstate->cmd_flags : 0;
+    int ms_inv_flags = is_exec ? c->mstate->cmd_inv_flags : 0;
+    int combined_flags = cmd_flags | ms_flags;
+    int combined_inv_flags = (~cmd_flags | ms_inv_flags);
+
+    int is_read_command = (combined_flags & CMD_READONLY);
+    int is_write_command = (combined_flags & CMD_WRITE);
+    int is_denyoom_command = (combined_flags & CMD_DENYOOM);
+    int is_denystale_command = (combined_inv_flags & CMD_STALE);
+    int is_denyloading_command = (combined_inv_flags & CMD_LOADING);
+    int is_may_replicate_command = (combined_flags & (CMD_WRITE | CMD_MAY_REPLICATE));
+    int is_deny_async_loading_command = (combined_flags & CMD_NO_ASYNC_LOADING);
+
+    const int obey_client = mustObeyClient(c);
 
     /* If cluster is enabled perform the cluster redirection here.
      * However we don't perform the redirection if:
