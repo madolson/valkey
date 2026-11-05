@@ -1032,6 +1032,10 @@ rax **unitTestOnly_getTrackingTable(void) {
     return &inst->TrackingTable;
 }
 
+uint64_t *unitTestOnly_getTrackingTableTotalItems(void) {
+    return &inst->TrackingTableTotalItems;
+}
+
 /* Unit-test-only: the number of liveness checks a sweep step performs between
  * clock reads, so tests can place IDs on a step boundary without duplicating
  * the constant. */

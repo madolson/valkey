@@ -11,11 +11,11 @@
 #include <cstring>
 
 extern "C" {
-/* TrackingTableTotalItems: non-static global in tracking.c, not declared in
- * server.h (it is internal to tracking; INFO reads it via
- * trackingGetTotalItems). The tests below build tracking state by hand and
- * must keep the counter consistent, so they need the symbol directly. */
-extern uint64_t TrackingTableTotalItems;
+/* TrackingTableTotalItems: an instance field, internal to tracking (INFO
+ * reads it via trackingGetTotalItems). The tests below build tracking state
+ * by hand and must keep the counter consistent, so they need it directly. */
+uint64_t *unitTestOnly_getTrackingTableTotalItems(void);
+#define TrackingTableTotalItems (*unitTestOnly_getTrackingTableTotalItems())
 
 /* Deliberately absent from server.h: the sweep-step primitive and the
  * tracking-table accessor are non-static only so unit tests can drive the
