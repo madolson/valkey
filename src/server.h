@@ -1530,6 +1530,8 @@ typedef struct client {
     listNode *throttle_node;           /* Node in throttler's client_queue */
     monotime throttle_start;           /* When this client was queued for throttling */
     struct trendCalculator *cob_trend; /* Per-replica COB size trend (NULL if not replica) */
+    /* Must stay last: the Rust read path's bindings (src/rust/valkey-read) are
+     * generated without LOG_REQ_RES and assume no other field depends on it. */
 #ifdef LOG_REQ_RES
     clientReqResInfo reqres;
 #endif
@@ -1953,11 +1955,11 @@ struct valkeyServer {
     client *current_client;                /* The client that triggered the command execution (External or AOF). */
     client *executing_client;              /* The client executing the current command (possibly script or module). */
 
-#ifdef LOG_REQ_RES
+    /* Used only under LOG_REQ_RES, but always present so the layout does not
+     * depend on it (src/rust/valkey-read/src/bindings.rs). */
     char *req_res_logfile; /* Path of log file for logging all requests and their replies. If NULL, no logging will be
                               performed */
     unsigned int client_default_resp;
-#endif
 
     /* Stuff for client mem eviction */
     clientMemUsageBucket *client_mem_usage_buckets;

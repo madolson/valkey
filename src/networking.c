@@ -3947,6 +3947,16 @@ void freeSharedQueryBuf(void) {
 #endif /* !USE_RUST_IO */
 
 #ifdef USE_RUST_IO
+/* Fails the build if the checked-in Rust bindings disagree with these structs. */
+#include "rust/valkey-read/layout.h"
+
+/* Called by the Rust initSharedQueryBuf(). C cannot check bitfield positions
+ * at compile time, so layout.h checks them here. */
+void rustReadCheckLayout(void) {
+    const char *moved = rustLayoutCheckBits();
+    if (moved) serverPanic("stale src/rust/valkey-read/src/bindings.rs: %s moved; run make rust-bindings", moved);
+}
+
 sds rustReadGetThreadSharedQb(void) {
     return thread_shared_qb;
 }

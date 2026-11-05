@@ -161,6 +161,7 @@ unsafe fn get_client_type(c: *mut client) -> c_int {
 /// Need to ensure the initlen is not less than readlen in readToQueryBuf.
 #[no_mangle]
 pub unsafe extern "C" fn initSharedQueryBuf() {
+    rustReadCheckLayout();
     let querybuf = sdsnewlen(null(), PROTO_IOBUF_LEN as usize);
     sdsclear(querybuf);
     // Stores both the _Thread_local thread_shared_qb and the fork registry.

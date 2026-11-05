@@ -2,6 +2,10 @@
 //! `make BUILD_RUST_IO=yes`. See read.rs for the function-by-function map.
 #![allow(clippy::missing_safety_doc)]
 
+// bindings.rs is generated for this target only (`make rust-bindings`).
+#[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
+compile_error!("valkey-read: src/bindings.rs is generated for x86_64 Linux only");
+
 #[allow(
     non_upper_case_globals,
     non_camel_case_types,
@@ -10,7 +14,8 @@
     clippy::all
 )]
 pub mod sys {
-    include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
+    // Checked in; regenerate with `make rust-bindings`.
+    include!("bindings.rs");
 }
 
 mod read;

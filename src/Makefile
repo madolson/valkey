@@ -434,6 +434,12 @@ endif
 RUST_READ_LIB=rust/valkey-read/target/release/libvalkey_read.a
 CARGO?=$(shell command -v cargo 2>/dev/null || echo $(HOME)/.cargo/bin/cargo)
 ifeq ($(BUILD_RUST_IO),yes)
+ifneq ($(uname_S)-$(uname_M),Linux-x86_64)
+$(error BUILD_RUST_IO=yes supports only Linux x86_64: src/rust/valkey-read/src/bindings.rs is generated for it)
+endif
+ifneq (,$(findstring -m32,$(CFLAGS) $(LDFLAGS)))
+$(error BUILD_RUST_IO=yes does not support 32bit builds: src/rust/valkey-read/src/bindings.rs is generated for x86_64)
+endif
 	FINAL_CFLAGS+=-DUSE_RUST_IO
 	RUST_READ_LINK=$(RUST_READ_LIB) -lpthread -ldl -lm
 endif
@@ -780,13 +786,34 @@ endif
 
 ifeq ($(BUILD_RUST_IO),yes)
 $(SERVER_NAME): $(RUST_READ_LIB)
-# Always ask cargo; it is a no-op when the crate is up to date. bindgen reads
-# server.h with the same -I/-D flags as the C build so the layouts agree.
+# Always ask cargo; it is a no-op when the crate is up to date. The bindings
+# are checked in (rust/valkey-read/src/bindings.rs); networking.c asserts
+# their layout against this build's structs (rust/valkey-read/layout.h).
 $(RUST_READ_LIB): rust-read-cargo
 rust-read-cargo: .make-prerequisites
-	cd rust/valkey-read && VALKEY_BINDGEN_CFLAGS="$(FINAL_CFLAGS)" $(CARGO) build --release --quiet
+	cd rust/valkey-read && $(CARGO) build --release --quiet
 .PHONY: rust-read-cargo
 endif
+
+# Regenerate the Rust read path's bindings after changing a struct they
+# cover. Needs libclang (set LIBCLANG_PATH if it is not found); nothing else
+# does. The clang flags are fixed, not this build's, so the output is the
+# same for every build configuration; layout.h catches configurations whose
+# structs differ.
+RUST_BINDGEN_ARGS=--target=x86_64-unknown-linux-gnu -std=gnu11 -DUSE_RUST_IO -I../.. -I../../../deps/libvalkey/include -I../../../deps/linenoise -I../../../deps/hdr_histogram -I../../../deps/fpconv -I../../../deps/fast_float -I../../../deps/lz4
+RUST_BINDGEN=cd rust/valkey-read && $(CARGO) run --quiet --release --locked --manifest-path bindgen/Cargo.toml --
+rust-bindings:
+	$(RUST_BINDGEN) src/bindings.rs layout.h -- $(RUST_BINDGEN_ARGS)
+
+# Fails if the checked-in bindings differ from what rust-bindings generates.
+check-rust-bindings:
+	@rm -rf rust/valkey-read/target/check-bindings && mkdir -p rust/valkey-read/target/check-bindings
+	$(RUST_BINDGEN) target/check-bindings/bindings.rs target/check-bindings/layout.h -- $(RUST_BINDGEN_ARGS)
+	@diff -u rust/valkey-read/src/bindings.rs rust/valkey-read/target/check-bindings/bindings.rs && \
+	 diff -u rust/valkey-read/layout.h rust/valkey-read/target/check-bindings/layout.h || \
+	 { echo "Rust bindings are stale: run 'make rust-bindings' and commit the result."; exit 1; }
+
+.PHONY: rust-bindings check-rust-bindings
 
 # valkey-server
 $(SERVER_NAME): $(ENGINE_SERVER_OBJ) $(LUA_MODULE)

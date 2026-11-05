@@ -21,6 +21,9 @@ void trimCommandQueue(client *c);
  * variable because freeClient() and trimClientQueryBuffer() compare it. */
 sds rustReadGetThreadSharedQb(void);
 void rustReadSetThreadSharedQb(sds qb);
+
+/* Startup check of the bitfield positions the Rust bindings assume. */
+void rustReadCheckLayout(void);
 #endif
 
 #endif
