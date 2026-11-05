@@ -32,6 +32,7 @@
 #include "cluster_slot_stats.h"
 #include "cluster_migrateslots.h"
 #include "script.h"
+#include "chunky.h"
 #include "forkless.h"
 #include "bgiteration.h"
 #include "intset.h"
@@ -389,6 +390,8 @@ client *createClient(connection *conn) {
     c->raw_flag2 = 0;
     c->capa = 0;
     c->slot = -1;
+    c->chunky_last_inst = -1;
+    c->chunky_multi_mask = 0;
     c->ctime = c->last_interaction = server.unixtime;
     c->duration = 0;
     clientSetDefaultAuth(c);
@@ -4480,7 +4483,19 @@ int processCommandAndResetClient(client *c) {
 /* This function will execute any fully parsed commands pending on
  * the client. Returns C_ERR if the client is no longer valid after executing
  * the command, and C_OK for all other cases. */
+static int processPendingCommandAndInputBufferImpl(client *c);
+
+/* Counts the pass as one chunky read batch when chunky-stats is enabled. */
 int processPendingCommandAndInputBuffer(client *c) {
+    if (!server.chunky_stats) return processPendingCommandAndInputBufferImpl(c);
+    chunkyBatch saved;
+    int began = chunkyBatchBegin(c, &saved);
+    int ret = processPendingCommandAndInputBufferImpl(c);
+    if (began) chunkyBatchEnd(&saved);
+    return ret;
+}
+
+static int processPendingCommandAndInputBufferImpl(client *c) {
     /* Blocked and throttled clients are resumed via processUnblockedClients(); skip them here
      * to avoid re-entering processCommand() while pending_command is intentionally left set.
      * A throttled client has already passed its throttle check, so re-entry would execute it. */
@@ -4736,7 +4751,19 @@ static void prefetchCommandQueueKeys(client *c) {
     }
 }
 
+static int processInputBufferImpl(client *c);
+
+/* Counts the pass as one chunky read batch when chunky-stats is enabled. */
 int processInputBuffer(client *c) {
+    if (!server.chunky_stats) return processInputBufferImpl(c);
+    chunkyBatch saved;
+    int began = chunkyBatchBegin(c, &saved);
+    int ret = processInputBufferImpl(c);
+    if (began) chunkyBatchEnd(&saved);
+    return ret;
+}
+
+static int processInputBufferImpl(client *c) {
     /* Parse the query buffer and/or execute already parsed commands. */
     while ((c->querybuf && c->qb_pos < sdslen(c->querybuf)) ||
            c->cmd_queue.off < c->cmd_queue.len) {

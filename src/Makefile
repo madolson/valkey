@@ -524,6 +524,7 @@ ENGINE_SERVER_OBJ = \
     blocked.o \
     call_reply.o \
     childinfo.o \
+    chunky.o \
     cluster.o \
     cluster_legacy.o \
     cluster_migrateslots.o \

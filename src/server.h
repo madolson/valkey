@@ -1500,6 +1500,8 @@ typedef struct client {
     int nread;                                    /* Number of bytes of the last read. */
     int read_flags;                               /* Client Read flags - used to communicate the client read state. */
     int slot;                                     /* The slot the client is executing against. Set to -1 if no slot is being used */
+    int8_t chunky_last_inst;                      /* Instance of 8 of the last keyed command, -1 if none. See chunky.c */
+    uint8_t chunky_multi_mask;                    /* Instances of 8 touched by the open MULTI. See chunky.c */
     listNode *mem_usage_bucket_node;
     clientMemUsageBucket *mem_usage_bucket;
     /* In updateClientMemoryUsage() we track the memory usage of
@@ -2144,6 +2146,7 @@ struct valkeyServer {
     int pause_cron;                            /* Don't run cron tasks (debug) */
     int dict_resizing;                         /* Whether to allow main dict and expired dict to be resized (debug) */
     int latency_tracking_enabled;              /* 1 if extended latency tracking is enabled, 0 otherwise. */
+    int chunky_stats;                          /* 1 to collect INFO chunky counters, see chunky.c */
     double *latency_tracking_info_percentiles; /* Extended latency tracking info output percentile list configuration. */
     int latency_tracking_info_percentiles_len;
     unsigned int max_new_tls_conns_per_cycle; /* The maximum number of tls connections that will be accepted during each
@@ -2917,6 +2920,7 @@ struct serverCommand {
 
     /* Runtime populated data */
     long long microseconds, calls, rejected_calls, failed_calls;
+    long long chunky_multislot_calls; /* Calls whose keys span more than one slot, see chunky.c */
     int id;           /* Command ID. This is a progressive ID starting from 0 that
                          is assigned at runtime, and is used in order to check
                          ACLs. A connection is able to execute a given command if
