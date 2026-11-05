@@ -960,7 +960,7 @@ TEST_F(NetworkingTest, TestReadDoneKeepsPostponeWhileWritePending) {
     c->conn = &fc->conn;
     c->io_read_state = CLIENT_COMPLETED_IO;
     c->io_write_state = CLIENT_PENDING_IO;
-    c->nread = -1; /* EAGAIN on a connected socket: stop after handleReadResult */
+    c->io.nread = -1; /* EAGAIN on a connected socket: stop after handleReadResult */
     connSetPostponeUpdateState(c->conn, CONN_POSTPONE_READ | CONN_POSTPONE_WRITE);
 
     processClientIOReadsDone(c);

@@ -66,6 +66,7 @@
 
 #include "ae.h"         /* Event driven programming library */
 #include "sds.h"        /* Dynamic safe strings */
+#include "client_io.h"  /* ClientIoRead, defined in Rust (src/rust/valkey-client) */
 #include "dict.h"       /* Hash tables (old implementation) */
 #include "hashtable.h"  /* Hash tables (new implementation) */
 #include "kvstore.h"    /* Slot-based hash table */
@@ -1422,20 +1423,14 @@ typedef struct client {
     /* Basic client information and connection. */
     uint64_t id; /* Client incremental unique ID. */
     connection *conn;
-    /* Input buffer and command parsing fields */
-    sds querybuf;        /* Buffer we use to accumulate client queries. */
-    size_t qb_pos;       /* The position we have read in querybuf. */
-    size_t qb_applied;   /* Right boundary of the *current* command in querybuf.
-                          * qb_pos may run ahead due to multi-command parsing, so
-                          * we use qb_applied (replicated clients only) to advance
-                          * reploff by exactly this command's bytes. */
+    /* Input buffer and command parsing fields. qb_applied is the right boundary
+     * of the *current* command in querybuf: qb_pos may run ahead due to
+     * multi-command parsing, so replicated clients advance reploff by qb_applied. */
+    ClientIoRead io;
     robj **argv;         /* Arguments of current command. */
     int argc;            /* Num of arguments of current command. */
     int argv_len;        /* Size of argv array (may be more than argc) */
     size_t argv_len_sum; /* Sum of lengths of objects in argv list. */
-    int reqtype;         /* Request protocol type: PROTO_REQ_* */
-    int multibulklen;    /* Number of multi bulk arguments left to read. */
-    long bulklen;        /* Length of bulk argument in multi bulk request. */
     long long woff;      /* Last write global replication offset. */
     cmdQueue cmd_queue;  /* Parsed commands queue */
     /* Command execution state and command information */
@@ -1489,7 +1484,6 @@ typedef struct client {
     uint8_t last_memory_type;
     uint8_t capa; /* Client capabilities: CLIENT_CAPA* macros. */
     /* Statistics and metrics */
-    unsigned long long net_input_bytes;           /* Total network input bytes read from this client. */
     unsigned long long net_input_bytes_curr_cmd;  /* Total network input bytes read for the* execution of this client's current command. */
     unsigned long long net_output_bytes;          /* Total network output bytes sent to this client. */
     unsigned long long commands_processed;        /* Total count of commands this client executed. */
@@ -1497,7 +1491,6 @@ typedef struct client {
     _Atomic(size_t) io_tracked_reply_len;         /* Total size of BULK_STR_REF replies tracked by I/O threads. */
     size_t buf_peak;                              /* Peak used size of buffer in last 5 sec interval. */
     int nwritten;                                 /* Number of bytes of the last write. */
-    int nread;                                    /* Number of bytes of the last read. */
     int read_flags;                               /* Client Read flags - used to communicate the client read state. */
     int slot;                                     /* The slot the client is executing against. Set to -1 if no slot is being used */
     listNode *mem_usage_bucket_node;
@@ -1511,7 +1504,6 @@ typedef struct client {
     /* Fields after this point are less frequently used */
     listNode *client_list_node;        /* list node in client list */
     mstime_t buf_peak_last_reset_time; /* keeps the last time the buffer peak value was reset */
-    size_t querybuf_peak;              /* Recent (100ms or more) peak of querybuf size. */
     dictEntry *cur_script;             /* Cached pointer to the dictEntry of the script being executed. */
     user *user;                        /* User associated with this connection */
     time_t obuf_soft_limit_reached_time;

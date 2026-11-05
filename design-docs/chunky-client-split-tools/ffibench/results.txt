@@ -1,0 +1,7 @@
+cmd: flock /tmp/chunky-bench-24-31.lock taskset -c 30 ./bench 200000000 (x5); gcc 7.3.1 -O3, rustc 1.95 --release
+Thu Nov  5 08:14:40 UTC 2026
+ns_per_reply(3 appends) c_inline=5.76 c_call=14.09 rust_call_cbuf=14.89 rust_opaque_vec=13.69 sink=7199978238
+ns_per_reply(3 appends) c_inline=5.66 c_call=14.08 rust_call_cbuf=12.47 rust_opaque_vec=13.54 sink=7199978238
+ns_per_reply(3 appends) c_inline=5.80 c_call=14.09 rust_call_cbuf=12.46 rust_opaque_vec=13.54 sink=7199978238
+ns_per_reply(3 appends) c_inline=5.80 c_call=14.10 rust_call_cbuf=13.57 rust_opaque_vec=13.56 sink=7199978238
+ns_per_reply(3 appends) c_inline=5.66 c_call=14.75 rust_call_cbuf=15.88 rust_opaque_vec=17.93 sink=7199978238

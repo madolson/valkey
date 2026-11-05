@@ -429,6 +429,14 @@ ifeq ($(BUILD_RDMA),yes)
 	FINAL_LIBS += ../deps/libvalkey/lib/libvalkey_rdma.a $(RDMA_LIBS)
 endif
 
+# Rust client-split prototype (src/rust/valkey-client). Off by default.
+RUST_CLIENT_LIB=rust/valkey-client/target/release/libvalkey_client.a
+CARGO?=$(shell command -v cargo 2>/dev/null || echo $(HOME)/.cargo/bin/cargo)
+ifeq ($(BUILD_RUST_CLIENT),yes)
+	FINAL_CFLAGS+=-DUSE_RUST_CLIENT
+	FINAL_LIBS := $(RUST_CLIENT_LIB) $(FINAL_LIBS) -lpthread -ldl -lrt -lm -lgcc_s
+endif
+
 RDMA_MODULE=
 RDMA_MODULE_NAME:=valkey-rdma$(PROG_SUFFIX).so
 RDMA_MODULE_CFLAGS:=$(FINAL_CFLAGS)
@@ -737,6 +745,7 @@ persist-settings: distclean
 	echo BUILD_TLS=$(BUILD_TLS) >> .make-settings
 	echo OPENSSL_PREFIX=$(OPENSSL_PREFIX) >> .make-settings
 	echo BUILD_RDMA=$(BUILD_RDMA) >> .make-settings
+	echo BUILD_RUST_CLIENT=$(BUILD_RUST_CLIENT) >> .make-settings
 	echo BUILD_ZSTD=$(BUILD_ZSTD) >> .make-settings
 	echo ZSTD_PREFIX=$(ZSTD_PREFIX) >> .make-settings
 	echo USE_SYSTEMD=$(USE_SYSTEMD) >> .make-settings
@@ -767,6 +776,23 @@ endif
 ifneq ($(strip $(PREV_FINAL_LDFLAGS)), $(strip $(FINAL_LDFLAGS)))
 .make-prerequisites: persist-settings
 endif
+
+ifeq ($(BUILD_RUST_CLIENT),yes)
+$(SERVER_NAME): $(RUST_CLIENT_LIB)
+# Always ask cargo; it is a no-op when the crate is up to date.
+$(RUST_CLIENT_LIB): rust-client-cargo
+rust-client-cargo:
+	cd rust/valkey-client && $(CARGO) build --release --offline --quiet
+.PHONY: rust-client-cargo
+endif
+
+# client_io.h is generated from the crate and checked in, so C-only builds
+# need neither cargo nor cbindgen.
+rust-client-header:
+	cd rust/valkey-client && cbindgen --config cbindgen.toml --crate valkey-client -q > ../../client_io.h
+check-rust-client-header:
+	cd rust/valkey-client && cbindgen --config cbindgen.toml --crate valkey-client -q | diff -u ../../client_io.h -
+.PHONY: rust-client-header check-rust-client-header
 
 # valkey-server
 $(SERVER_NAME): $(ENGINE_SERVER_OBJ) $(LUA_MODULE)
