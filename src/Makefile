@@ -435,7 +435,7 @@ RUST_READ_LIB=rust/valkey-read/target/release/libvalkey_read.a
 CARGO?=$(shell command -v cargo 2>/dev/null || echo $(HOME)/.cargo/bin/cargo)
 ifeq ($(BUILD_RUST_IO),yes)
 	FINAL_CFLAGS+=-DUSE_RUST_IO
-	FINAL_LIBS := $(RUST_READ_LIB) $(FINAL_LIBS) -lpthread -ldl -lm
+	RUST_READ_LINK=$(RUST_READ_LIB) -lpthread -ldl -lm
 endif
 
 RDMA_MODULE=
@@ -790,7 +790,7 @@ endif
 
 # valkey-server
 $(SERVER_NAME): $(ENGINE_SERVER_OBJ) $(LUA_MODULE)
-	$(SERVER_LD) -o $@ $(ENGINE_SERVER_OBJ) ../deps/libvalkey/lib/libvalkey.a ../deps/hdr_histogram/libhdrhistogram.a ../deps/fpconv/libfpconv.a ../deps/lz4/liblz4.a $(FINAL_LIBS) $(LUA_LDFLAGS)
+	$(SERVER_LD) -o $@ $(ENGINE_SERVER_OBJ) ../deps/libvalkey/lib/libvalkey.a ../deps/hdr_histogram/libhdrhistogram.a ../deps/fpconv/libfpconv.a ../deps/lz4/liblz4.a $(RUST_READ_LINK) $(FINAL_LIBS) $(LUA_LDFLAGS)
 
 # Valkey static library, used to compile against for unit testing
 $(ENGINE_LIB_NAME): $(ENGINE_SERVER_OBJ)
