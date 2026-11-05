@@ -202,13 +202,18 @@ pub unsafe extern "C" fn resetSharedQueryBuf(c: *mut client) {
 /// Called only from the main thread. Returns C_OK if the querybuf can be
 /// further processed, C_ERR if not.
 #[no_mangle]
+#[allow(clippy::nonminimal_bool)] // kept in the same shape as the C condition
 pub unsafe extern "C" fn handleReadResult(c: *mut client) -> c_int {
     server_assert!(c, inMainThread() != 0);
     server.stat_total_reads_processed += 1;
     if (*c).nread <= 0 {
         if (*c).nread == -1 {
             if conn_get_state((*c).conn) != ConnectionState_CONN_STATE_CONNECTED as c_int {
-                server_log!(LL_VERBOSE, "Reading from client: %s", conn_get_last_error((*c).conn));
+                server_log!(
+                    LL_VERBOSE,
+                    "Reading from client: %s",
+                    conn_get_last_error((*c).conn)
+                );
                 freeClientAsync(c);
             }
         } else if (*c).nread == 0 {
@@ -317,7 +322,8 @@ pub unsafe extern "C" fn parseInlineBuffer(c: *mut client) {
             zfree((*c).argv as *mut c_void);
         }
         (*c).argv_len = argc;
-        (*c).argv = zmalloc(core::mem::size_of::<*mut robj>() * (*c).argv_len as usize) as *mut *mut robj;
+        (*c).argv =
+            zmalloc(core::mem::size_of::<*mut robj>() * (*c).argv_len as usize) as *mut *mut robj;
         (*c).argv_len_sum = 0;
     }
 
@@ -336,8 +342,9 @@ pub unsafe extern "C" fn parseInlineBuffer(c: *mut client) {
     /* Per-slot network bytes-in: every whitespace is of length 1, with the
      * exception of the trailing '\r\n' being length 2. Same unsigned
      * wraparound as C when argc == 0. */
-    (*c).net_input_bytes_curr_cmd =
-        ((*c).argv_len_sum as u64).wrapping_add(((*c).argc - 1) as i64 as u64).wrapping_add(2);
+    (*c).net_input_bytes_curr_cmd = ((*c).argv_len_sum as u64)
+        .wrapping_add(((*c).argc - 1) as i64 as u64)
+        .wrapping_add(2);
     (*c).read_flags |= READ_FLAGS_PARSING_COMPLETED as c_int;
     /* Record qb_pos so commandProcessed() can update reploff precisely. */
     (*c).qb_applied = (*c).qb_pos;
@@ -538,8 +545,10 @@ unsafe fn parse_multibulk(
                     (*c).qb_applied = 0;
                     /* Hint the sds library about the amount of bytes this string is
                      * going to contain. */
-                    (*c).querybuf =
-                        sdsMakeRoomForNonGreedy((*c).querybuf, ll as usize + 2 - sdslen((*c).querybuf));
+                    (*c).querybuf = sdsMakeRoomForNonGreedy(
+                        (*c).querybuf,
+                        ll as usize + 2 - sdslen((*c).querybuf),
+                    );
                     /* Over-allocated on purpose; don't let it be shrunk before used. */
                     if (*c).querybuf_peak < ll as usize + 2 {
                         (*c).querybuf_peak = ll as usize + 2;
@@ -558,8 +567,12 @@ unsafe fn parse_multibulk(
         } else {
             /* Check if we have space in argv, grow if needed */
             if *argc >= *argv_len {
-                *argv_len = (if *argv_len < INT_MAX / 2 { *argv_len * 2 } else { INT_MAX })
-                    .min(*argc + (*c).multibulklen);
+                *argv_len = (if *argv_len < INT_MAX / 2 {
+                    *argv_len * 2
+                } else {
+                    INT_MAX
+                })
+                .min(*argc + (*c).multibulklen);
                 *argv = zrealloc(
                     *argv as *mut c_void,
                     core::mem::size_of::<*mut robj>() * *argv_len as usize,
@@ -579,7 +592,8 @@ unsafe fn parse_multibulk(
                 && (*c).bulklen >= PROTO_MBULK_BIG_ARG as _
                 && sdslen((*c).querybuf) == ((*c).bulklen + 2) as usize
             {
-                *(*argv).add(*argc as usize) = createObject(OBJ_STRING as c_int, (*c).querybuf as *mut c_void);
+                *(*argv).add(*argc as usize) =
+                    createObject(OBJ_STRING as c_int, (*c).querybuf as *mut c_void);
                 *argc += 1;
                 *argv_len_sum += (*c).bulklen as usize;
                 sdsIncrLen((*c).querybuf, -2); /* remove CRLF */
@@ -676,7 +690,11 @@ pub unsafe extern "C" fn readToQueryBuf(c: *mut client) -> bool {
     let is_replicated = (*c).read_flags & READ_FLAGS_REPLICATED as c_int;
 
     let mut readlen: usize = PROTO_IOBUF_LEN as usize;
-    let mut qblen: usize = if (*c).querybuf.is_null() { 0 } else { sdslen((*c).querybuf) };
+    let mut qblen: usize = if (*c).querybuf.is_null() {
+        0
+    } else {
+        sdslen((*c).querybuf)
+    };
     /* If this is a multi bulk request, and we are processing a bulk reply
      * that is large enough, try to maximize the probability that the query
      * buffer contains exactly the SDS string representing the object, even
@@ -686,7 +704,8 @@ pub unsafe extern "C" fn readToQueryBuf(c: *mut client) -> bool {
         && (*c).bulklen != -1
         && (*c).bulklen >= PROTO_MBULK_BIG_ARG as _
     {
-        let remaining: isize = ((*c).bulklen as usize + 2).wrapping_sub(qblen - (*c).qb_pos) as isize;
+        let remaining: isize =
+            ((*c).bulklen as usize + 2).wrapping_sub(qblen - (*c).qb_pos) as isize;
         big_arg = true;
 
         /* Note that the 'remaining' variable may be zero in some edge case,
@@ -704,7 +723,11 @@ pub unsafe extern "C" fn readToQueryBuf(c: *mut client) -> bool {
 
     if (*c).querybuf.is_null() {
         server_assert!(c, sdslen(thread_shared_qb()) == 0);
-        (*c).querybuf = if big_arg { sdsempty() } else { thread_shared_qb() };
+        (*c).querybuf = if big_arg {
+            sdsempty()
+        } else {
+            thread_shared_qb()
+        };
         qblen = sdslen((*c).querybuf);
     }
 
@@ -743,9 +766,14 @@ pub unsafe extern "C" fn readToQueryBuf(c: *mut client) -> bool {
         /* MULTI/EXEC queued arguments count as query buffer too. For
          * unauthenticated clients, the query buffer cannot exceed 1MB. */
         let qb_memory = sdslen((*c).querybuf)
-            + if (*c).mstate.is_null() { 0 } else { (*(*c).mstate).argv_len_sums };
+            + if (*c).mstate.is_null() {
+                0
+            } else {
+                (*(*c).mstate).argv_len_sums
+            };
         if qb_memory > server.client_max_querybuf_len
-            || (qb_memory > 1024 * 1024 && ((*c).read_flags & READ_FLAGS_AUTH_REQUIRED as c_int) != 0)
+            || (qb_memory > 1024 * 1024
+                && ((*c).read_flags & READ_FLAGS_AUTH_REQUIRED as c_int) != 0)
         {
             (*c).read_flags |= READ_FLAGS_QB_LIMIT_REACHED as c_int;
         }
@@ -767,7 +795,11 @@ unsafe fn read_and_decode_primary_stream(
         (*primary).nread = 0;
         *full_read = false;
     } else {
-        (*primary).nread = conn_read((*primary).conn, wire_buf.as_mut_ptr() as *mut c_void, PROTO_IOBUF_LEN as usize);
+        (*primary).nread = conn_read(
+            (*primary).conn,
+            wire_buf.as_mut_ptr() as *mut c_void,
+            PROTO_IOBUF_LEN as usize,
+        );
         *full_read = (*primary).nread == PROTO_IOBUF_LEN as c_int;
     }
     if handleReadResult(primary) != C_OK as c_int {
@@ -811,14 +843,22 @@ pub unsafe extern "C" fn readQueryFromClient(conn: *mut connection) {
             full_read = !replStreamHasPendingDecode();
         } else if decode_repl_stream {
             full_read = false;
-            read_ok = read_and_decode_primary_stream(c, decode_budget, &mut decoded_this_iteration, &mut full_read);
+            read_ok = read_and_decode_primary_stream(
+                c,
+                decode_budget,
+                &mut decoded_this_iteration,
+                &mut full_read,
+            );
         } else {
             full_read = readToQueryBuf(c);
             read_ok = handleReadResult(c) == C_OK as c_int;
         }
         if read_ok {
             if decoded_this_iteration < 0 {
-                server_log!(LL_WARNING, "Disconnecting primary due to replication stream decompression failure");
+                server_log!(
+                    LL_WARNING,
+                    "Disconnecting primary due to replication stream decompression failure"
+                );
                 freeClientAsync(c);
                 return;
             }
