@@ -17,6 +17,8 @@
 
 #define DLHOST_SLOT_CLOSED ((void *)1)
 
+void trimCommandQueue(client *c); /* networking.c */
+
 static const dlhostOps *host_ops;
 static int engine_idx;
 static dlhostInbox *inbox;
@@ -184,6 +186,62 @@ static hostConn *hcCreate(dlhostMsg *m) {
     return hc;
 }
 
+/* Parse on the IO thread, the way the engine's own IO threads run
+ * parseMultibulk off the main thread. Input is complete and well formed: the
+ * host checked it. */
+void *dlhostEngineParse(const struct iovec *cmds, int n) {
+    parsedCommand *pc = zmalloc(sizeof(*pc) * n);
+    for (int i = 0; i < n; i++) {
+        const char *p = cmds[i].iov_base;
+        parsedCommand *x = &pc[i];
+        memset(x, 0, sizeof(*x));
+        x->argc = (int)strtol(p + 1, NULL, 10);
+        x->argv_len = x->argc;
+        x->argv = zmalloc(sizeof(robj *) * x->argc);
+        p = strchr(p, '\n') + 1;
+        for (int j = 0; j < x->argc; j++) {
+            long len = strtol(p + 1, NULL, 10);
+            p = strchr(p, '\n') + 1;
+            x->argv[j] = createStringObject(p, len);
+            x->argv_len_sum += len;
+            p += len + 2;
+        }
+        x->read_flags = READ_FLAGS_PARSING_COMPLETED;
+        x->slot = -1;
+        /* As prepareCommandGeneric() (server.c), which IO threads also run. */
+        if (x->argc) {
+            x->cmd = lookupCommand(x->argv, x->argc);
+            if (!x->cmd)
+                x->read_flags |= READ_FLAGS_COMMAND_NOT_FOUND;
+            else if (!commandCheckArity(x->cmd, x->argc, NULL))
+                x->read_flags |= READ_FLAGS_BAD_ARITY;
+        }
+        x->input_bytes = cmds[i].iov_len;
+    }
+    return pc;
+}
+
+/* Append pre-parsed commands to the client's command queue and run them;
+ * processInputBuffer() consumes the queue, and resumes it after a block. */
+static void handleParsed(hostConn *hc, dlhostMsg *m) {
+    client *c = connGetPrivateData(&hc->c);
+    parsedCommand *pc = m->parsed;
+    cmdQueue *q = &c->cmd_queue;
+    serverAssert(q->len + m->nparsed < 65535);
+    if (q->len + m->nparsed > q->cap) {
+        q->cap = q->len + m->nparsed;
+        q->cmds = zrealloc(q->cmds, sizeof(parsedCommand) * q->cap);
+    }
+    memcpy(q->cmds + q->len, pc, sizeof(parsedCommand) * m->nparsed);
+    q->len += m->nparsed;
+    zfree(pc);
+    m->parsed = NULL;
+    host_ops->msg_done(m);
+    if (processInputBuffer(c) == C_ERR) return;
+    trimCommandQueue(c);
+    beforeNextClient(c);
+}
+
 static void handleMsg(dlhostMsg *m) {
     void *s = *m->engine_slot;
     if (m->type == DLHOST_MSG_CLOSE) {
@@ -196,10 +254,22 @@ static void handleMsg(dlhostMsg *m) {
         return;
     }
     if (s == DLHOST_SLOT_CLOSED) {
+        if (m->parsed) { /* free what dlhostEngineParse() built */
+            parsedCommand *pc = m->parsed;
+            for (int i = 0; i < m->nparsed; i++) {
+                for (int j = 0; j < pc[i].argc; j++) decrRefCount(pc[i].argv[j]);
+                zfree(pc[i].argv);
+            }
+            zfree(pc);
+        }
         host_ops->msg_done(m);
         return;
     }
     hostConn *hc = s ? s : hcCreate(m);
+    if (m->type == DLHOST_MSG_PARSED) {
+        handleParsed(hc, m);
+        return;
+    }
     m->next = NULL;
     if (hc->in_tail)
         hc->in_tail->next = m;

@@ -14,6 +14,7 @@
 
 #define DLHOST_MSG_DATA 1  /* host -> engine: RESP bytes for one connection */
 #define DLHOST_MSG_CLOSE 2 /* host -> engine: connection closed */
+#define DLHOST_MSG_PARSED 5 /* host -> engine: commands already parsed into argv */
 
 typedef struct dlhostMsg {
     struct dlhostMsg *next;
@@ -22,6 +23,8 @@ typedef struct dlhostMsg {
     void **engine_slot;  /* per-engine slot in hconn, touched only by that engine */
     size_t len;
     size_t pos;          /* consumed by the engine */
+    void *parsed;        /* DLHOST_MSG_PARSED: engine-allocated, from dlhostEngineParseFn */
+    int nparsed;
     char data[];
 } dlhostMsg;
 
@@ -52,5 +55,9 @@ typedef struct dlhostOps {
 /* Exported by the engine shared object. */
 typedef void (*dlhostEngineSetupFn)(const dlhostOps *ops, int idx, dlhostInbox *inbox);
 typedef int (*dlhostEngineMainFn)(int argc, char **argv);
+/* Runs on a host IO thread, in the engine's namespace: turns n complete
+ * multibulk requests into the engine's parsed-command structs, allocated
+ * with the engine's allocator. */
+typedef void *(*dlhostEngineParseFn)(const struct iovec *cmds, int n);
 
 #endif

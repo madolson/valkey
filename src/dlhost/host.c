@@ -17,6 +17,8 @@
  *   --pin-io "cpu,cpu,..."   pin IO thread k to the k-th cpu
  *   --pin-engines "cpu,..."  pin engine i to the i-th cpu (sets server-cpulist)
  *   --copy-dlopen            dlopen a private copy per engine instead of dlmopen
+ *   --raw                    hand engines raw RESP to re-parse on their main
+ *                            thread, instead of argv built on the IO thread
  */
 #define _GNU_SOURCE
 #include <dlfcn.h>
@@ -61,6 +63,7 @@ typedef struct hconn {
     int closed;
     int dirty; /* on the IO thread's dirty list */
     int want_out;
+    int close_engine; /* 1 + engine that closed its client (QUIT, kill) */
     struct hconn *dirty_next;
     buf in, out;
     buf rep[MAXN];
@@ -84,6 +87,14 @@ static int N = 2, M = 2, port = 10100;
 static const char *so_path = "./libvalkey-engine.so";
 static const char *rundir = "/tmp/chunky-dlmopen-run";
 static int copy_dlopen = 0;
+static int raw_mode = 0;
+static dlhostEngineParseFn eng_parse[MAXN];
+static void (*ns_ctype_init[MAXN])(void);
+
+static void *failingMorecore(ptrdiff_t n) {
+    (void)n;
+    return NULL;
+}
 static int pin_io[MAXIO], npin_io = 0;
 static int pin_eng[MAXN], npin_eng = 0;
 static dlhostInbox engine_inbox[MAXN];
@@ -164,6 +175,8 @@ static dlhostMsg *msgNew(int type, hconn *hc, size_t len) {
     m->engine_slot = NULL;
     m->len = len;
     m->pos = 0;
+    m->parsed = NULL;
+    m->nparsed = 0;
     atomic_fetch_add_explicit(&hc->refs, 1, memory_order_relaxed);
     return m;
 }
@@ -385,6 +398,7 @@ static void connClose(iothread *t, hconn *hc) {
 
 #define MAXSPANS 1024
 static void connRead(iothread *t, hconn *hc) {
+    if (hc->close_engine) return; /* nothing after QUIT runs */
     for (;;) {
         bufReserve(&hc->in, 65536);
         ssize_t n = read(hc->fd, hc->in.p + hc->in.len, hc->in.cap - hc->in.len);
@@ -420,16 +434,37 @@ static void connRead(iothread *t, hconn *hc) {
         }
         if (ns == 0) break;
         dlhostMsg *m[MAXN] = {0};
+        int inl[MAXN] = {0};
+        for (int i = 0; i < ns; i++)
+            if (hc->in.p[start[i]] != '*') inl[eng[i]] = 1;
         for (int e = 0; e < N; e++) {
             if (!tot[e]) continue;
+            if (!raw_mode && !inl[e]) {
+                /* Build the engine's argv here, on the IO thread. */
+                struct iovec iov[MAXSPANS];
+                int n = 0;
+                for (int i = 0; i < ns; i++)
+                    if (eng[i] == e) {
+                        iov[n].iov_base = hc->in.p + start[i];
+                        iov[n].iov_len = len[i];
+                        n++;
+                    }
+                m[e] = msgNew(DLHOST_MSG_PARSED, hc, 0);
+                m[e]->engine_slot = &hc->eslot[e];
+                m[e]->parsed = eng_parse[e](iov, n);
+                m[e]->nparsed = n;
+                continue;
+            }
             m[e] = msgNew(DLHOST_MSG_DATA, hc, tot[e]);
             m[e]->engine_slot = &hc->eslot[e];
             m[e]->len = 0;
         }
         for (int i = 0; i < ns; i++) {
             dlhostMsg *x = m[eng[i]];
-            memcpy(x->data + x->len, hc->in.p + start[i], len[i]);
-            x->len += len[i];
+            if (x->type == DLHOST_MSG_DATA) {
+                memcpy(x->data + x->len, hc->in.p + start[i], len[i]);
+                x->len += len[i];
+            }
             orderPush(hc, eng[i]);
         }
         for (int e = 0; e < N; e++)
@@ -441,11 +476,16 @@ static void connRead(iothread *t, hconn *hc) {
 }
 
 static void connFlush(iothread *t, hconn *hc) {
+    int close_now = 0;
     while (hc->ohead != hc->otail) {
         int e = hc->order[hc->ohead % hc->ocap];
         buf *b = &hc->rep[e];
         size_t k = respSkip(b->p + b->off, b->len - b->off);
-        if (!k) break;
+        if (!k) {
+            /* The engine that closed will not reply again. */
+            if (hc->close_engine == e + 1) close_now = 1;
+            break;
+        }
         bufAppend(&hc->out, b->p + b->off, k);
         b->off += k;
         if (b->off == b->len) b->off = b->len = 0;
@@ -461,6 +501,10 @@ static void connFlush(iothread *t, hconn *hc) {
         hc->out.off += n;
     }
     if (hc->out.off == hc->out.len) hc->out.off = hc->out.len = 0;
+    if (hc->close_engine && (close_now || hc->ohead == hc->otail)) {
+        connClose(t, hc); /* unwritten output is dropped, as on a socket */
+        return;
+    }
     int want = hc->out.len != 0;
     if (want != hc->want_out) {
         struct epoll_event ev = {.events = EPOLLIN | (want ? EPOLLOUT : 0), .data.ptr = hc};
@@ -482,9 +526,9 @@ static void handleReplies(iothread *t) {
                 bufAppend(&hc->rep[m->pos], m->data, m->len);
                 markDirty(t, hc);
             } else if (m->type == DLHOST_MSG_ECLOSED) {
-                /* Flush what we have, then close (QUIT and friends). */
-                connFlush(t, hc);
-                connClose(t, hc);
+                /* Close once every earlier reply is written (QUIT, kill). */
+                hc->close_engine = (int)m->pos + 1;
+                markDirty(t, hc);
             }
         }
         opMsgDone(m);
@@ -500,6 +544,7 @@ static void *ioMain(void *arg) {
         CPU_SET(t->cpu, &cs);
         pthread_setaffinity_np(pthread_self(), sizeof(cs), &cs);
     }
+    for (int e = 0; e < N; e++) ns_ctype_init[e]();
     char name[16];
     snprintf(name, sizeof(name), "dlhost-io%d", t->id);
     pthread_setname_np(pthread_self(), name);
@@ -600,7 +645,15 @@ static void loadEngine(int i) {
     }
     dlhostEngineSetupFn setup = (dlhostEngineSetupFn)dlsym(h, "dlhostEngineSetup");
     dlhostEngineMainFn emain = (dlhostEngineMainFn)dlsym(h, "valkey_engine_main");
-    if (!setup || !emain) {
+    eng_parse[i] = (dlhostEngineParseFn)dlsym(h, "dlhostEngineParse");
+    /* IO threads call into the namespace (dlhostEngineParse), whose libc
+     * never ran its per-thread init on them; they call this first. */
+    ns_ctype_init[i] = (void (*)(void))dlsym(h, "__ctype_init");
+    /* glibc 2.26 lets every namespace's main arena grow with brk; glibc
+     * 2.27+ forbids it outside the base namespace. Make it mmap instead. */
+    void **morecore = dlsym(h, "__morecore");
+    if (morecore) *morecore = (void *)failingMorecore;
+    if (!setup || !emain || !eng_parse[i] || !ns_ctype_init[i] || !morecore) {
         fprintf(stderr, "dlhost: engine %d missing symbols: %s\n", i, dlerror());
         exit(1);
     }
@@ -683,6 +736,8 @@ int main(int argc, char **argv) {
             parseCpus(argv[++i], pin_io, &npin_io);
         else if (!strcmp(argv[i], "--pin-engines") && i + 1 < argc)
             parseCpus(argv[++i], pin_eng, &npin_eng);
+        else if (!strcmp(argv[i], "--raw"))
+            raw_mode = 1;
         else if (!strcmp(argv[i], "--copy-dlopen"))
             copy_dlopen = 1;
         else if (!strcmp(argv[i], "--")) {
@@ -750,7 +805,7 @@ int main(int argc, char **argv) {
      * before its exit() takes the whole process down. Exit directly. */
     signal(SIGTERM, onTerm);
     signal(SIGINT, onTerm);
-    fprintf(stderr, "dlhost: %d engines (%s), %d io threads, port %d\n", N, copy_dlopen ? "dlopen copies" : "dlmopen",
-            M, port);
+    fprintf(stderr, "dlhost: %d engines (%s), %d io threads, port %d, %s\n", N,
+            copy_dlopen ? "dlopen copies" : "dlmopen", M, port, raw_mode ? "raw RESP" : "argv parsed on IO threads");
     for (;;) pause();
 }
