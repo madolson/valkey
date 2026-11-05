@@ -261,6 +261,8 @@ void bioCreateClusterConfigSaveJob(sds content, bool do_fsync) {
 #define CONFIG_SAVE_LOG_ERROR_RATE 30 /* Seconds between errors logging. */
 void *bioProcessBackgroundJobs(void *arg) {
     bio_worker_data *const bwd = arg;
+    /* Only lazy free jobs run instance code, on the instance that submitted them. */
+    inst = NULL;
     sigset_t sigset;
 
     valkey_set_thread_title(bwd->bio_worker_title);

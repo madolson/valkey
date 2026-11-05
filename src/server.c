@@ -112,7 +112,10 @@ double R_Zero, R_PosInf, R_NegInf, R_Nan;
 /* Global vars */
 struct valkeyServer server;                                       /* Server global state */
 struct valkeyInstance server_instance = {.bgIteration_epoch = 1}; /* The only server instance */
-__thread struct valkeyInstance *inst;                             /* Instance owned by the running thread */
+/* Instance owned by the running thread. Threads start on the single instance,
+ * which covers threads created by modules. Server threads that must not touch
+ * instance state (IO, bio) clear it. */
+__thread struct valkeyInstance *inst = &server_instance;
 
 /*============================ Internal prototypes ========================== */
 

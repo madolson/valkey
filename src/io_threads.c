@@ -374,6 +374,8 @@ static inline void processTaggedSPMCJob(void *tagged_job) {
 }
 
 static void *IOThreadMain(void *myid) {
+    /* IO threads serve every instance and must not use instance state. */
+    inst = NULL;
     /* The ID is the thread ID number (from 1 to server.io_threads_num-1). ID 0 is the main thread. */
     long id = (long)myid;
     char thdname[32];
