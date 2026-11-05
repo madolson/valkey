@@ -839,12 +839,12 @@ void unblockClientOnError(client *c, const char *err_str) {
  *
  * This uses the BLOCKED_INUSE blocking type (via blockClient()) and tracks
  * blocked keys per client in c->bstate->keys and a key→clients mapping in
- * a static hashtable (inuse_key_to_clients).
+ * a static hashtable (inst->inuse_key_to_clients).
  *
  * Workflow:
  *   1. blockClientInUseOnKeys() blocks the client via
  *      blockClient(c, BLOCKED_INUSE) and records mappings in both
- *      c->bstate->keys and inuse_key_to_clients.
+ *      c->bstate->keys and inst->inuse_key_to_clients.
  *   2. unblockClientsInUseOnKey() unblocks a single key. A client remains
  *      blocked until all its keys are unblocked.
  *   3. A client is fully unblocked only when it has no remaining keys in its
@@ -859,7 +859,6 @@ void unblockClientOnError(client *c, const char *err_str) {
  * with DB swaps. A BLOCKED_INUSE client may get unblocked early due to
  * unblocking a key with the same name on a different DB. In this case, the
  * client will get reblocked when attempting to reprocess the command. */
-static hashtable *inuse_key_to_clients; /* Maps keys to keyToClientsEntry. */
 
 /* ----------------------------- key_to_clients Hashtable Util ------------------------- */
 
@@ -890,9 +889,9 @@ static hashtableType keyToClientsHashtableType = {
 
 // Return the list of clients blocked on key, or NULL if none exist.
 static list *keyToClients_getBlockedClientsList(robj *key) {
-    if (!inuse_key_to_clients) return NULL;
+    if (!inst->inuse_key_to_clients) return NULL;
     keyToClientsEntry *entry;
-    if (hashtableFind(inuse_key_to_clients, key, (void **)&entry)) {
+    if (hashtableFind(inst->inuse_key_to_clients, key, (void **)&entry)) {
         return entry->clients;
     }
     return NULL;
@@ -905,7 +904,7 @@ static list *keyToClients_addEntry(robj *key) {
     entry->key = key;
     incrRefCount(key);
     entry->clients = listCreate();
-    serverAssert(hashtableAdd(inuse_key_to_clients, entry));
+    serverAssert(hashtableAdd(inst->inuse_key_to_clients, entry));
     return entry->clients;
 }
 
@@ -931,7 +930,7 @@ void blockClientInUseOnKeys(client *c, int num_keys, robj *keys[]) {
     serverAssert(num_keys > 0);
     serverAssert(!c->flag.replica);
 
-    if (!inuse_key_to_clients) inuse_key_to_clients = hashtableCreate(&keyToClientsHashtableType);
+    if (!inst->inuse_key_to_clients) inst->inuse_key_to_clients = hashtableCreate(&keyToClientsHashtableType);
 
     initClientBlockingState(c);
     c->bstate->timeout = 0;
@@ -982,7 +981,7 @@ void unblockClientsInUseOnKey(robj *key) {
         }
     }
 
-    hashtableDelete(inuse_key_to_clients, key);
+    hashtableDelete(inst->inuse_key_to_clients, key);
 }
 
 /* Unblock all clients that are currently blocked by blockInUse, across all
@@ -990,16 +989,16 @@ void unblockClientsInUseOnKey(robj *key) {
  * processUnblockedClients(). After this call, no clients remain blocked
  * by blockInUse. */
 void unblockClientsInUseOnAllKeys(void) {
-    if (!inuse_key_to_clients) return;
+    if (!inst->inuse_key_to_clients) return;
     hashtableIterator iter;
-    hashtableInitIterator(&iter, inuse_key_to_clients, HASHTABLE_ITER_SAFE);
+    hashtableInitIterator(&iter, inst->inuse_key_to_clients, HASHTABLE_ITER_SAFE);
     keyToClientsEntry *e;
     while (hashtableNext(&iter, (void **)&e)) {
         unblockClientsInUseOnKey(e->key);
     }
     hashtableCleanupIterator(&iter);
     serverAssert(inst->blocked_clients_by_type[BLOCKED_INUSE] == 0);
-    serverAssert(hashtableSize(inuse_key_to_clients) == 0);
+    serverAssert(hashtableSize(inst->inuse_key_to_clients) == 0);
 }
 
 /* Remove a client from all blockInUse key-to-clients mappings.
@@ -1015,7 +1014,7 @@ static void unlinkBlockInUseClient(client *c) {
         listNode *ln = listSearchKey(clientList, c);
         serverAssert(ln != NULL);
         listDelNode(clientList, ln);
-        if (listLength(clientList) == 0) hashtableDelete(inuse_key_to_clients, key);
+        if (listLength(clientList) == 0) hashtableDelete(inst->inuse_key_to_clients, key);
     }
     dictReleaseIterator(di);
     dictEmpty(c->bstate->keys, NULL);
@@ -1051,14 +1050,14 @@ void blockedBeforeSleep(void) {
 
 /* Test-only: get the current number of blocked keys by blockInUse. */
 int getBlockInUseKeyCount(void) {
-    return inuse_key_to_clients ? hashtableSize(inuse_key_to_clients) : 0;
+    return inst->inuse_key_to_clients ? hashtableSize(inst->inuse_key_to_clients) : 0;
 }
 
 /* Test-only: release the blockInUse hashtable. */
 void releaseBlockInUse(void) {
     unblockClientsInUseOnAllKeys();
-    if (inuse_key_to_clients) {
-        hashtableRelease(inuse_key_to_clients);
-        inuse_key_to_clients = NULL;
+    if (inst->inuse_key_to_clients) {
+        hashtableRelease(inst->inuse_key_to_clients);
+        inst->inuse_key_to_clients = NULL;
     }
 }

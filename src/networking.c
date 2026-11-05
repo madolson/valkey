@@ -162,7 +162,6 @@ static int parseMultibulk(client *c,
                           size_t *argv_len_sum,
                           unsigned long long *net_input_bytes_curr_cmd);
 
-int ProcessingEventsWhileBlocked = 0; /* See processEventsWhileBlocked(). */
 _Thread_local sds thread_shared_qb = NULL;
 
 /* fork() only preserves the calling thread's TLS. Keep a process-wide reference
@@ -7113,7 +7112,7 @@ void processEventsWhileBlocked(void) {
      * Note that there could be cases of nested calls to this function,
      * specifically on a busy script during async_loading rdb, and scripts
      * that came from AOF. */
-    ProcessingEventsWhileBlocked++;
+    inst->ProcessingEventsWhileBlocked++;
     while (iterations--) {
         long long startval = inst->events_processed_while_blocked;
         long long ae_events =
@@ -7127,8 +7126,8 @@ void processEventsWhileBlocked(void) {
 
     whileBlockedCron();
 
-    ProcessingEventsWhileBlocked--;
-    serverAssert(ProcessingEventsWhileBlocked >= 0);
+    inst->ProcessingEventsWhileBlocked--;
+    serverAssert(inst->ProcessingEventsWhileBlocked >= 0);
 
     inst->cmd_time_snapshot = prev_cmd_time_snapshot;
 }
@@ -7136,7 +7135,7 @@ void processEventsWhileBlocked(void) {
 /* Return 1 if the client read is handled using threaded I/O.
  * 0 otherwise. */
 int postponeClientRead(client *c) {
-    if (ProcessingEventsWhileBlocked) return 0;
+    if (inst->ProcessingEventsWhileBlocked) return 0;
 
     return (trySendReadToIOThreads(c) == C_OK);
 }
@@ -7145,8 +7144,8 @@ int postponeClientRead(client *c) {
 int processClientIOReadsDone(client *c) {
     serverAssert(c->io_read_state == CLIENT_COMPLETED_IO);
 
-    if (ProcessingEventsWhileBlocked) {
-        /* When ProcessingEventsWhileBlocked we may call processIOThreadsReadDone recursively.
+    if (inst->ProcessingEventsWhileBlocked) {
+        /* When inst->ProcessingEventsWhileBlocked we may call processIOThreadsReadDone recursively.
          * In this case, there may be some clients left in the batch waiting to be processed. */
         processClientsCommandsBatch();
     }

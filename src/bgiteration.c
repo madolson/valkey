@@ -287,15 +287,13 @@ typedef struct itemListNode {
 } itemListNode;
 
 static const int FREE_ITEM_MAX = 500;
-static itemListNode *freeItemStackHead = NULL;
-static int freeItemStackCount = 0;
 
 static void itemFreeList_returnItemBackToFreeList(bgIteratorItem *item) {
     itemListNode *freedNode = (itemListNode *)item;
-    if (freeItemStackCount < FREE_ITEM_MAX) {
-        freedNode->next = freeItemStackHead;
-        freeItemStackHead = freedNode;
-        freeItemStackCount++;
+    if (inst->freeItemStackCount < FREE_ITEM_MAX) {
+        freedNode->next = inst->freeItemStackHead;
+        inst->freeItemStackHead = freedNode;
+        inst->freeItemStackCount++;
     } else {
         zfree(freedNode);
     }
@@ -304,13 +302,13 @@ static void itemFreeList_returnItemBackToFreeList(bgIteratorItem *item) {
 // Pop a free node from the free list or allocate if none free
 static bgIteratorItem *itemFreeList_getElementOrAllocate(void) {
     bgIteratorItem *item;
-    if (freeItemStackHead) {
-        item = (bgIteratorItem *)freeItemStackHead;
-        freeItemStackHead = freeItemStackHead->next;
-        freeItemStackCount--;
-        if (freeItemStackHead) valkey_prefetch(freeItemStackHead);
+    if (inst->freeItemStackHead) {
+        item = (bgIteratorItem *)inst->freeItemStackHead;
+        inst->freeItemStackHead = inst->freeItemStackHead->next;
+        inst->freeItemStackCount--;
+        if (inst->freeItemStackHead) valkey_prefetch(inst->freeItemStackHead);
     } else {
-        serverAssert(freeItemStackCount == 0);
+        serverAssert(inst->freeItemStackCount == 0);
         // Create new listNode and item
         item = zmalloc(sizeof(bgIteratorItem));
     }
@@ -318,13 +316,13 @@ static bgIteratorItem *itemFreeList_getElementOrAllocate(void) {
 }
 
 static void itemFreeList_release(void) {
-    while (freeItemStackHead) {
-        itemListNode *node = freeItemStackHead;
-        freeItemStackHead = node->next;
-        freeItemStackCount--;
+    while (inst->freeItemStackHead) {
+        itemListNode *node = inst->freeItemStackHead;
+        inst->freeItemStackHead = node->next;
+        inst->freeItemStackCount--;
         zfree(node);
     }
-    serverAssert(freeItemStackCount == 0);
+    serverAssert(inst->freeItemStackCount == 0);
 }
 
 
@@ -432,39 +430,29 @@ struct bgIterator {
 
 // These static values are only accessed from the main Valkey thread.
 
-static list *allIterators;   // list of bgIterator
-static dict *nameToIterator; // bgIterator->name -> bgIterator
 
 // Global, across all iterators, dict contains a dbEntry pointer -> ref count
-static dict *inUseEntries; // dbEntry -> ref count
 
 /* Key values in the current command which don't exist in the DB yet.  Needed for determination of
  * replication for NON-consistent iterations. */
-static list *curCmdMissingKeys; // list of robj
 
 /* A counter of the total amount of memory used for buffered replication data.  This amount is
  * excluded when computing the need for evictions. */
-static ssize_t bufferedReplicationBytes;
 
 // Memory pool to track current allocated memory of cloned items (in bytes)
-static ssize_t bgiteration_current_clone_memory_pool_size;
 
 /* Snapshot of the last queue size to seed the next queue.  We assume all bgIterators consume items
  * at roughly the same rate. */
-static int last_item_count_target;
 
 // Eventloop ID of the timerproc (or AE_DELETED_EVENT_ID)
-static long long bgIterator_timeproc_id;
 
 // Incremented on each new iteration, this is updated in dbEntry metadata whenever an entry is modified.
-static uint32_t bgIteration_epoch = 1;
 
 /* If true, the iterators' cur_cmd_may_replicate flag was determined in the last call to
  * blockClientIfRequired.  Otherwise, we skipped over computing this flag (maybe because it was a
  * READ command).
  * If this is true, AND we are in the context of executing a command inside of call(), then we
  * should respect the setting of cur_cmd_may_replicate. */
-static bool iteratorReplicationFlagsWereUpdated;
 
 
 /* BgIteration debug captures BgIteration activity to a large sds buffer.  When an iterator is
@@ -768,7 +756,7 @@ static void resumeRehashing(dbEntry *de) {
 // Maintain a list of entries which are currently in-use.  These items should not be modified.
 static void incrementEntryInuse(dbEntry *de) {
     dictEntry *existingEntry;
-    dictEntry *newEntry = dictAddRaw(inUseEntries, de, &existingEntry);
+    dictEntry *newEntry = dictAddRaw(inst->inUseEntries, de, &existingEntry);
     if (newEntry) {
         incrRefCount(de);
         dictSetSignedIntegerVal(newEntry, 1);
@@ -779,9 +767,9 @@ static void incrementEntryInuse(dbEntry *de) {
 
 
 static void decrementEntryInuse(dbEntry *de) {
-    dictEntry *entry = dictFind(inUseEntries, de);
+    dictEntry *entry = dictFind(inst->inUseEntries, de);
     if (dictGetSignedIntegerVal(entry) == 1) {
-        dictDelete(inUseEntries, de);
+        dictDelete(inst->inUseEntries, de);
         decrRefCount(de);
     } else {
         serverAssert(dictGetSignedIntegerVal(entry) > 1);
@@ -790,12 +778,12 @@ static void decrementEntryInuse(dbEntry *de) {
 }
 
 static bool isEntryInuseBySingleIterator(dbEntry *de) {
-    dictEntry *entry = dictFind(inUseEntries, de);
+    dictEntry *entry = dictFind(inst->inUseEntries, de);
     return dictGetSignedIntegerVal(entry) == 1;
 }
 
 static bool isEntryInuseByAnyIterator(dbEntry *de) {
-    return (dictFind(inUseEntries, de) != NULL);
+    return (dictFind(inst->inUseEntries, de) != NULL);
 }
 
 
@@ -808,7 +796,7 @@ static ssize_t computeStringDbEntrySize(dbEntry *de) {
 
 
 static dbEntry *tryCloneDbEntry(dbEntry *de) {
-    if (bgiteration_current_clone_memory_pool_size + bgiter_max_clone_item_bytes >
+    if (inst->bgiteration_current_clone_memory_pool_size + bgiter_max_clone_item_bytes >
         bgiter_max_clone_pool_bytes) return NULL;
 
     /* Future optimization: Incorporate small ziplists, sorted sets, etc.
@@ -817,7 +805,7 @@ static dbEntry *tryCloneDbEntry(dbEntry *de) {
         ssize_t itemSize = computeStringDbEntrySize(de);
 
         if (itemSize <= bgiter_max_clone_item_bytes) {
-            bgiteration_current_clone_memory_pool_size += itemSize;
+            inst->bgiteration_current_clone_memory_pool_size += itemSize;
             dbEntry *clone = createStringObjectWithKeyAndExpire((char *)objectGetVal(de),
                                                                 sdslen(objectGetVal(de)),
                                                                 objectGetKey(de),
@@ -834,7 +822,7 @@ static dbEntry *tryCloneDbEntry(dbEntry *de) {
 static void freeClonedDictEntry(dbEntry *clonedEntry) {
     serverAssert(clonedEntry->type == OBJ_STRING);
 
-    bgiteration_current_clone_memory_pool_size -= computeStringDbEntrySize(clonedEntry);
+    inst->bgiteration_current_clone_memory_pool_size -= computeStringDbEntrySize(clonedEntry);
 
     decrRefCount(clonedEntry);
 }
@@ -919,8 +907,8 @@ static void bgIteratorRelease(bgIterator *it) {
     serverAssert(mutexQueueLength(it->items_for_iterator) == 0);
     serverAssert(mutexQueueLength(it->return_to_main_thread) == 0);
 
-    dictDelete(nameToIterator, it->name);
-    listDelNode(allIterators, listSearchKey(allIterators, it));
+    dictDelete(inst->nameToIterator, it->name);
+    listDelNode(inst->allIterators, listSearchKey(inst->allIterators, it));
 
     mutexQueueRelease(it->items_for_iterator);
     it->items_for_iterator = NULL;
@@ -991,7 +979,7 @@ static void feedIterator(bgIterator *it, monotime end_time_us) {
             serverAssert(it->dbentry_clones_queued >= it->dbentry_clones_processed);
 
             // Snapshot queue size to seed next iterator when terminated
-            last_item_count_target = it->item_count_target;
+            inst->last_item_count_target = it->item_count_target;
 
             if (it->iteration_flags & BGITERATOR_FLAG_REPLICATION) {
                 if (!it->client_is_active || (it->dbentries_queued > it->dbentries_processed)) {
@@ -1294,7 +1282,7 @@ static bool expediteKeysForWrite(bgIterator *it,
     } else {
         /* Identification of missing keys is only needed for non-consistent iteration.  This only
          * needs to be collected once (on the 1st non-consistent iteration). */
-        bool collectMissing = (listLength(curCmdMissingKeys) == 0);
+        bool collectMissing = (listLength(inst->curCmdMissingKeys) == 0);
 
         if (it->iteration_flags & BGITERATOR_FLAG_REPLICATION) {
             // CONSISTENT = NO,  REPLICATION = YES
@@ -1310,7 +1298,7 @@ static bool expediteKeysForWrite(bgIterator *it,
                 if (de == NULL) {
                     if (collectMissing) {
                         incrRefCount(oKey);
-                        listAddNodeHead(curCmdMissingKeys, oKey);
+                        listAddNodeHead(inst->curCmdMissingKeys, oKey);
                     }
                     continue;
                 }
@@ -1328,7 +1316,7 @@ static bool expediteKeysForWrite(bgIterator *it,
             /* Since missing keys are considered as already iterated, if there are any missing keys
              * we must consider that some keys have been iterated, and make sure all other keys
              * will be expedited if needed. */
-            if (listLength(curCmdMissingKeys) > 0) someIterated = true;
+            if (listLength(inst->curCmdMissingKeys) > 0) someIterated = true;
 
             /* This command may be executing as part of a larger transaction.  If some parts of the
              * transaction have already been identified to replicate, we must wait on all keys and
@@ -1373,7 +1361,7 @@ static bool expediteKeysForWrite(bgIterator *it,
                 if (de == NULL) {
                     if (collectMissing) {
                         incrRefCount(oKey);
-                        listAddNodeHead(curCmdMissingKeys, oKey);
+                        listAddNodeHead(inst->curCmdMissingKeys, oKey);
                     }
                     continue;
                 }
@@ -1463,7 +1451,7 @@ static void processReturnOfItemToMainThread(bgIterator *it, bgIteratorItem *item
     serverAssert(hasMainThreadExclusivity());
     switch ((int)item->type) {
     case BGITERATOR_ITEM_REPLICATION:
-        bufferedReplicationBytes -= item->u.repl.replication_size;
+        inst->bufferedReplicationBytes -= item->u.repl.replication_size;
         freeRobjArray(item->u.repl.argc, item->u.repl.argv);
         break;
 
@@ -1514,7 +1502,7 @@ static void processReturnOfItemToMainThread(bgIterator *it, bgIteratorItem *item
         serverAssert(it->flushdb_queued == it->flushdb_processed);
         serverAssert(it->dbentry_clones_queued == it->dbentry_clones_processed);
 
-        listEmpty(curCmdMissingKeys); // Just in case any remain
+        listEmpty(inst->curCmdMissingKeys); // Just in case any remain
 
         bool terminated = it->terminated;
         void *privdata = it->privdata;
@@ -1592,7 +1580,7 @@ static void receiveItemsBackFromIterators(bool blocking) {
     listNode *node;
     bool processedItems = false;
     do {
-        listRewind(allIterators, &li);
+        listRewind(inst->allIterators, &li);
         while ((node = listNext(&li)) != NULL) {
             bgIterator *it = listNodeValue(node);
             processedItems |= receiveItemsBackFromOneIterator(it);
@@ -1615,17 +1603,17 @@ static long long bgIteration_feedIterators_task(struct aeEventLoop *eventLoop,
 
     if (!bgIteration_iterationActive()) {
         // No more iterators exist.  Self-check, and terminate the "feed" task.
-        serverAssert(dictSize(nameToIterator) == 0);
-        serverAssert(dictSize(inUseEntries) == 0);
-        serverAssert(bufferedReplicationBytes == 0);
+        serverAssert(dictSize(inst->nameToIterator) == 0);
+        serverAssert(dictSize(inst->inUseEntries) == 0);
+        serverAssert(inst->bufferedReplicationBytes == 0);
 
         // Shrink dict back to zero (doesn't normally shrink)
-        dictRelease(inUseEntries);
-        inUseEntries = dictCreate(&dictEntryPtrDictType);
+        dictRelease(inst->inUseEntries);
+        inst->inUseEntries = dictCreate(&dictEntryPtrDictType);
 
         itemFreeList_release();
 
-        bgIterator_timeproc_id = AE_DELETED_EVENT_ID;
+        inst->bgIterator_timeproc_id = AE_DELETED_EVENT_ID;
         lastFeedEndTime = 0;
         return AE_NOMORE;
     }
@@ -1654,7 +1642,7 @@ static long long bgIteration_feedIterators_task(struct aeEventLoop *eventLoop,
 
     listIter li;
     listNode *node;
-    listRewind(allIterators, &li);
+    listRewind(inst->allIterators, &li);
     while ((node = listNext(&li)) != NULL && getMonotonicUs() < endTime) {
         bgIterator *it = listNodeValue(node);
         if (it->completed || it->terminated) continue;
@@ -1672,7 +1660,7 @@ void bgIteration_feedIterators(void) {
      * feed a minimal amount to the iterators rather than a non-deterministic amount. */
     listIter li;
     listNode *node;
-    listRewind(allIterators, &li);
+    listRewind(inst->allIterators, &li);
     while ((node = listNext(&li)) != NULL) {
         bgIterator *it = listNodeValue(node);
         it->item_count_target = 1;
@@ -1756,7 +1744,7 @@ static void resetReplicationFlagForIterators(client *c) {
 
     listIter li;
     listNode *node;
-    listRewind(allIterators, &li);
+    listRewind(inst->allIterators, &li);
     while ((node = listNext(&li)) != NULL) {
         bgIterator *it = listNodeValue(node);
         if (it->completed || it->terminated) {
@@ -1782,7 +1770,7 @@ static void handleSwapdb(int db1, int db2) {
 
     listIter li;
     listNode *node;
-    listRewind(allIterators, &li);
+    listRewind(inst->allIterators, &li);
     while ((node = listNext(&li)) != NULL) {
         bgIterator *it = listNodeValue(node);
         if (it->completed || it->terminated) continue;
@@ -1823,7 +1811,7 @@ static void handleFlushdb(int dbid) {
 
     listIter li;
     listNode *node;
-    listRewind(allIterators, &li);
+    listRewind(inst->allIterators, &li);
     while ((node = listNext(&li)) != NULL) {
         bgIterator *it = listNodeValue(node);
 
@@ -1866,7 +1854,7 @@ static bool expediteKeysForWriteOnAllIterators(int dbid,
 
     listIter li;
     listNode *node;
-    listRewind(allIterators, &li);
+    listRewind(inst->allIterators, &li);
     while ((node = listNext(&li)) != NULL) {
         bgIterator *it = listNodeValue(node);
         if (expediteKeysForWrite(it, dbid, cmd, argc, argv, keyrefs, numKeys, waitingOnKeys))
@@ -1880,7 +1868,7 @@ static bool expediteKeysForWriteOnAllIterators(int dbid,
 static bool anIteratorWillReplicateForThisCommand(void) {
     listIter li;
     listNode *node;
-    listRewind(allIterators, &li);
+    listRewind(inst->allIterators, &li);
     while ((node = listNext(&li)) != NULL) {
         bgIterator *it = listNodeValue(node);
         if (it->cur_cmd_may_replicate) return true;
@@ -2017,13 +2005,13 @@ static bgIterator *bgIteratorCreate(const char *name,
     it->return_to_main_thread = mutexQueueCreate();
 
     // Floor queue size to bgiteration_queue_increase_incr or use last queue size value
-    if (last_item_count_target < BGITER_QUEUE_INCREASE_INCR) {
-        last_item_count_target = BGITER_QUEUE_INCREASE_INCR;
+    if (inst->last_item_count_target < BGITER_QUEUE_INCREASE_INCR) {
+        inst->last_item_count_target = BGITER_QUEUE_INCREASE_INCR;
     }
-    it->item_count_target = last_item_count_target;
+    it->item_count_target = inst->last_item_count_target;
     it->iteration_flags = flags;
     it->iteration_type = iter_type;
-    it->consistent_modification_id = bgIteration_epoch++;
+    it->consistent_modification_id = inst->bgIteration_epoch++;
     it->keyset_iter = keyset_iter;
     it->early_iterate_entries = hashtableCreate(&dbEntryPtrHashtableType);
     hashtableExpand(it->early_iterate_entries, BGITER_EARLY_ITERATE_DICT_INITIAL_SIZE);
@@ -2051,20 +2039,20 @@ static bgIterator *bgIteratorCreate(const char *name,
     it->monotonic_item_start_time = 0;
 
 
-    if (bgIterator_timeproc_id <= 0) {
+    if (inst->bgIterator_timeproc_id <= 0) {
         // If iteration is not currently active, start the feeding task.  (Runs in main thread.)
-        bgIterator_timeproc_id = aeCreateTimeEvent(inst->el, 0, bgIteration_feedIterators_task, NULL, NULL);
-        serverAssert(bgIterator_timeproc_id != AE_ERR);
+        inst->bgIterator_timeproc_id = aeCreateTimeEvent(inst->el, 0, bgIteration_feedIterators_task, NULL, NULL);
+        serverAssert(inst->bgIterator_timeproc_id != AE_ERR);
     }
 
-    if (dictAdd(nameToIterator, it->name, it) != DICT_OK) {
+    if (dictAdd(inst->nameToIterator, it->name, it) != DICT_OK) {
         // Can't have 2 iterators with the same name!
         serverAssert(false);
     }
 
-    listAddNodeTail(allIterators, it);
+    listAddNodeTail(inst->allIterators, it);
 
-    dictExpand(inUseEntries, listLength(allIterators) * it->item_count_target);
+    dictExpand(inst->inUseEntries, listLength(inst->allIterators) * it->item_count_target);
 
     return it;
 }
@@ -2101,7 +2089,7 @@ bgIterator *bgIteratorFind(const char *name) {
     serverAssert(hasMainThreadExclusivity());
 
     sds sdsname = sdsnew(name);
-    bgIterator *it = dictFetchValue(nameToIterator, sdsname);
+    bgIterator *it = dictFetchValue(inst->nameToIterator, sdsname);
     sdsfree(sdsname);
 
     return it;
@@ -2223,22 +2211,22 @@ void bgIteration_init(void) {
 
     /* This should be called once and only once from the Valkey main thread.  However to support
      * unit tests, this is not validated, and multiple invocations are ignored.  */
-    if (nameToIterator) return; // If already initialized, ignore (unit tests)
+    if (inst->nameToIterator) return; // If already initialized, ignore (unit tests)
 
-    nameToIterator = dictCreate(&sdsrefToPtrDictType);
-    serverAssert(nameToIterator != NULL);
+    inst->nameToIterator = dictCreate(&sdsrefToPtrDictType);
+    serverAssert(inst->nameToIterator != NULL);
 
-    allIterators = listCreate();
-    serverAssert(allIterators != NULL);
+    inst->allIterators = listCreate();
+    serverAssert(inst->allIterators != NULL);
 
-    inUseEntries = dictCreate(&dictEntryPtrDictType);
-    serverAssert(inUseEntries != NULL);
+    inst->inUseEntries = dictCreate(&dictEntryPtrDictType);
+    serverAssert(inst->inUseEntries != NULL);
 
-    curCmdMissingKeys = listCreate();
-    serverAssert(curCmdMissingKeys != NULL);
-    listSetFreeMethod(curCmdMissingKeys, decrRefCountVoid);
+    inst->curCmdMissingKeys = listCreate();
+    serverAssert(inst->curCmdMissingKeys != NULL);
+    listSetFreeMethod(inst->curCmdMissingKeys, decrRefCountVoid);
 
-    bufferedReplicationBytes = 0;
+    inst->bufferedReplicationBytes = 0;
 
     if (BGITERATION_DEBUG) {
         debugBuffer = sdsMakeRoomFor(sdsempty(), SDS_MAX_PREALLOC);
@@ -2248,7 +2236,7 @@ void bgIteration_init(void) {
 
 // PUBLIC API
 bool bgIteration_iterationActive(void) {
-    return (allIterators != NULL && listLength(allIterators) > 0);
+    return (inst->allIterators != NULL && listLength(inst->allIterators) > 0);
 }
 
 
@@ -2274,7 +2262,7 @@ void bgIteration_keyDelete(int dbid, const_sds key) {
     // For consistent iterators, we need to make sure the item gets written before delete
     listIter li;
     listNode *node;
-    listRewind(allIterators, &li);
+    listRewind(inst->allIterators, &li);
     while ((node = listNext(&li)) != NULL) {
         bgIterator *it = listNodeValue(node);
         if (it->completed || it->terminated || !it->keyset_iter->isKeyInScope(it->keyset_iter, key)) continue;
@@ -2282,7 +2270,7 @@ void bgIteration_keyDelete(int dbid, const_sds key) {
         if (it->iteration_flags & BGITERATOR_FLAG_CONSISTENT &&
             ((bgIterationEntryMetadata *)objectGetMetadata(de))->iterator_epoch <= it->consistent_modification_id) {
             if (!iteratorHasPassedKey(it, dbid, key, de)) {
-                addEarlyIterationKey(it, de, dbid); // (may also add to inUseEntries)
+                addEarlyIterationKey(it, de, dbid); // (may also add to inst->inUseEntries)
             }
         }
 
@@ -2297,7 +2285,7 @@ void bgIteration_keyDelete(int dbid, const_sds key) {
      * missing.  If the key exists after the command executes, we can treat it like a new key. */
     if (inst->in_call) {
         robj *oKey = createObject(OBJ_STRING, sdsdup(key));
-        listAddNodeHead(curCmdMissingKeys, oKey);
+        listAddNodeHead(inst->curCmdMissingKeys, oKey);
     }
 }
 
@@ -2317,7 +2305,7 @@ void bgIteration_swapdb(int db1, int db2) {
 // PUBLIC API
 bool bgIteration_blockClientIfRequired(client *c) {
     serverAssert(hasMainThreadExclusivity());
-    iteratorReplicationFlagsWereUpdated = false;
+    inst->iteratorReplicationFlagsWereUpdated = false;
     if (!bgIteration_iterationActive()) return false;
     if (!isWriteCmd(c->cmd)) return false;
 
@@ -2331,7 +2319,7 @@ bool bgIteration_blockClientIfRequired(client *c) {
      * iterator.  If it's determined that the command should replicate, the flag will be set
      * as the command and keys are examined for expedite. */
     resetReplicationFlagForIterators(c);
-    iteratorReplicationFlagsWereUpdated = true;
+    inst->iteratorReplicationFlagsWereUpdated = true;
 
     if (c->cmd->proc == flushdbCommand || c->cmd->proc == flushallCommand) {
         // Handle flush commands prior to execution
@@ -2344,7 +2332,7 @@ bool bgIteration_blockClientIfRequired(client *c) {
 
     bool mustBlock = false;
     hashtable *waitOnKeys = hashtableCreate(&tempKeysetHashtableType); // set of robj(sds)
-    listEmpty(curCmdMissingKeys);
+    listEmpty(inst->curCmdMissingKeys);
 
     if (c->cmd->proc == execCommand) {
         mustBlock = expediteKeysForMultiExec(c, waitOnKeys);
@@ -2389,7 +2377,7 @@ bool bgIteration_blockClientIfRequired(client *c) {
             // WRITE commands with no keys should always be replicated.  SWAPDB, FLUSH, FUNCTION, etc.
             listIter li;
             listNode *node;
-            listRewind(allIterators, &li);
+            listRewind(inst->allIterators, &li);
             while ((node = listNext(&li)) != NULL) {
                 bgIterator *it = listNodeValue(node);
                 it->cur_cmd_may_replicate = true;
@@ -2492,7 +2480,7 @@ void bgIteration_handleCommandReplication(int dbid,
 
     listIter li;
     listNode *node;
-    listRewind(allIterators, &li);
+    listRewind(inst->allIterators, &li);
     while ((node = listNext(&li)) != NULL) {
         bgIterator *it = listNodeValue(node);
         if (it->completed || it->terminated) continue;
@@ -2521,14 +2509,14 @@ void bgIteration_handleCommandReplication(int dbid,
                  *       handle it as a "missing key" below.  If we were to try to handle it as a
                  *       standard "missing key", we would get the DBID incorrect. */
 
-            } else if (listLength(curCmdMissingKeys) > 0 &&
+            } else if (listLength(inst->curCmdMissingKeys) > 0 &&
                        cmd->proc != multiCommand && cmd->proc != execCommand) {
                 /* MULTI/EXEC are ignored because they are injected around a transaction by
                  * propagateToBgIteration without passing through bgIteration_blockClientIfRequired.
-                 * curCmdMissingKeys holds the keys of a command inside the transaction. */
+                 * inst->curCmdMissingKeys holds the keys of a command inside the transaction. */
                 listIter missingIt;
                 listNode *missingNode;
-                listRewind(curCmdMissingKeys, &missingIt);
+                listRewind(inst->curCmdMissingKeys, &missingIt);
                 while ((missingNode = listNext(&missingIt)) != NULL) {
                     robj *oKey = listNodeValue(missingNode);
                     const_sds key = objectGetVal(oKey);
@@ -2602,7 +2590,7 @@ void bgIteration_handleCommandReplication(int dbid,
             serverAssert(de == NULL); // dbEntry should be removed before replication (self-check)
             if (it->keyset_iter->isKeyInScope(it->keyset_iter, key)) {
                 bool blockClientIfRequiredWasCalled = (inst->in_call > 0);
-                if (blockClientIfRequiredWasCalled && iteratorReplicationFlagsWereUpdated) {
+                if (blockClientIfRequiredWasCalled && inst->iteratorReplicationFlagsWereUpdated) {
                     // Here we know that the DEL is related to the running command
                     shouldReplicateDelCommand = it->cur_cmd_may_replicate;
                 } else {
@@ -2639,17 +2627,17 @@ void bgIteration_handleCommandReplication(int dbid,
             item->u.repl.argv = cloneRobjArray(argc, argv);
             item->u.repl.argc = argc;
             item->u.repl.replication_size = replicationItemSize(item);
-            bufferedReplicationBytes += item->u.repl.replication_size;
+            inst->bufferedReplicationBytes += item->u.repl.replication_size;
             it->replication_queued++;
             mutexQueueAdd(it->items_for_iterator, item);
         }
-    } // allIterators loop
+    } // inst->allIterators loop
 }
 
 
 // PUBLIC API
 size_t bgIteration_memoryInuseForReplication(void) {
-    return bufferedReplicationBytes;
+    return inst->bufferedReplicationBytes;
 }
 
 
@@ -2665,7 +2653,7 @@ bool bgIteration_isEntryInuse(dbEntry *de) {
 void bgIteration_dbEntryModified(dbEntry *de) {
     if (bgIteration_iterationActive()) {
         bgIterationEntryMetadata *md = (bgIterationEntryMetadata *)objectGetMetadata(de);
-        if (md) md->iterator_epoch = bgIteration_epoch;
+        if (md) md->iterator_epoch = inst->bgIteration_epoch;
     }
 }
 
@@ -2687,7 +2675,7 @@ void bgIteration_updateDbEntryPtr(dbEntry *old, dbEntry *new) {
 
     listIter li;
     listNode *node;
-    listRewind(allIterators, &li);
+    listRewind(inst->allIterators, &li);
     while ((node = listNext(&li)) != NULL) {
         bgIterator *it = listNodeValue(node);
         if (hashtableDelete(it->early_iterate_entries, old)) {

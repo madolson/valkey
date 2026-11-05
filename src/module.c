@@ -321,11 +321,6 @@ static list *moduleUnblockedClients;
  * costly. We manage a pool of clients to avoid this cost. Pool expands when
  * more clients are needed and shrinks when unused. Please see modulesCron()
  * for more details. */
-static client **moduleTempClients;
-static size_t moduleTempClientCap = 0;
-static size_t moduleTempClientCount = 0;    /* Client count in pool */
-static size_t moduleTempClientMinCount = 0; /* Min client count in pool since
-                                               the last cron. */
 
 /* We need a mutex that is unlocked / relocked in beforeSleep() in order to
  * allow thread safe contexts to execute commands at a safe moment. */
@@ -364,7 +359,6 @@ typedef struct ValkeyModulePostExecUnitJob {
 static list *moduleKeyspaceSubscribers;
 
 /* The module post keyspace jobs list */
-static list *modulePostExecUnitJobs;
 
 /* Data structures related to the exported dictionary data structure. */
 typedef struct ValkeyModuleDict {
@@ -759,9 +753,9 @@ sds moduleLoadQueueEntryToLoadmoduleOptionStr(ValkeyModule *module,
 client *moduleAllocTempClient(void) {
     client *c = NULL;
 
-    if (moduleTempClientCount > 0) {
-        c = moduleTempClients[--moduleTempClientCount];
-        if (moduleTempClientCount < moduleTempClientMinCount) moduleTempClientMinCount = moduleTempClientCount;
+    if (inst->moduleTempClientCount > 0) {
+        c = inst->moduleTempClients[--inst->moduleTempClientCount];
+        if (inst->moduleTempClientCount < inst->moduleTempClientMinCount) inst->moduleTempClientMinCount = inst->moduleTempClientCount;
     } else {
         c = createClient(NULL);
         c->flag.module = 1;
@@ -782,9 +776,9 @@ static void freeValkeyModuleAsyncRMCallPromise(ValkeyModuleAsyncRMCallPromise *p
 }
 
 void moduleReleaseTempClient(client *c) {
-    if (moduleTempClientCount == moduleTempClientCap) {
-        moduleTempClientCap = moduleTempClientCap ? moduleTempClientCap * 2 : 32;
-        moduleTempClients = zrealloc(moduleTempClients, sizeof(c) * moduleTempClientCap);
+    if (inst->moduleTempClientCount == inst->moduleTempClientCap) {
+        inst->moduleTempClientCap = inst->moduleTempClientCap ? inst->moduleTempClientCap * 2 : 32;
+        inst->moduleTempClients = zrealloc(inst->moduleTempClients, sizeof(c) * inst->moduleTempClientCap);
     }
     clearClientConnectionState(c);
     listEmpty(c->reply);
@@ -804,7 +798,7 @@ void moduleReleaseTempClient(client *c) {
         freeValkeyModuleAsyncRMCallPromise(promise);
         c->bstate->async_rm_call_handle = NULL;
     }
-    moduleTempClients[moduleTempClientCount++] = c;
+    inst->moduleTempClients[inst->moduleTempClientCount++] = c;
 }
 
 /* Create an empty key of the specified type. `key` must point to a key object
@@ -9690,13 +9684,13 @@ int VM_SubscribeToKeyspaceEvents(ValkeyModuleCtx *ctx, int types, ValkeyModuleNo
 }
 
 /* Whether any module post-execution-unit job is pending. Kept as a tiny
- * accessor rather than exposing modulePostExecUnitJobs itself, so callers
+ * accessor rather than exposing inst->modulePostExecUnitJobs itself, so callers
  * outside this file (postExecutionUnitOperations()) don't need to know it's
  * backed by a list - if that representation ever changes, only this
  * function needs to change with it. It's trivial enough that LTO can inline
  * it at its (currently single) call site same as any other cross-TU call. */
 bool moduleHasPostExecUnitJobs(void) {
-    return listLength(modulePostExecUnitJobs) > 0;
+    return listLength(inst->modulePostExecUnitJobs) > 0;
 }
 
 void firePostExecutionUnitJobs(void) {
@@ -9706,10 +9700,10 @@ void firePostExecutionUnitJobs(void) {
      * This is a special case where we need to increase 'execution_nesting'
      * but we do not want to update the cached time */
     enterExecutionUnit(0, 0);
-    while (listLength(modulePostExecUnitJobs) > 0) {
-        listNode *ln = listFirst(modulePostExecUnitJobs);
+    while (listLength(inst->modulePostExecUnitJobs) > 0) {
+        listNode *ln = listFirst(inst->modulePostExecUnitJobs);
         ValkeyModulePostExecUnitJob *job = listNodeValue(ln);
-        listDelNode(modulePostExecUnitJobs, ln);
+        listDelNode(inst->modulePostExecUnitJobs, ln);
 
         ValkeyModuleCtx ctx;
         moduleCreateContext(&ctx, job->module, VALKEYMODULE_CTX_TEMP_CLIENT);
@@ -9755,7 +9749,7 @@ int VM_AddPostNotificationJob(ValkeyModuleCtx *ctx,
     job->free_pd = free_privdata;
     job->dbid = ctx->client->db->id;
 
-    listAddNodeTail(modulePostExecUnitJobs, job);
+    listAddNodeTail(inst->modulePostExecUnitJobs, job);
     return VALKEYMODULE_OK;
 }
 
@@ -13564,7 +13558,7 @@ void moduleInitModulesSystem(void) {
     /* Set up the keyspace notification subscriber list and static client */
     moduleKeyspaceSubscribers = listCreate();
 
-    modulePostExecUnitJobs = listCreate();
+    inst->modulePostExecUnitJobs = listCreate();
 
     /* Set up filter list */
     moduleCommandFilters = listCreate();
@@ -13597,7 +13591,7 @@ void moduleInitModulesSystem(void) {
 
 void modulesCron(void) {
     /* Check number of temporary clients in the pool and free the unused ones
-     * since the last cron. moduleTempClientMinCount tracks minimum count of
+     * since the last cron. inst->moduleTempClientMinCount tracks minimum count of
      * clients in the pool since the last cron. This is the number of clients
      * that we didn't use for the last cron period. */
 
@@ -13607,18 +13601,18 @@ void modulesCron(void) {
      * small amount of clients to avoid client allocation costs if temporary
      * clients are required after some idle period. */
     const unsigned int min_client = 8;
-    while (iteration > 0 && moduleTempClientCount > 0 && moduleTempClientMinCount > min_client) {
-        client *c = moduleTempClients[--moduleTempClientCount];
+    while (iteration > 0 && inst->moduleTempClientCount > 0 && inst->moduleTempClientMinCount > min_client) {
+        client *c = inst->moduleTempClients[--inst->moduleTempClientCount];
         freeClient(c);
         iteration--;
-        moduleTempClientMinCount--;
+        inst->moduleTempClientMinCount--;
     }
-    moduleTempClientMinCount = moduleTempClientCount;
+    inst->moduleTempClientMinCount = inst->moduleTempClientCount;
 
-    /* Shrink moduleTempClients array itself if it is wasting some space */
-    if (moduleTempClientCap > 32 && moduleTempClientCap > moduleTempClientCount * 4) {
-        moduleTempClientCap /= 4;
-        moduleTempClients = zrealloc(moduleTempClients, sizeof(client *) * moduleTempClientCap);
+    /* Shrink inst->moduleTempClients array itself if it is wasting some space */
+    if (inst->moduleTempClientCap > 32 && inst->moduleTempClientCap > inst->moduleTempClientCount * 4) {
+        inst->moduleTempClientCap /= 4;
+        inst->moduleTempClients = zrealloc(inst->moduleTempClients, sizeof(client *) * inst->moduleTempClientCap);
     }
 }
 

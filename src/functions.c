@@ -123,7 +123,6 @@ dictType librariesDictType = {
 };
 
 /* Libraries Ctx. */
-static functionsLibCtx *curr_functions_lib_ctx = NULL;
 
 static size_t functionMallocSize(functionInfo *fi) {
     return zmalloc_size(fi) +
@@ -192,9 +191,9 @@ static void functionsLibCtxReleaseCurrent(int async) {
     if (async) {
         list *engine_callbacks = listCreate();
         scriptingEngineManagerForEachEngine(resetEngineOrCollectResetCallbacks, engine_callbacks);
-        freeFunctionsAsync(curr_functions_lib_ctx, engine_callbacks);
+        freeFunctionsAsync(inst->curr_functions_lib_ctx, engine_callbacks);
     } else {
-        functionsLibCtxFree(curr_functions_lib_ctx, NULL);
+        functionsLibCtxFree(inst->curr_functions_lib_ctx, NULL);
         scriptingEngineManagerForEachEngine(resetEngineOrCollectResetCallbacks, NULL);
     }
 }
@@ -239,13 +238,13 @@ void functionsLibCtxFree(functionsLibCtx *functions_lib_ctx, list *engine_callba
 /* Swap the current functions ctx with the given one.
  * Free the old functions ctx. */
 void functionsLibCtxSwapWithCurrent(functionsLibCtx *new_lib_ctx, int async) {
-    functionsLibCtxFreeGeneric(curr_functions_lib_ctx, async);
-    curr_functions_lib_ctx = new_lib_ctx;
+    functionsLibCtxFreeGeneric(inst->curr_functions_lib_ctx, async);
+    inst->curr_functions_lib_ctx = new_lib_ctx;
 }
 
 /* return the current functions ctx */
 functionsLibCtx *functionsLibCtxGetCurrent(void) {
-    return curr_functions_lib_ctx;
+    return inst->curr_functions_lib_ctx;
 }
 
 static void initializeFunctionsLibEngineStats(scriptingEngine *engine,
@@ -267,11 +266,11 @@ functionsLibCtx *functionsLibCtxCreate(void) {
 }
 
 void functionsAddEngineStats(sds engine_name) {
-    serverAssert(curr_functions_lib_ctx != NULL);
-    dictEntry *entry = dictFind(curr_functions_lib_ctx->engines_stats, engine_name);
+    serverAssert(inst->curr_functions_lib_ctx != NULL);
+    dictEntry *entry = dictFind(inst->curr_functions_lib_ctx->engines_stats, engine_name);
     if (entry == NULL) {
         functionsLibEngineStats *stats = zcalloc(sizeof(*stats));
-        dictAdd(curr_functions_lib_ctx->engines_stats, sdsdup(engine_name), stats);
+        dictAdd(inst->curr_functions_lib_ctx->engines_stats, sdsdup(engine_name), stats);
     }
 }
 
@@ -461,7 +460,7 @@ static void replyEngineStats(scriptingEngine *engine, void *context) {
     addReplyBulkCString(c, scriptingEngineGetName(engine));
     addReplyMapLen(c, 2);
     functionsLibEngineStats *e_stats =
-        dictFetchValue(curr_functions_lib_ctx->engines_stats, scriptingEngineGetName(engine));
+        dictFetchValue(inst->curr_functions_lib_ctx->engines_stats, scriptingEngineGetName(engine));
     addReplyBulkCString(c, "libraries_count");
     addReplyLongLong(c, e_stats ? e_stats->n_lib : 0);
     addReplyBulkCString(c, "functions_count");
@@ -469,12 +468,12 @@ static void replyEngineStats(scriptingEngine *engine, void *context) {
 }
 
 void functionsRemoveLibFromEngine(scriptingEngine *engine) {
-    dictIterator *iter = dictGetSafeIterator(curr_functions_lib_ctx->libraries);
+    dictIterator *iter = dictGetSafeIterator(inst->curr_functions_lib_ctx->libraries);
     dictEntry *entry = NULL;
     while ((entry = dictNext(iter))) {
         functionLibInfo *li = dictGetVal(entry);
         if (li->engine == engine) {
-            libraryUnlink(curr_functions_lib_ctx, li);
+            libraryUnlink(inst->curr_functions_lib_ctx, li);
             engineLibraryFree(li);
         }
     }
@@ -571,9 +570,9 @@ void functionListCommand(client *c) {
         len_ptr = addReplyDeferredLen(c);
     } else {
         /* If no pattern is asked we know the reply len and we can just set it */
-        addReplyArrayLen(c, dictSize(curr_functions_lib_ctx->libraries));
+        addReplyArrayLen(c, dictSize(inst->curr_functions_lib_ctx->libraries));
     }
-    dictIterator *iter = dictGetIterator(curr_functions_lib_ctx->libraries);
+    dictIterator *iter = dictGetIterator(inst->curr_functions_lib_ctx->libraries);
     dictEntry *entry = NULL;
     while ((entry = dictNext(iter))) {
         functionLibInfo *li = dictGetVal(entry);
@@ -626,13 +625,13 @@ void functionListCommand(client *c) {
  */
 void functionDeleteCommand(client *c) {
     robj *function_name = c->argv[2];
-    functionLibInfo *li = dictFetchValue(curr_functions_lib_ctx->libraries, objectGetVal(function_name));
+    functionLibInfo *li = dictFetchValue(inst->curr_functions_lib_ctx->libraries, objectGetVal(function_name));
     if (!li) {
         addReplyError(c, "Library not found");
         return;
     }
 
-    libraryUnlink(curr_functions_lib_ctx, li);
+    libraryUnlink(inst->curr_functions_lib_ctx, li);
     engineLibraryFree(li);
     /* Indicate that the command changed the data so it will be replicated and
      * counted as a data change (for persistence configuration) */
@@ -649,7 +648,7 @@ void functionKillCommand(client *c) {
  * Note that it does not guarantee the command arguments are right. */
 uint64_t fcallGetCommandFlags(client *c, uint64_t cmd_flags) {
     robj *function_name = c->argv[1];
-    c->cur_script = dictFind(curr_functions_lib_ctx->functions, objectGetVal(function_name));
+    c->cur_script = dictFind(inst->curr_functions_lib_ctx->functions, objectGetVal(function_name));
     if (!c->cur_script) return cmd_flags;
     functionInfo *fi = dictGetVal(c->cur_script);
     uint64_t script_flags = fi->compiled_function->f_flags;
@@ -662,7 +661,7 @@ static void fcallCommandGeneric(client *c, int ro) {
 
     robj *function_name = c->argv[1];
     dictEntry *de = c->cur_script;
-    if (!de) de = dictFind(curr_functions_lib_ctx->functions, objectGetVal(function_name));
+    if (!de) de = dictFind(inst->curr_functions_lib_ctx->functions, objectGetVal(function_name));
     if (!de) {
         addReplyError(c, "Function not found");
         return;
@@ -832,7 +831,7 @@ void functionRestoreCommand(client *c) {
         functionsLibCtxSwapWithCurrent(functions_lib_ctx, server.lazyfree_lazy_user_flush);
         functions_lib_ctx = NULL; /* avoid releasing the f_ctx in the end */
     } else {
-        if (libraryJoin(curr_functions_lib_ctx, functions_lib_ctx, restore_policy == restorePolicy_Replace, &err) !=
+        if (libraryJoin(inst->curr_functions_lib_ctx, functions_lib_ctx, restore_policy == restorePolicy_Replace, &err) !=
             C_OK) {
             goto load_error;
         }
@@ -1153,7 +1152,7 @@ void functionLoadCommand(client *c) {
     if (mustObeyClient(c)) {
         timeout = 0;
     }
-    if (!(library_name = functionsCreateWithLibraryCtx(objectGetVal(code), replace, &err, curr_functions_lib_ctx, timeout))) {
+    if (!(library_name = functionsCreateWithLibraryCtx(objectGetVal(code), replace, &err, inst->curr_functions_lib_ctx, timeout))) {
         serverAssert(err != NULL);
         addReplyErrorSds(c, err);
         return;
@@ -1180,9 +1179,9 @@ unsigned long functionsMemory(void) {
 /* Return memory overhead of all the engines combine */
 unsigned long functionsMemoryOverhead(void) {
     size_t memory_overhead = scriptingEngineManagerGetMemoryUsage();
-    memory_overhead += dictMemUsage(curr_functions_lib_ctx->functions);
+    memory_overhead += dictMemUsage(inst->curr_functions_lib_ctx->functions);
     memory_overhead += sizeof(functionsLibCtx);
-    memory_overhead += curr_functions_lib_ctx->cache_memory;
+    memory_overhead += inst->curr_functions_lib_ctx->cache_memory;
     memory_overhead += scriptingEngineManagerGetTotalMemoryOverhead();
 
     return memory_overhead;
@@ -1190,15 +1189,15 @@ unsigned long functionsMemoryOverhead(void) {
 
 /* Returns the number of functions */
 unsigned long functionsNum(void) {
-    return dictSize(curr_functions_lib_ctx->functions);
+    return dictSize(inst->curr_functions_lib_ctx->functions);
 }
 
 unsigned long functionsLibNum(void) {
-    return dictSize(curr_functions_lib_ctx->libraries);
+    return dictSize(inst->curr_functions_lib_ctx->libraries);
 }
 
 dict *functionsLibGet(void) {
-    return curr_functions_lib_ctx->libraries;
+    return inst->curr_functions_lib_ctx->libraries;
 }
 
 size_t functionsLibCtxFunctionsLen(functionsLibCtx *functions_ctx) {
@@ -1208,7 +1207,7 @@ size_t functionsLibCtxFunctionsLen(functionsLibCtx *functions_ctx) {
 /* Initialize engine data structures.
  * Should be called once on server initialization */
 int functionsInit(void) {
-    curr_functions_lib_ctx = functionsLibCtxCreate();
+    inst->curr_functions_lib_ctx = functionsLibCtxCreate();
 
     return C_OK;
 }

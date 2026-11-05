@@ -110,9 +110,9 @@ double R_Zero, R_PosInf, R_NegInf, R_Nan;
 /*================================= Globals ================================= */
 
 /* Global vars */
-struct valkeyServer server;            /* Server global state */
-struct valkeyInstance server_instance; /* The only server instance */
-__thread struct valkeyInstance *inst;  /* Instance owned by the running thread */
+struct valkeyServer server;                                       /* Server global state */
+struct valkeyInstance server_instance = {.bgIteration_epoch = 1}; /* The only server instance */
+__thread struct valkeyInstance *inst;                             /* Instance owned by the running thread */
 
 /*============================ Internal prototypes ========================== */
 
@@ -1914,7 +1914,6 @@ static void sendGetackToReplicas(void) {
     replicationFeedReplicas(-1, argv, 3);
 }
 
-extern int ProcessingEventsWhileBlocked;
 
 /* Process one buffered decompression slice before the event loop sleeps.
  * Returning true lets processEventsWhileBlocked count the slice as progress. */
@@ -1959,7 +1958,7 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
      * case we keep track of the number of events we are processing, since
      * processEventsWhileBlocked() wants to stop ASAP if there are no longer
      * events to handle. */
-    if (ProcessingEventsWhileBlocked) {
+    if (inst->ProcessingEventsWhileBlocked) {
         uint64_t processed = 0;
         processed += processIOThreadsResponses();
         processed += connTypeProcessPendingData();
@@ -2164,7 +2163,7 @@ void afterSleep(struct aeEventLoop *eventLoop, int numevents) {
     /********************* WARNING ********************
      * Do NOT add anything above moduleAcquireGIL !!! *
      ***************************** ********************/
-    if (!ProcessingEventsWhileBlocked) {
+    if (!inst->ProcessingEventsWhileBlocked) {
         /* Acquire the modules GIL so that their threads won't touch anything. */
         if (moduleCount()) {
             mstime_t latency;
@@ -2193,7 +2192,7 @@ void afterSleep(struct aeEventLoop *eventLoop, int numevents) {
     /* Update command time snapshot in case it'll be required without a command
      * e.g. somehow used by module timers. Don't update it while yielding to a
      * blocked command, call() will handle that and restore the original time. */
-    if (!ProcessingEventsWhileBlocked) {
+    if (!inst->ProcessingEventsWhileBlocked) {
         inst->cmd_time_snapshot = inst->mstime;
     }
 

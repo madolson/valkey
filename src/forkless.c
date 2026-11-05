@@ -37,7 +37,6 @@ typedef struct forklessSaveInfo {
 } forklessSaveInfo;
 
 /* Keep a global indicator of the current iterator (for cancellation purposes). */
-static forklessSaveInfo *currentForklessSave = NULL;
 
 /* True while a socket forkless save's iterator is scanning the keyspace. During
  * that time the syncing replicas are not fed from the shared replication backlog
@@ -508,7 +507,7 @@ static void cleanupSaveInfoAndEmitEndMetrics(forklessSaveInfo *saveInfo) {
     /* Notify replicas waiting for BGSAVE to complete */
     updateReplicasWaitingBgsave(success ? C_OK : C_ERR, saveInfo->write_target);
 
-    currentForklessSave = NULL;
+    inst->currentForklessSave = NULL;
     iteratorOwnsIncomingReplication = false;
     atomic_store_explicit(&server.stat_current_save_keys_processed, 0, memory_order_relaxed);
     atomic_store_explicit(&server.stat_current_save_keys_total, 0, memory_order_relaxed);
@@ -740,7 +739,7 @@ static void forklessMarkSaveFailed(forklessSaveInfo *saveInfo) {
     }
     rdbClearSaveState(time(NULL));
     stopSaving(0);
-    currentForklessSave = NULL;
+    inst->currentForklessSave = NULL;
     iteratorOwnsIncomingReplication = false;
     serverLog(LL_WARNING, "forkless-save: save failed. %lld seconds.", (long long)server.rdb_save_time_last);
 }
@@ -750,7 +749,7 @@ static void forklessMarkSaveFailed(forklessSaveInfo *saveInfo) {
  * Writes to a temp file and renames to the final filename on completion. */
 int forklessSaveToDisk(const char *filename) {
     serverAssert(onServerMainThread());
-    serverAssert(currentForklessSave == NULL);
+    serverAssert(inst->currentForklessSave == NULL);
     serverAssert(!isSaveInProgress());
     serverAssert(filename);
     serverLog(LL_NOTICE, "Beginning forklessSaveToDisk");
@@ -791,7 +790,7 @@ int forklessSaveToDisk(const char *filename) {
         serverLog(LL_WARNING, "forkless-save: error creating iterator");
         goto werr;
     }
-    currentForklessSave = saveInfo;
+    inst->currentForklessSave = saveInfo;
 
     atomic_store_explicit(&server.stat_current_save_keys_total, dbTotalServerKeyCount(), memory_order_relaxed);
     atomic_store_explicit(&server.stat_current_save_keys_processed, 0, memory_order_relaxed);
@@ -823,13 +822,13 @@ werr:
 /* Cancels the currently running forkless save, if one is in progress. */
 void forklessSaveCancel(void) {
     serverAssert(onServerMainThread());
-    if (currentForklessSave == NULL) return;
-    if (currentForklessSave->iterator != NULL) {
-        bgIteratorTerminate(currentForklessSave->iterator);
+    if (inst->currentForklessSave == NULL) return;
+    if (inst->currentForklessSave->iterator != NULL) {
+        bgIteratorTerminate(inst->currentForklessSave->iterator);
     } else {
         /* Iteration is done and the snapshot file is being closed in the background. */
         pthread_mutex_lock(&forkless_rename_mutex);
-        currentForklessSave->cancel_requested = true;
+        inst->currentForklessSave->cancel_requested = true;
         pthread_mutex_unlock(&forkless_rename_mutex);
     }
 }
@@ -965,7 +964,7 @@ static bool forklessDoneIteratingKeyspace(void *privdata) {
 
 int forklessSaveToSockets(int req, int rdbver) {
     serverAssert(onServerMainThread());
-    serverAssert(currentForklessSave == NULL);
+    serverAssert(inst->currentForklessSave == NULL);
 
     forklessSaveInfo *saveInfo = zmalloc(sizeof(forklessSaveInfo));
     memset(saveInfo, 0, sizeof(forklessSaveInfo));
@@ -1048,7 +1047,7 @@ int forklessSaveToSockets(int req, int rdbver) {
         serverLog(LL_WARNING, "forkless-save: error creating iterator");
         goto werr;
     }
-    currentForklessSave = saveInfo;
+    inst->currentForklessSave = saveInfo;
     iteratorOwnsIncomingReplication = true;
 
     startBackgroundThread(saveInfo);

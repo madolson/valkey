@@ -548,17 +548,16 @@ ustime_t activeExpireCycle(int type) {
  * with a DB id > 63 are not expired, but a trivial fix is to set the bitmap
  * to the max 64 bit unsigned value when we know there is a key with a DB
  * ID greater than 63, and check all the configured DBs in such a case. */
-dict *replicaKeysWithExpire = NULL;
 
 /* Check the set of keys created by the primary with an expire set in order to
  * check if they should be evicted. */
 void expireReplicaKeys(void) {
-    if (replicaKeysWithExpire == NULL || dictSize(replicaKeysWithExpire) == 0) return;
+    if (inst->replicaKeysWithExpire == NULL || dictSize(inst->replicaKeysWithExpire) == 0) return;
 
     int cycles = 0, noexpire = 0;
     mstime_t start = mstime();
     while (1) {
-        dictEntry *de = dictGetRandomKey(replicaKeysWithExpire);
+        dictEntry *de = dictGetRandomKey(inst->replicaKeysWithExpire);
         sds keyname = dictGetKey(de);
         uint64_t dbids = dictGetUnsignedIntegerVal(de);
         uint64_t new_dbids = 0;
@@ -599,14 +598,14 @@ void expireReplicaKeys(void) {
         if (new_dbids)
             dictSetUnsignedIntegerVal(de, new_dbids);
         else
-            dictDelete(replicaKeysWithExpire, keyname);
+            dictDelete(inst->replicaKeysWithExpire, keyname);
 
         /* Stop conditions: found 3 keys we can't expire in a row or
          * time limit was reached. */
         cycles++;
         if (noexpire > 3) break;
         if ((cycles % 64) == 0 && mstime() - start > 1) break;
-        if (dictSize(replicaKeysWithExpire) == 0) break;
+        if (dictSize(inst->replicaKeysWithExpire) == 0) break;
     }
 }
 
@@ -614,24 +613,24 @@ void expireReplicaKeys(void) {
  * of a writable replica. */
 
 void rememberReplicaKeyWithExpire(serverDb *db, robj *key) {
-    if (replicaKeysWithExpire == NULL) {
+    if (inst->replicaKeysWithExpire == NULL) {
         static dictType dt = {
             .entryGetKey = dictEntryGetKey,
             .hashFunction = dictSdsHash,
             .keyCompare = dictSdsKeyCompare,
             .entryDestructor = dictEntryDestructorSdsKey,
         };
-        replicaKeysWithExpire = dictCreate(&dt);
+        inst->replicaKeysWithExpire = dictCreate(&dt);
     }
     if (db->id > 63) return;
 
-    dictEntry *de = dictAddOrFind(replicaKeysWithExpire, objectGetVal(key));
+    dictEntry *de = dictAddOrFind(inst->replicaKeysWithExpire, objectGetVal(key));
     /* If the entry was just created, set it to a copy of the SDS string
      * representing the key: we don't want to need to take those keys
      * in sync with the main DB. The keys will be removed by expireReplicaKeys()
      * as it scans to find keys to remove. */
     if (dictGetKey(de) == objectGetVal(key)) {
-        dictSetKey(replicaKeysWithExpire, de, sdsdup(objectGetVal(key)));
+        dictSetKey(inst->replicaKeysWithExpire, de, sdsdup(objectGetVal(key)));
         dictSetUnsignedIntegerVal(de, 0);
     }
 
@@ -642,8 +641,8 @@ void rememberReplicaKeyWithExpire(serverDb *db, robj *key) {
 
 /* Return the number of keys we are tracking. */
 size_t getReplicaKeyWithExpireCount(void) {
-    if (replicaKeysWithExpire == NULL) return 0;
-    return dictSize(replicaKeysWithExpire);
+    if (inst->replicaKeysWithExpire == NULL) return 0;
+    return dictSize(inst->replicaKeysWithExpire);
 }
 
 /* Remove the keys in the hash table. We need to do that when data is
@@ -655,13 +654,13 @@ size_t getReplicaKeyWithExpireCount(void) {
  * of key names in a writable replica and in its primary will lead to
  * inconsistencies. This is just a best-effort thing we do. */
 void flushReplicaKeysWithExpireList(int async) {
-    if (replicaKeysWithExpire) {
+    if (inst->replicaKeysWithExpire) {
         if (async) {
-            freeReplicaKeysWithExpireAsync(replicaKeysWithExpire);
+            freeReplicaKeysWithExpireAsync(inst->replicaKeysWithExpire);
         } else {
-            dictRelease(replicaKeysWithExpire);
+            dictRelease(inst->replicaKeysWithExpire);
         }
-        replicaKeysWithExpire = NULL;
+        inst->replicaKeysWithExpire = NULL;
     }
 }
 

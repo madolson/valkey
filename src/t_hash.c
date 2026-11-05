@@ -146,7 +146,6 @@ bool hashTypeHasVolatileFields(robj *o) {
  * does not span commands. A bracket that can run with another already open
  * closes by restoring the state it found rather than clearing unconditionally
  * (see hashTypeConvertListpack). */
-static bool listpack_ttl_ignored = false;
 
 
 /* Make any access to the hash object elements ignore the specific elements expiration.
@@ -159,8 +158,8 @@ static bool listpack_ttl_ignored = false;
  * whether a bracket was open. */
 static inline void hashTypeIgnoreTTL(robj *o, bool ignore, bool *oldstate) {
     if (objectGetEncoding(o) == OBJ_ENCODING_LISTPACK) {
-        if (oldstate) *oldstate = listpack_ttl_ignored;
-        listpack_ttl_ignored = ignore;
+        if (oldstate) *oldstate = inst->listpack_ttl_ignored;
+        inst->listpack_ttl_ignored = ignore;
         return;
     }
     /* Clearing is done regardless of encoding so that a bracket whose object
@@ -168,7 +167,7 @@ static inline void hashTypeIgnoreTTL(robj *o, bool ignore, bool *oldstate) {
      * Setting, however, must NOT touch the flag for hashtable objects:
      * hashTypeFreeVolatileSet() uses ignore=true as steady-state (not
      * bracketed) configuration for hashes without volatile fields. */
-    if (!ignore) listpack_ttl_ignored = false;
+    if (!ignore) inst->listpack_ttl_ignored = false;
     if (objectGetEncoding(o) == OBJ_ENCODING_HASHTABLE) {
         /* prevent placing access function if not needed */
         if (!ignore && hashTypeGetVolatileSet(o) == NULL) {
@@ -258,7 +257,7 @@ bool hashTypeListpackFieldIsValid(long long expiry) {
     /* Inside an ignore-TTL bracket (e.g. HSETEX force-deleting an already
      * expired field) every field is visible, mirroring the hashtable
      * encoding's type swap to the non-validating hashHashtableType. */
-    if (listpack_ttl_ignored) return true;
+    if (inst->listpack_ttl_ignored) return true;
     if (getExpirationPolicyWithFlags(0) == POLICY_IGNORE_EXPIRE) return true;
     return !timestampIsExpired(expiry);
 }

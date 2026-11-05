@@ -41,12 +41,7 @@
  *
  * Clients will normally take frequently requested objects in memory, removing
  * them when invalidation messages are received. */
-rax *TrackingTable = NULL;
 rax *PrefixTable = NULL;
-uint64_t TrackingTableTotalItems = 0; /* Total number of IDs stored across
-                                         the whole tracking table. This gives
-                                         a hint about the total memory we
-                                         are using server side for CSC. */
 robj *TrackingChannelName;
 
 /* This is the structure that we have as value of the PrefixTable, and
@@ -191,8 +186,8 @@ void enableTracking(client *c, uint64_t redirect_to, struct ClientFlags options,
 
     /* This may be the first client we ever enable. Create the tracking
      * table if it does not exist. */
-    if (TrackingTable == NULL) {
-        TrackingTable = raxNew();
+    if (inst->TrackingTable == NULL) {
+        inst->TrackingTable = raxNew();
         PrefixTable = raxNew();
         TrackingChannelName = createStringObject("__redis__:invalidate", 20);
     }
@@ -248,15 +243,15 @@ void trackingRememberKeys(client *tracking, client *executing) {
         sds sdskey = objectGetVal(executing->argv[idx]);
         void *result;
         rax *ids;
-        if (!raxFind(TrackingTable, (unsigned char *)sdskey, sdslen(sdskey), &result)) {
+        if (!raxFind(inst->TrackingTable, (unsigned char *)sdskey, sdslen(sdskey), &result)) {
             ids = raxNew();
-            int inserted = raxTryInsert(TrackingTable, (unsigned char *)sdskey, sdslen(sdskey), ids, NULL);
+            int inserted = raxTryInsert(inst->TrackingTable, (unsigned char *)sdskey, sdslen(sdskey), ids, NULL);
             serverAssert(inserted == 1);
         } else {
             ids = result;
         }
         if (raxTryInsert(ids, (unsigned char *)&tracking->id, sizeof(tracking->id), NULL, NULL))
-            TrackingTableTotalItems++;
+            inst->TrackingTableTotalItems++;
     }
     getKeysFreeResult(&result);
 }
@@ -371,7 +366,7 @@ void trackingRememberKeyToBroadcast(client *c, char *keyname, size_t keylen) {
  * just to notify the clients that are in the table for this key, that would
  * otherwise miss the fact we are no longer tracking the key for them. */
 void trackingInvalidateKey(client *c, robj *keyobj, int bcast) {
-    if (TrackingTable == NULL) return;
+    if (inst->TrackingTable == NULL) return;
 
     unsigned char *key = (unsigned char *)objectGetVal(keyobj);
     size_t keylen = sdslen(objectGetVal(keyobj));
@@ -379,7 +374,7 @@ void trackingInvalidateKey(client *c, robj *keyobj, int bcast) {
     if (bcast && raxSize(PrefixTable) > 0) trackingRememberKeyToBroadcast(c, (char *)key, keylen);
 
     void *result;
-    if (!raxFind(TrackingTable, key, keylen, &result)) return;
+    if (!raxFind(inst->TrackingTable, key, keylen, &result)) return;
     rax *ids = result;
 
     raxIterator ri;
@@ -418,9 +413,9 @@ void trackingInvalidateKey(client *c, robj *keyobj, int bcast) {
 
     /* Free the tracking table: we'll create the radix tree and populate it
      * again if more keys will be modified in this caching slot. */
-    TrackingTableTotalItems -= raxSize(ids);
+    inst->TrackingTableTotalItems -= raxSize(ids);
     raxFree(ids);
-    raxRemove(TrackingTable, (unsigned char *)key, keylen, NULL);
+    raxRemove(inst->TrackingTable, (unsigned char *)key, keylen, NULL);
 }
 
 /* Whether any tracking (client-side-caching) key invalidation is pending
@@ -494,14 +489,14 @@ void trackingInvalidateKeysOnFlush(int async) {
     }
 
     /* In case of FLUSHALL, reclaim all the memory used by tracking. */
-    if (TrackingTable) {
+    if (inst->TrackingTable) {
         if (async) {
-            freeTrackingRadixTreeAsync(TrackingTable);
+            freeTrackingRadixTreeAsync(inst->TrackingTable);
         } else {
-            freeTrackingRadixTree(TrackingTable);
+            freeTrackingRadixTree(inst->TrackingTable);
         }
-        TrackingTable = raxNew();
-        TrackingTableTotalItems = 0;
+        inst->TrackingTable = raxNew();
+        inst->TrackingTableTotalItems = 0;
     }
 }
 
@@ -521,10 +516,10 @@ void trackingInvalidateKeysOnFlush(int async) {
  * modified. */
 void trackingLimitUsedSlots(void) {
     static unsigned int timeout_counter = 0;
-    if (TrackingTable == NULL) return;
+    if (inst->TrackingTable == NULL) return;
     if (server.tracking_table_max_keys == 0) return; /* No limits set. */
     size_t max_keys = server.tracking_table_max_keys;
-    if (raxSize(TrackingTable) <= max_keys) {
+    if (raxSize(inst->TrackingTable) <= max_keys) {
         timeout_counter = 0;
         return; /* Limit not reached. */
     }
@@ -538,7 +533,7 @@ void trackingLimitUsedSlots(void) {
 
     /* We just remove one key after another by using a random walk. */
     raxIterator ri;
-    raxStart(&ri, TrackingTable);
+    raxStart(&ri, inst->TrackingTable);
     while (effort > 0) {
         effort--;
         raxSeek(&ri, "^", NULL, 0);
@@ -547,7 +542,7 @@ void trackingLimitUsedSlots(void) {
         robj *keyobj = createStringObject((char *)ri.key, ri.key_len);
         trackingInvalidateKey(NULL, keyobj, 0);
         decrRefCount(keyobj);
-        if (raxSize(TrackingTable) <= max_keys) {
+        if (raxSize(inst->TrackingTable) <= max_keys) {
             timeout_counter = 0;
             raxStop(&ri);
             return; /* Return ASAP: we are again under the limit. */
@@ -615,7 +610,7 @@ int trackingSweepStep(monotime endtime, uint64_t *removed) {
 
     if (removed) *removed = 0;
 
-    if (TrackingTable == NULL) {
+    if (inst->TrackingTable == NULL) {
         resetCursor(&sweep_cursor);
         return 1;
     }
@@ -625,7 +620,7 @@ int trackingSweepStep(monotime endtime, uint64_t *removed) {
     bool out_of_time = false;
 
     raxIterator ri;
-    raxStart(&ri, TrackingTable);
+    raxStart(&ri, inst->TrackingTable);
     if (sweep_cursor.key == NULL) {
         raxSeek(&ri, "^", NULL, 0);
     } else if (sweep_cursor.in_key) {
@@ -663,7 +658,7 @@ int trackingSweepStep(monotime endtime, uint64_t *removed) {
              * client is always preserved. */
             if (lookupClientByID(id) == NULL) {
                 raxRemove(ids, (unsigned char *)&id, sizeof(id), NULL);
-                TrackingTableTotalItems--;
+                inst->TrackingTableTotalItems--;
                 if (removed) (*removed)++;
                 /* The removal invalidated the iterator: re-seek past the
                  * removed ID, as the stream trimming code does. */
@@ -696,7 +691,7 @@ int trackingSweepStep(monotime endtime, uint64_t *removed) {
          * names a key that no longer exists: resume after it, not inside. */
         if (raxSize(ids) == 0) {
             raxFree(ids);
-            raxRemove(TrackingTable, ri.key, ri.key_len, NULL);
+            raxRemove(inst->TrackingTable, ri.key, ri.key_len, NULL);
             raxSeek(&ri, ">=", ri.key, ri.key_len);
             sweep_cursor.in_key = false;
         }
@@ -734,7 +729,7 @@ void trackingSweepDeadClients(void) {
     static monotime next_run = 0;
     static int period_ms = TRACKING_SWEEP_MAX_PERIOD_MS;
 
-    if (TrackingTable == NULL) {
+    if (inst->TrackingTable == NULL) {
         /* Nothing to sweep; start from the slow end again if a table appears. */
         next_run = 0;
         period_ms = TRACKING_SWEEP_MAX_PERIOD_MS;
@@ -812,7 +807,7 @@ void trackingBroadcastInvalidationMessages(void) {
     raxIterator ri, ri2;
 
     /* Return ASAP if there is nothing to do here. */
-    if (TrackingTable == NULL || !inst->tracking_clients) return;
+    if (inst->TrackingTable == NULL || !inst->tracking_clients) return;
 
     raxStart(&ri, PrefixTable);
     raxSeek(&ri, "^", NULL, 0);
@@ -859,12 +854,12 @@ void trackingBroadcastInvalidationMessages(void) {
 /* This is just used in order to access the amount of used slots in the
  * tracking table. */
 uint64_t trackingGetTotalItems(void) {
-    return TrackingTableTotalItems;
+    return inst->TrackingTableTotalItems;
 }
 
 uint64_t trackingGetTotalKeys(void) {
-    if (TrackingTable == NULL) return 0;
-    return raxSize(TrackingTable);
+    if (inst->TrackingTable == NULL) return 0;
+    return raxSize(inst->TrackingTable);
 }
 
 /* Defrag callback for radix tree iterator, called for each node,
@@ -908,7 +903,7 @@ int defragTrackingTable(monotime endtime) {
 
     /* Tracking may never have been enabled, or may have been torn down (e.g.
      * by a flush) mid-cycle; either way there is nothing left to defrag. */
-    if (TrackingTable == NULL) {
+    if (inst->TrackingTable == NULL) {
         resetCursor(&defrag_cursor);
         initialized = false;
         return 1;
@@ -920,11 +915,11 @@ int defragTrackingTable(monotime endtime) {
      * not relocated until the next pass; its keys are still walked and their
      * inner radix trees still defragged below. That one-pass gap is accepted
      * to keep the resume logic simple. */
-    rax *rt = TrackingTable;
+    rax *rt = inst->TrackingTable;
     if (!initialized) {
         rax *newrt = activeDefragAlloc(rt);
         if (newrt) {
-            TrackingTable = newrt;
+            inst->TrackingTable = newrt;
             rt = newrt;
         }
         defragRaxNode(&rt->head);
@@ -1034,7 +1029,7 @@ int defragTrackingTable(monotime endtime) {
  * tests can install and inspect a table without a full server. White-box by
  * nature - tests using it are coupled to tracking.c internals. */
 rax **unitTestOnly_getTrackingTable(void) {
-    return &TrackingTable;
+    return &inst->TrackingTable;
 }
 
 /* Unit-test-only: the number of liveness checks a sweep step performs between

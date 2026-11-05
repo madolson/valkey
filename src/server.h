@@ -1977,6 +1977,38 @@ struct valkeyInstance {
     unsigned int watching_clients; /* # of clients are watching keys */
     int pre_command_oom_state;     /* OOM before command (script?) was started */
     struct spaceSavingManager *hotkeys_manager;
+    /* Former file-scope statics, by defining file. */
+    struct evictionPoolEntry *EvictionPoolLRU;          /* evict.c */
+    int isEvictionProcRunning;                          /* evict.c */
+    int ProcessingEventsWhileBlocked;                   /* networking.c: See processEventsWhileBlocked(). */
+    bool listpack_ttl_ignored;                          /* t_hash.c */
+    struct itemListNode *freeItemStackHead;             /* bgiteration.c */
+    int freeItemStackCount;                             /* bgiteration.c */
+    list *allIterators;                                 /* bgiteration.c: list of bgIterator */
+    dict *nameToIterator;                               /* bgiteration.c: bgIterator->name -> bgIterator */
+    dict *inUseEntries;                                 /* bgiteration.c: dbEntry -> ref count, across all iterators */
+    list *curCmdMissingKeys;                            /* bgiteration.c: Keys of the current command missing from the DB */
+    ssize_t bufferedReplicationBytes;                   /* bgiteration.c: Buffered replication data, excluded from eviction */
+    ssize_t bgiteration_current_clone_memory_pool_size; /* bgiteration.c: Bytes of cloned items */
+    int last_item_count_target;                         /* bgiteration.c: Last queue size, seeds the next queue */
+    long long bgIterator_timeproc_id;                   /* bgiteration.c: Timer proc ID or AE_DELETED_EVENT_ID */
+    uint32_t bgIteration_epoch;                         /* bgiteration.c: Incremented on each new iteration */
+    bool iteratorReplicationFlagsWereUpdated;           /* bgiteration.c */
+    hashtable *inuse_key_to_clients;                    /* blocked.c: Maps keys to keyToClientsEntry. */
+    int isScriptsEvictionProcRunning;                   /* eval.c */
+    dict *replicaKeysWithExpire;                        /* expire.c: Keys with an expire set directly on a writable replica */
+    struct forklessSaveInfo *currentForklessSave;       /* forkless.c */
+    functionsLibCtx *curr_functions_lib_ctx;            /* functions.c */
+    client **moduleTempClients;                         /* module.c */
+    size_t moduleTempClientCap;                         /* module.c */
+    size_t moduleTempClientCount;                       /* module.c: Client count in pool */
+    size_t moduleTempClientMinCount;                    /* module.c: Min client count in pool since the last cron. */
+    list *modulePostExecUnitJobs;                       /* module.c */
+    struct scriptRunCtx *curr_run_ctx;                  /* script.c */
+    rax *TrackingTable;                                 /* tracking.c */
+    uint64_t TrackingTableTotalItems;                   /* tracking.c: Total number of IDs stored across the tracking table. */
+    hashtable *metrics_table;                           /* throttle.c: Maps throttler type name to metricsEntry*. */
+    long long total_throttled_commands;                 /* throttle.c: Cumulative throttled-command counter */
 };
 
 struct valkeyServer {

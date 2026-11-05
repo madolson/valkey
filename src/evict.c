@@ -63,7 +63,6 @@ struct evictionPoolEntry {
     int slot;                /* Slot. */
 };
 
-static struct evictionPoolEntry *EvictionPoolLRU;
 
 /* ----------------------------------------------------------------------------
  * Implementation of eviction, aging and LRU
@@ -101,7 +100,7 @@ void evictionPoolAlloc(void) {
         ep[j].cached = sdsnewlen(NULL, EVPOOL_CACHED_SDS_SIZE);
         ep[j].dbid = 0;
     }
-    EvictionPoolLRU = ep;
+    inst->EvictionPoolLRU = ep;
 }
 
 /* This is a helper function for performEvictions(), it is used in order
@@ -325,7 +324,6 @@ int overMaxmemoryAfterAlloc(size_t moremem) {
  * could not immediately be resolved.  This will spin the event loop with short
  * eviction cycles until the "maxmemory" condition has resolved or there are no
  * more evictable items.  */
-static int isEvictionProcRunning = 0;
 static long long evictionTimeProc(struct aeEventLoop *eventLoop, long long id, void *clientData) {
     UNUSED(eventLoop);
     UNUSED(id);
@@ -335,13 +333,13 @@ static long long evictionTimeProc(struct aeEventLoop *eventLoop, long long id, v
 
     /* For EVICT_OK - things are good, no need to keep evicting.
      * For EVICT_FAIL - there is nothing left to evict.  */
-    isEvictionProcRunning = 0;
+    inst->isEvictionProcRunning = 0;
     return AE_NOMORE;
 }
 
 void startEvictionTimeProc(void) {
-    if (!isEvictionProcRunning) {
-        isEvictionProcRunning = 1;
+    if (!inst->isEvictionProcRunning) {
+        inst->isEvictionProcRunning = 1;
         aeCreateTimeEvent(inst->el, 0, evictionTimeProc, NULL, NULL);
     }
 }
@@ -491,7 +489,7 @@ int performEvictions(void) {
 
         if (server.maxmemory_policy & (MAXMEMORY_FLAG_LRU | MAXMEMORY_FLAG_LFU) ||
             server.maxmemory_policy == MAXMEMORY_VOLATILE_TTL) {
-            struct evictionPoolEntry *pool = EvictionPoolLRU;
+            struct evictionPoolEntry *pool = inst->EvictionPoolLRU;
             while (bestkey == NULL) {
                 unsigned long total_keys = 0;
 
@@ -631,7 +629,7 @@ int performEvictions(void) {
         }
     }
     /* at this point, the memory is OK, or we have reached the time limit */
-    result = (isEvictionProcRunning) ? EVICT_RUNNING : EVICT_OK;
+    result = (inst->isEvictionProcRunning) ? EVICT_RUNNING : EVICT_OK;
 
 cant_free:
     if (result == EVICT_FAIL) {
