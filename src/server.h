@@ -396,8 +396,6 @@ typedef enum {
 typedef struct commandlog {
     list *entries;
     long long entry_id;
-    long long threshold;
-    unsigned long max_len;
 } commandlog;
 
 /* Replica replication state. Used in server.repl_state for replicas to remember
@@ -2520,6 +2518,8 @@ struct valkeyServer {
     int lazyfree_lazy_user_flush;
     /* Latency monitor */
     long long latency_monitor_threshold;
+    long long commandlog_threshold[COMMANDLOG_TYPE_NUM];   /* Commandlog thresholds by type, -1 disables. */
+    unsigned long commandlog_max_len[COMMANDLOG_TYPE_NUM]; /* Commandlog max entries by type. */
     dict *latency_events;
     /* ACLs */
     char *acl_filename;           /* ACL Users file. NULL if not configured. */

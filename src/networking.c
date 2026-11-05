@@ -661,7 +661,7 @@ static size_t _addReplyPayloadToBuffer(client *c, const void *payload, size_t le
     size_t available = c->buf_usable_size - c->bufpos;
     size_t reply_len = min(available, len);
     if (c->flag.buf_encoded) {
-        int track_bytes = (inst->commandlog[COMMANDLOG_TYPE_LARGE_REPLY].threshold != -1);
+        int track_bytes = (server.commandlog_threshold[COMMANDLOG_TYPE_LARGE_REPLY] != -1);
         reply_len = upsertPayloadHeader(c->buf, &c->bufpos, &c->last_header, payload_type, len, c->slot, track_bytes, available);
     }
     if (!reply_len) return 0;
@@ -712,7 +712,7 @@ static void _addReplyPayloadToList(client *c, list *reply_list, const char *payl
         size_t copy = avail >= len ? len : avail;
 
         if (tail->flag.buf_encoded) {
-            int track_bytes = (inst->commandlog[COMMANDLOG_TYPE_LARGE_REPLY].threshold != -1);
+            int track_bytes = (server.commandlog_threshold[COMMANDLOG_TYPE_LARGE_REPLY] != -1);
             copy = upsertPayloadHeader(tail->buf, &tail->used, &tail->last_header, payload_type, len, c->slot, track_bytes, avail);
         } else if (encoded) {
             /* If encoded buffer is required but tail is unencoded then pretend nothing can be added to it
@@ -741,7 +741,7 @@ static void _addReplyPayloadToList(client *c, list *reply_list, const char *payl
         tail->flag.buf_encoded = encoded;
         tail->last_header = NULL;
         if (tail->flag.buf_encoded) {
-            int track_bytes = (inst->commandlog[COMMANDLOG_TYPE_LARGE_REPLY].threshold != -1);
+            int track_bytes = (server.commandlog_threshold[COMMANDLOG_TYPE_LARGE_REPLY] != -1);
             upsertPayloadHeader(tail->buf, &tail->used, &tail->last_header, payload_type, len, c->slot, track_bytes, tail->size);
         }
         memcpy(tail->buf + tail->used, payload, len);
@@ -1549,7 +1549,7 @@ void addReplyBulk(client *c, robj *obj) {
     if (tryAvoidBulkStrCopyToReply(c, obj) == C_OK) {
         /* If copy avoidance allowed, then we explicitly maintain net_output_bytes_curr_cmd.
          * We determine per-reply if tracking is enabled by checking the config in the main thread. */
-        if (inst->commandlog[COMMANDLOG_TYPE_LARGE_REPLY].threshold != -1) {
+        if (server.commandlog_threshold[COMMANDLOG_TYPE_LARGE_REPLY] != -1) {
             serverAssert(obj->encoding == OBJ_ENCODING_RAW);
             size_t str_len = sdslen(objectGetVal(obj));
             uint32_t num_len = digits10(str_len);

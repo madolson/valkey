@@ -1327,6 +1327,9 @@ __attribute__((noinline)) void _serverPanic(const char *file, int line, const ch
 
 /* Start a bug report, returning 1 if this is the first time this function was called, 0 otherwise. */
 int bugReportStart(void) {
+    /* The crash report reads instance state, and the crashing thread (an IO or
+     * bio thread) may not have an instance. */
+    if (!inst) inst = &server_instance;
     pthread_mutex_lock(&bug_report_start_mutex);
     if (bug_report_start == 0) {
         serverLog(LL_WARNING | LL_RAW, "\n\n=== %s BUG REPORT START: Cut & paste starting from here ===\n",

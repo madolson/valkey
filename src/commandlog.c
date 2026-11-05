@@ -106,12 +106,12 @@ void commandlogInit(void) {
  * This function will make sure to trim the command log accordingly to the
  * configured max length. */
 static void commandlogPushEntryIfNeeded(client *c, robj **argv, int argc, long long value, int type) {
-    if (inst->commandlog[type].threshold < 0 || inst->commandlog[type].max_len == 0) return; /* The corresponding commandlog disabled */
-    if (value >= inst->commandlog[type].threshold)
+    if (server.commandlog_threshold[type] < 0 || server.commandlog_max_len[type] == 0) return; /* The corresponding commandlog disabled */
+    if (value >= server.commandlog_threshold[type])
         listAddNodeHead(inst->commandlog[type].entries, commandlogCreateEntry(c, argv, argc, value, type));
 
     /* Remove old entries if needed. */
-    while (listLength(inst->commandlog[type].entries) > inst->commandlog[type].max_len) listDelNode(inst->commandlog[type].entries, listLast(inst->commandlog[type].entries));
+    while (listLength(inst->commandlog[type].entries) > server.commandlog_max_len[type]) listDelNode(inst->commandlog[type].entries, listLast(inst->commandlog[type].entries));
 }
 
 /* Remove all the entries from the current command log of the specified type. */

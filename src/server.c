@@ -110,7 +110,9 @@ double R_Zero, R_PosInf, R_NegInf, R_Nan;
 /*================================= Globals ================================= */
 
 /* Global vars */
-struct valkeyServer server; /* Server global state */
+struct valkeyServer server;            /* Server global state */
+struct valkeyInstance server_instance; /* The only server instance */
+__thread struct valkeyInstance *inst;  /* Instance owned by the running thread */
 
 /*============================ Internal prototypes ========================== */
 
@@ -7948,6 +7950,8 @@ __attribute__((weak)) int main(int argc, char **argv) {
     struct timeval tv;
     int j;
     char config_from_stdin = 0;
+
+    inst = &server_instance;
 
     /* We need to initialize our libraries, and the server configuration. */
 #ifdef INIT_SETPROCTITLE_REPLACEMENT

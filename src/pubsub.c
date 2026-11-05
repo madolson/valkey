@@ -37,7 +37,7 @@ typedef struct pubsubtype {
     int shard;
     hashtable *(*clientPubSubChannels)(client *);
     int (*subscriptionCount)(client *);
-    kvstore **serverPubSubChannels;
+    kvstore *(*serverPubSubChannels)(void);
     robj **subscribeMsg;
     robj **unsubscribeMsg;
     robj **messageBulk;
@@ -70,6 +70,14 @@ hashtable *getClientPubSubShardChannels(client *c);
  */
 void channelList(client *c, sds pat, kvstore *pubsub_channels);
 
+static kvstore *getServerPubSubChannels(void) {
+    return server.pubsub_channels;
+}
+
+static kvstore *getServerPubSubShardChannels(void) {
+    return inst->pubsubshard_channels;
+}
+
 /*
  * Pub/Sub type for global channels.
  */
@@ -77,7 +85,7 @@ pubsubtype pubSubType = {
     .shard = 0,
     .clientPubSubChannels = getClientPubSubChannels,
     .subscriptionCount = clientSubscriptionsCount,
-    .serverPubSubChannels = &server.pubsub_channels,
+    .serverPubSubChannels = getServerPubSubChannels,
     .subscribeMsg = &shared.subscribebulk,
     .unsubscribeMsg = &shared.unsubscribebulk,
     .messageBulk = &shared.messagebulk,
@@ -90,7 +98,7 @@ pubsubtype pubSubShardType = {
     .shard = 1,
     .clientPubSubChannels = getClientPubSubShardChannels,
     .subscriptionCount = clientShardSubscriptionsCount,
-    .serverPubSubChannels = &inst->pubsubshard_channels,
+    .serverPubSubChannels = getServerPubSubShardChannels,
     .subscribeMsg = &shared.ssubscribebulk,
     .unsubscribeMsg = &shared.sunsubscribebulk,
     .messageBulk = &shared.smessagebulk,
@@ -307,7 +315,7 @@ int pubsubSubscribeChannel(client *c, robj *channel, pubsubtype type) {
 
         hashtablePosition pos;
         void *existing;
-        if (!kvstoreHashtableFindPositionForInsert(*type.serverPubSubChannels, slot, channel, &pos, &existing)) {
+        if (!kvstoreHashtableFindPositionForInsert(type.serverPubSubChannels(), slot, channel, &pos, &existing)) {
             clients = existing;
             channel = *(robj **)hashtableMetadata(clients);
         } else {
@@ -316,7 +324,7 @@ int pubsubSubscribeChannel(client *c, robj *channel, pubsubtype type) {
             *(robj **)hashtableMetadata(clients) = channel;
             incrRefCount(channel);
             /* Insert this dict in the kvstore at the position returned above. */
-            kvstoreHashtableInsertAtPosition(*type.serverPubSubChannels, slot, clients, &pos);
+            kvstoreHashtableInsertAtPosition(type.serverPubSubChannels(), slot, clients, &pos);
         }
 
         serverAssert(hashtableAdd(clients, c));
@@ -349,7 +357,7 @@ int pubsubUnsubscribeChannel(client *c, robj *channel, int notify, pubsubtype ty
             slot = keyHashSlot(objectGetVal(channel), (int)sdslen(objectGetVal(channel)));
         }
         void *found = NULL;
-        kvstoreHashtableFind(*type.serverPubSubChannels, slot, channel, &found);
+        kvstoreHashtableFind(type.serverPubSubChannels(), slot, channel, &found);
         serverAssertWithInfo(c, NULL, found);
         clients = found;
         serverAssertWithInfo(c, NULL, hashtableDelete(clients, c));
@@ -357,7 +365,7 @@ int pubsubUnsubscribeChannel(client *c, robj *channel, int notify, pubsubtype ty
             /* Free the dict and associated hash entry at all if this was
              * the latest client, so that it will be possible to abuse
              * PUBSUB creating millions of channels. */
-            kvstoreHashtableDelete(*type.serverPubSubChannels, slot, channel);
+            kvstoreHashtableDelete(type.serverPubSubChannels(), slot, channel);
         }
         c->pubsub_data->pubsub_object_mem -= getStringObjectMemory(popped);
         decrRefCount(popped);
@@ -531,7 +539,7 @@ int pubsubPublishMessageInternal(robj *channel, robj *message, pubsubtype type) 
     if (server.cluster_enabled && type.shard) {
         slot = keyHashSlot(objectGetVal(channel), sdslen(objectGetVal(channel)));
     }
-    if (kvstoreHashtableFind(*type.serverPubSubChannels, (slot == -1) ? 0 : slot, channel, &element)) {
+    if (kvstoreHashtableFind(type.serverPubSubChannels(), (slot == -1) ? 0 : slot, channel, &element)) {
         hashtable *clients = element;
         hashtableIterator iter;
         hashtableInitIterator(&iter, clients, 0);

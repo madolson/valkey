@@ -269,10 +269,10 @@ sds createLatencyReport(void) {
 
         /* Potentially commands. */
         if (!strcasecmp(event, "command")) {
-            if (inst->commandlog[COMMANDLOG_TYPE_SLOW].threshold < 0 || inst->commandlog[COMMANDLOG_TYPE_SLOW].max_len == 0) {
+            if (server.commandlog_threshold[COMMANDLOG_TYPE_SLOW] < 0 || server.commandlog_max_len[COMMANDLOG_TYPE_SLOW] == 0) {
                 advise_slowlog_enabled = 1;
                 advices++;
-            } else if (inst->commandlog[COMMANDLOG_TYPE_SLOW].threshold / 1000 > server.latency_monitor_threshold) {
+            } else if (server.commandlog_threshold[COMMANDLOG_TYPE_SLOW] / 1000 > server.latency_monitor_threshold) {
                 advise_slowlog_tuning = 1;
                 advices++;
             }

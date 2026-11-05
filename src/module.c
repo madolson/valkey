@@ -9133,8 +9133,15 @@ void VM_SignalKeyAsReady(ValkeyModuleCtx *ctx, ValkeyModuleString *key) {
     signalKeyAsReady(ctx->client->db, key, OBJ_MODULE);
 }
 
+/* Threads created by modules do not belong to an instance. With a single
+ * instance they attach to it when they enter the module API. */
+static inline void moduleThreadAttachInstance(void) {
+    if (!inst) inst = &server_instance;
+}
+
 /* Implements VM_UnblockClient() and moduleUnblockClient(). */
 int moduleUnblockClientByHandle(ValkeyModuleBlockedClient *bc, void *privdata) {
+    moduleThreadAttachInstance();
     pthread_mutex_lock(&moduleUnblockedClientsMutex);
     if (!bc->blocked_on_keys) bc->privdata = privdata;
     bc->unblocked = 1;
@@ -9475,6 +9482,7 @@ int VM_BlockedClientDisconnected(ValkeyModuleCtx *ctx) {
  * consider using `VM_GetDetachedThreadSafeContext` which will also retain
  * the module ID and thus be more useful for logging. */
 ValkeyModuleCtx *VM_GetThreadSafeContext(ValkeyModuleBlockedClient *bc) {
+    moduleThreadAttachInstance();
     ValkeyModuleCtx *ctx = zmalloc(sizeof(*ctx));
     ValkeyModule *module = bc ? bc->module : NULL;
     int flags = VALKEYMODULE_CTX_THREAD_SAFE;
@@ -9513,6 +9521,7 @@ ValkeyModuleCtx *VM_GetThreadSafeContext(ValkeyModuleBlockedClient *bc) {
  * This is useful for modules that wish to hold a global context over
  * a long term, for purposes such as logging. */
 ValkeyModuleCtx *VM_GetDetachedThreadSafeContext(ValkeyModuleCtx *ctx) {
+    moduleThreadAttachInstance();
     ValkeyModuleCtx *new_ctx = zmalloc(sizeof(*new_ctx));
     /* We create a new client object for the detached context.
      * See VM_GetThreadSafeContext() for more information */
@@ -9522,6 +9531,7 @@ ValkeyModuleCtx *VM_GetDetachedThreadSafeContext(ValkeyModuleCtx *ctx) {
 
 /* Release a thread safe context. */
 void VM_FreeThreadSafeContext(ValkeyModuleCtx *ctx) {
+    moduleThreadAttachInstance();
     moduleFreeContext(ctx);
     zfree(ctx);
 }
@@ -9540,6 +9550,7 @@ void moduleGILAfterLock(void) {
  * a blocked client connected to the thread safe context. */
 void VM_ThreadSafeContextLock(ValkeyModuleCtx *ctx) {
     UNUSED(ctx);
+    moduleThreadAttachInstance();
     moduleAcquireGIL();
     moduleGILAfterLock();
 }
@@ -9552,6 +9563,7 @@ void VM_ThreadSafeContextLock(ValkeyModuleCtx *ctx) {
  * accordingly. */
 int VM_ThreadSafeContextTryLock(ValkeyModuleCtx *ctx) {
     UNUSED(ctx);
+    moduleThreadAttachInstance();
 
     int res = moduleTryAcquireGIL();
     if (res != 0) {
@@ -10521,6 +10533,7 @@ int VM_EventLoopDel(int fd, int mask) {
  * VALKEYMODULE_ERR is returned and errno is set to EINVAL.
  */
 int VM_EventLoopAddOneShot(ValkeyModuleEventLoopOneShotFunc func, void *user_data) {
+    moduleThreadAttachInstance();
     if (!func) {
         errno = EINVAL;
         return VALKEYMODULE_ERR;
