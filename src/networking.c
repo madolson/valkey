@@ -4516,7 +4516,15 @@ int processPendingCommandAndInputBuffer(client *c) {
  * Sets the client's read_flags to indicate the parsing outcome. If multiple
  * commands could be parsed, additional parsed commands are stored in the
  * client's command queue. */
+#ifdef USE_RUST_CLIENT
+#include "valkey_client_rs.h"
+#endif
+
 void parseInputBuffer(client *c) {
+#ifdef USE_RUST_CLIENT
+    vc_parse_input_buffer(c);
+    return;
+#endif
     /* The command queue must be emptied before parsing. */
     serverAssert(c->cmd_queue.len == 0);
 
