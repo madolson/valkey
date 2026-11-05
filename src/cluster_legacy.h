@@ -250,6 +250,7 @@ typedef enum {
     CLUSTERMSG_EXT_TYPE_CLIENT_TLS_PORT,
     CLUSTERMSG_EXT_TYPE_AVAILABILITY_ZONE,
     CLUSTERMSG_EXT_TYPE_REPLICA_PRIORITY,
+    CLUSTERMSG_EXT_TYPE_CHUNKY_GROUP,
 } clusterMsgPingtypes;
 
 /* Helper function for making sure extensions are eight byte aligned. */
@@ -266,6 +267,10 @@ typedef struct {
 typedef struct {
     char availability_zone[1]; /* The availability zone, ends with \0. */
 } clusterMsgPingExtAvailabilityZone;
+
+typedef struct {
+    char chunky_group[1]; /* Id shared by the instances of one chunky node, ends with \0. */
+} clusterMsgPingExtChunkyGroup;
 
 typedef struct {
     char name[CLUSTER_NAMELEN]; /* Node name. */
@@ -313,6 +318,7 @@ typedef struct {
         clusterMsgPingExtClientTlsPort announce_client_tls_port;
         clusterMsgPingExtAvailabilityZone availability_zone;
         clusterMsgPingExtReplicaPriority replica_priority;
+        clusterMsgPingExtChunkyGroup chunky_group;
     } ext[]; /* Actual extension information, formatted so that the data is 8
               * byte aligned, regardless of its content. */
 } clusterMsgPingExt;
@@ -501,6 +507,7 @@ struct _clusterNode {
     sds hostname;                            /* The known hostname for this node */
     sds human_nodename;                      /* The known human readable nodename for this node */
     sds availability_zone;                   /* The known availability zone for this node */
+    sds chunky_group;                        /* Chunky node this instance runs in, empty if none */
     int tcp_port;                            /* Latest known clients TCP port. */
     int tls_port;                            /* Latest known clients TLS port */
     int cport;                               /* Latest known cluster port of this node. */

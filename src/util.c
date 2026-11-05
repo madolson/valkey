@@ -1119,6 +1119,13 @@ static void initializeRandomSeed(void) {
     if (fp) fclose(fp);
 }
 
+/* Draw a new seed. A forked child that will act as a separate server calls
+ * this, otherwise it would generate the same ids as its parent and siblings. */
+void reseedRandom(void) {
+    seed_initialized = 0;
+    initializeRandomSeed();
+}
+
 /* This function receives a string with 64 bytes encoded as 128 hexadecimal
  * digits, and sets the 64 byte random seed. */
 void setRandomSeedCString(char *seed_str, size_t len) {
