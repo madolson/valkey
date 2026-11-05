@@ -35,6 +35,7 @@
 #include <ctype.h>
 
 #include "script.h"
+#include "io_threads.h"
 
 /* =============================================================================
  * Global state for ACLs
@@ -43,10 +44,11 @@
 rax *Users; /* Table mapping usernames to user structures. */
 rax *Roles; /* Table mapping role names to user structures (with USER_FLAG_ROLE). */
 
-user *DefaultUser; /* Global reference to the default user.
-                      Every new connection is associated to it, if no
-                      AUTH or HELLO is used to authenticate with a
-                      different user. */
+user *DefaultUser;               /* Global reference to the default user.
+                                    Every new connection is associated to it, if no
+                                    AUTH or HELLO is used to authenticate with a
+                                    different user. */
+uint64_t acl_mutation_epoch = 0; /* See ACLBeginMutation(). */
 
 list *UsersToLoad; /* This is a list of users found in the configuration file
                       that we'll need to load in the final stage of the server
@@ -504,6 +506,15 @@ static user *ACLCreateUser(const char *name, size_t namelen) {
     return u;
 }
 
+/* Call before changing a user or role, or which user a client has. IO threads
+ * run ACLCheckAllUserCommandPerm() on c->user in precheckCommandQueue(), so
+ * wait for them first. Commands they prechecked at an older epoch are checked
+ * again in full on the main thread. */
+static void ACLBeginMutation(void) {
+    drainIOThreadsQueue();
+    acl_mutation_epoch++;
+}
+
 /* This function should be called when we need an unlinked "fake" user
  * we can use in order to validate ACL rules or for other similar reasons.
  * The user will not get linked to the Users radix tree. The returned
@@ -551,6 +562,7 @@ static void ACLCopyRoles(user *dst, user *src) {
 /* Release the memory used by the user structure. Note that this function
  * will not remove the user from the Users global radix tree. */
 void ACLFreeUser(user *u) {
+    ACLBeginMutation();
     ACLUserClearRoles(u);
     sdsfree(u->name);
     if (u->acl_string) {
@@ -575,6 +587,7 @@ static void ACLFreeUserVoid(void *u) {
  * connections in order to kill all the pending ones that
  * are authenticated with such user. */
 void ACLFreeUserAndKillClients(user *u) {
+    ACLBeginMutation();
     listIter li;
     listNode *ln;
     listRewind(server.clients, &li);
@@ -600,6 +613,7 @@ void ACLFreeUserAndKillClients(user *u) {
  * user 'dst' so that at the end of the process they'll have exactly the
  * same rules (but the names will continue to be the original ones). */
 static void ACLCopyUser(user *dst, user *src) {
+    ACLBeginMutation();
     if (dst->passwords) listRelease(dst->passwords);
     listRelease(dst->selectors);
     dst->passwords = src->passwords ? listDup(src->passwords) : NULL;
@@ -712,6 +726,7 @@ static int ACLSetUserRoles(user *u, const char *spec, size_t speclen) {
  * Returns NULL on success, or an SDS error string on failure. */
 static sds ACLStringSetRole(user *r, sds rolename, sds *argv, int argc) {
     sds error = NULL;
+    ACLBeginMutation(); /* Replaces r->selectors below. */
 
     /* Create a temporary role-flagged user to validate all changes */
     user *tempr = zmalloc(sizeof(*tempr));
@@ -1004,6 +1019,7 @@ static void ACLRecomputeCommandBitsFromCommandRulesInTable(rax *table) {
  * It uses the 'command_rules', a string representation of the ordered categories and commands,
  * to recompute the command bits. */
 void ACLRecomputeCommandBitsFromCommandRulesAllUsers(void) {
+    ACLBeginMutation();
     ACLRecomputeCommandBitsFromCommandRulesInTable(Users);
     ACLRecomputeCommandBitsFromCommandRulesInTable(Roles);
 }
@@ -1759,6 +1775,7 @@ static int ACLSetSelector(aclSelector *selector, const char *op, size_t oplen) {
  * ERANGE: A database ID provided with the db= rule is out of the supported range.
  */
 int ACLSetUser(user *u, const char *op, ssize_t oplen) {
+    ACLBeginMutation();
     /* as we are changing the ACL, the old generated string is now invalid */
     if (u->acl_string) {
         decrRefCount(u->acl_string);
@@ -3091,6 +3108,9 @@ static void ACLRemapSurvivingRoleMembers(rax *old_roles) {
 static sds ACLLoadFromFile(const char *filename) {
     FILE *fp;
     char buf[1024];
+
+    /* Replaces the users and roles and reassigns c->user of every client. */
+    ACLBeginMutation();
 
     /* Open the ACL file. */
     if ((fp = fopen(filename, "r")) == NULL) {

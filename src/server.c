@@ -4632,6 +4632,47 @@ void prepareCommandQueue(client *c) {
     }
 }
 
+/* Whether processCommand() would pass the auth, NO_MULTI and ACL checks for a
+ * prepared command, given the client's current session. Module commands are
+ * never checked here: their key extraction is module code (valkey#5054). */
+static int precheckCommand(client *c, robj **argv, int argc, int read_flags, struct serverCommand *cmd) {
+    if (!(read_flags & READ_FLAGS_PARSING_COMPLETED) || argc == 0 || !cmd) return 0;
+    if (read_flags & READ_FLAGS_BAD_ARITY) return 0;
+    if (cmd->flags & (CMD_MODULE | CMD_PROTECTED)) return 0;
+    if ((c->read_flags & READ_FLAGS_AUTH_REQUIRED) && !(cmd->flags & CMD_NO_AUTH)) return 0;
+    int idx;
+    return ACLCheckAllUserCommandPerm(c->precheck.user, cmd, argv, argc, c->precheck.dbid, &idx) == ACL_OK;
+}
+
+/* Called by an IO thread after prepareCommandQueue(). Runs the checks that
+ * depend only on the command, the client's session and the ACL users, and
+ * flags the commands that pass with READ_FLAGS_PRECHECKED. The main thread
+ * owns no part of the client while the IO job runs, and changes users only
+ * after draining the IO threads (ACLBeginMutation), so both are stable here.
+ * processCommand() trusts the flag only while acl_mutation_epoch and the
+ * session still match what is recorded here. */
+void precheckCommandQueue(client *c) {
+    if (c->flag.multi) return; /* ACL checks MULTI commands against the transaction db. */
+    c->precheck.acl_epoch = acl_mutation_epoch;
+    c->precheck.user = c->user;
+    c->precheck.dbid = c->db->id;
+    c->precheck.authenticated = c->flag.authenticated;
+
+    if (precheckCommand(c, c->argv, c->argc, c->read_flags, c->parsed_cmd)) c->read_flags |= READ_FLAGS_PRECHECKED;
+    for (int i = c->cmd_queue.off; i < c->cmd_queue.len; i++) {
+        parsedCommand *p = &c->cmd_queue.cmds[i];
+        if (precheckCommand(c, p->argv, p->argc, p->read_flags, p->cmd)) p->read_flags |= READ_FLAGS_PRECHECKED;
+    }
+}
+
+/* Main thread: whether the IO thread's precheck of the current command still
+ * holds, so processCommand() can skip the checks it covers. */
+static int precheckValid(client *c) {
+    return (c->read_flags & READ_FLAGS_PRECHECKED) && c->precheck.acl_epoch == acl_mutation_epoch &&
+           c->precheck.user == c->user && c->precheck.dbid == c->db->id &&
+           c->precheck.authenticated == c->flag.authenticated && !c->flag.multi && !moduleHasCommandFilters();
+}
+
 /* Undo prepareCommand(), to allow prepareCommand() again after applying command filters. */
 void unprepareCommand(client *c) {
     c->parsed_cmd = NULL;
@@ -4681,11 +4722,18 @@ int processCommand(client *c) {
         return C_OK;
     }
 
+    /* An IO thread already ran the auth, lookup, arity, protected, NO_MULTI
+     * and ACL checks and they still hold. */
+    int prechecked = !client_reprocessing_command && precheckValid(c);
+
     /* Now lookup the command and check ASAP about trivial error conditions
      * such as wrong arity, bad command name and so forth.
      * In case we are reprocessing a command after it was blocked,
      * we do not have to repeat the same checks */
-    if (!client_reprocessing_command) {
+    if (prechecked) {
+        c->cmd = c->lastcmd = c->realcmd = c->parsed_cmd;
+        c->flag.buffered_reply = 0;
+    } else if (!client_reprocessing_command) {
         struct serverCommand *cmd = c->parsed_cmd;
         if (!cmd) {
             /* Handle possible security attacks. */
@@ -4743,7 +4791,7 @@ int processCommand(client *c) {
 
     uint64_t cmd_flags = getCommandFlags(c);
 
-    if (!processCommandChecks(c)) return C_OK;
+    if (!prechecked && !processCommandChecks(c)) return C_OK;
     return processCommandExecute(c, cmd_flags);
 }
 

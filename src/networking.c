@@ -7310,6 +7310,7 @@ void ioThreadReadQueryFromClient(client *c) {
     parseInputBuffer(c);
     trimCommandQueue(c);
     prepareCommandQueue(c);
+    precheckCommandQueue(c);
 
     /* Parsing was not completed - let the main-thread handle it. */
     if (!(c->read_flags & READ_FLAGS_PARSING_COMPLETED)) {

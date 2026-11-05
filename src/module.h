@@ -215,6 +215,7 @@ unsigned long moduleNotifyKeyspaceSubscribersCnt(void);
 void firePostExecutionUnitJobs(void);
 bool moduleHasPostExecUnitJobs(void);
 void moduleCallCommandFilters(client *c);
+int moduleHasCommandFilters(void);
 void moduleFireCommandResultEvent(client *c,
                                   struct serverCommand *cmd,
                                   int command_failed,

@@ -171,3 +171,58 @@ start_server {config "minimal.conf" tags {"external:skip" "valgrind:skip"} overr
         assert_equal {PONG} [r ping]
     }
 }
+
+# IO threads run the auth and ACL checks of the commands they parse
+# (precheckCommandQueue). Each test lets a command be prechecked in an IO
+# thread, then changes what it was checked against before it runs.
+start_server {config "minimal.conf" tags {"external:skip" "valgrind:skip"} overrides {io-threads 2 io-threads-always-active yes}} {
+    r set k v
+
+    # One write while the server is paused, so one IO thread read parses all
+    # of the commands into the client's command queue.
+    proc send_pipeline_in_one_read {rd cmds} {
+        set buf {}
+        foreach cmd $cmds { append buf [format_command {*}$cmd] }
+        set server_pid [s process_id]
+        pause_process $server_pid
+        $rd write $buf
+        $rd flush
+        resume_process $server_pid
+    }
+
+    test {Pipelined command sees an ACL change made while it was queued} {
+        r del l
+        r acl setuser precheck-u on nopass +@all ~*
+        set rd [valkey_deferring_client]
+        $rd auth precheck-u x
+        assert_equal {OK} [$rd read]
+        send_pipeline_in_one_read $rd {{blpop l 0} {get k}}
+        wait_for_blocked_clients_count 1
+        r acl setuser precheck-u -get
+        r lpush l x
+        assert_equal {l x} [$rd read]
+        assert_error {*NOPERM*} {$rd read}
+        $rd close
+    }
+
+    test {Pipelined command after AUTH is checked against the new user} {
+        r acl setuser precheck-limited on >pw +auth +ping
+        set rd [valkey_deferring_client]
+        send_pipeline_in_one_read $rd {{auth precheck-limited pw} {get k}}
+        assert_equal {OK} [$rd read]
+        assert_error {*NOPERM*} {$rd read}
+        $rd close
+    }
+
+    test {Pipelined command after SELECT is checked against the new db} {
+        r acl setuser precheck-db on nopass resetkeys ~* -@all +auth +select db=1 (+get ~* db=9)
+        set rd [valkey_deferring_client]
+        $rd auth precheck-db x
+        assert_equal {OK} [$rd read]
+        send_pipeline_in_one_read $rd {{get k} {select 1} {get k}}
+        assert_equal {v} [$rd read]
+        assert_equal {OK} [$rd read]
+        assert_error {*NOPERM*} {$rd read}
+        $rd close
+    }
+}
