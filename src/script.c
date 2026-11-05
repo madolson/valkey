@@ -30,6 +30,7 @@
 #include "server.h"
 #include "script.h"
 #include "cluster_slot_stats.h"
+#include "chunky.h"
 
 scriptFlag scripts_flags_def[] = {
     {.flag = VMSE_SCRIPT_FLAG_NO_WRITES, .str = "no-writes"},
@@ -243,6 +244,8 @@ int scriptPrepareForRun(scriptRunCtx *run_ctx,
     /* set the curr_run_ctx so we can use it to kill the script if needed */
     curr_run_ctx = run_ctx;
 
+    if (server.chunky_stats) chunkyScriptBegin(caller, script_flags);
+
     return C_OK;
 }
 
@@ -265,6 +268,8 @@ void scriptResetRun(scriptRunCtx *run_ctx) {
 
     /*  unset curr_run_ctx so we will know there is no running script */
     curr_run_ctx = NULL;
+
+    chunkyScriptEnd();
 }
 
 /* return true if a script is currently running */

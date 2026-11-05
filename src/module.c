@@ -60,6 +60,7 @@
 #include "cluster.h"
 #include "entry.h"
 #include "commandlog.h"
+#include "chunky.h"
 #include "rdb.h"
 #include "monotonic.h"
 #include "script.h"
@@ -6850,6 +6851,8 @@ static void moduleCallCommandHelper(ValkeyModuleCtx *ctx, client *c, robj **argv
         errno = EINVAL;
         goto cleanup;
     }
+
+    if (is_running_script && server.chunky_stats) chunkyScriptTrackCall(c);
 
     cmd_flags = getCommandFlags(c);
 

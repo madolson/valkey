@@ -40,6 +40,7 @@
 #include "cluster_slot_stats.h"
 #include "cluster_migrateslots.h"
 #include "commandlog.h"
+#include "chunky.h"
 #include "bio.h"
 #include "latency.h"
 #include "mt19937-64.h"
@@ -2933,6 +2934,8 @@ int listenToPort(connListener *sfd) {
 void resetServerStats(void) {
     int j;
 
+    chunkyResetStats();
+
     server.stat_numcommands = 0;
     server.stat_numconnections = 0;
     server.stat_expiredkeys = 0;
@@ -4736,6 +4739,8 @@ int processCommand(client *c) {
                 return C_OK;
             }
         }
+
+        if (server.chunky_stats && !mustObeyClient(c)) chunkyTrackCommand(c);
     }
 
     uint64_t cmd_flags = getCommandFlags(c);
@@ -7141,6 +7146,13 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
         if (sections++) info = sdscat(info, "\r\n");
         info = sdscatprintf(info, "# Commandstats\r\n");
         info = genValkeyInfoStringCommandStats(info, server.commands);
+    }
+
+    /* Chunky shard counters */
+    if (all_sections || (dictFind(section_dict, "chunky") != NULL)) {
+        if (sections++) info = sdscat(info, "\r\n");
+        info = sdscat(info, "# Chunky\r\n");
+        info = genChunkyInfoString(info);
     }
 
     /* Error statistics */
