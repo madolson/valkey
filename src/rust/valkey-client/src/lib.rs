@@ -8,3 +8,4 @@ pub mod ffi {
 }
 
 pub mod shape1;
+pub mod shape2;

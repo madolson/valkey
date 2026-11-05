@@ -8,7 +8,7 @@ fn main() {
     let src = src.canonicalize().unwrap();
     let deps = src.join("../deps");
     println!("cargo:rerun-if-changed=wrapper.h");
-    for h in ["server.h", "connection.h", "sds.h"] {
+    for h in ["server.h", "connection.h", "sds.h", "client_io.h"] {
         println!("cargo:rerun-if-changed={}", src.join(h).display());
     }
     let mut b = bindgen::Builder::default()
@@ -33,6 +33,10 @@ fn main() {
         .rustified_enum("clientIOState")
         .allowlist_function("_serverAssert")
         .opaque_type("user")
+        // Shape 2: ClientIoRead is defined in Rust; bindgen must reuse it so
+        // the layout tests check the embedded copy against the C header.
+        .blocklist_type("ClientIoRead")
+        .raw_line("pub use crate::shape2::ClientIoRead;")
         .opaque_type("serverCommand")
         .derive_default(false)
         .layout_tests(true)

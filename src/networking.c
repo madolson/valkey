@@ -364,11 +364,11 @@ client *createClient(connection *conn) {
     c->last_header = NULL;
     c->buf_peak = c->buf_usable_size;
     c->buf_peak_last_reset_time = server.unixtime;
-    c->qb_pos = 0;
-    c->qb_applied = 0;
-    c->querybuf = NULL;
-    c->querybuf_peak = 0;
-    c->reqtype = 0;
+    c->io.qb_pos = 0;
+    c->io.qb_applied = 0;
+    c->io.querybuf = NULL;
+    c->io.querybuf_peak = 0;
+    c->io.reqtype = 0;
     c->argc = 0;
     c->argv = NULL;
     c->argv_len = 0;
@@ -376,15 +376,15 @@ client *createClient(connection *conn) {
     c->original_argc = 0;
     c->original_argv = NULL;
     c->redact_arg_bitmap = 0;
-    c->nread = 0;
+    c->io.nread = 0;
     c->read_flags = 0;
     c->write_flags = 0;
     c->cmd_queue.cmds = NULL;
     c->cmd_queue.len = c->cmd_queue.off = c->cmd_queue.cap = 0;
     c->cmd = c->lastcmd = c->realcmd = c->parsed_cmd = NULL;
     c->cur_script = NULL;
-    c->multibulklen = 0;
-    c->bulklen = -1;
+    c->io.multibulklen = 0;
+    c->io.bulklen = -1;
     c->raw_flag1 = 0;
     c->raw_flag2 = 0;
     c->capa = 0;
@@ -424,7 +424,7 @@ client *createClient(connection *conn) {
     c->mem_usage_bucket = NULL;
     c->mem_usage_bucket_node = NULL;
     if (conn) linkClient(c);
-    c->net_input_bytes = 0;
+    c->io.net_input_bytes = 0;
     c->net_input_bytes_curr_cmd = 0;
     c->net_output_bytes = 0;
     c->net_output_bytes_curr_cmd = 0;
@@ -2468,12 +2468,12 @@ int freeClient(client *c) {
     }
 
     /* Free the query buffer */
-    if (c->querybuf && c->querybuf == thread_shared_qb) {
-        sdsclear(c->querybuf);
+    if (c->io.querybuf && c->io.querybuf == thread_shared_qb) {
+        sdsclear(c->io.querybuf);
     } else {
-        sdsfree(c->querybuf);
+        sdsfree(c->io.querybuf);
     }
-    c->querybuf = NULL;
+    c->io.querybuf = NULL;
 
     /* Deallocate structures used to block on blocking ops. */
     /* If there is any in-flight command, we don't record their duration. */
@@ -2586,8 +2586,8 @@ void logInvalidUseAndFreeClientAsync(client *c, const char *fmt, ...) {
  * If any data remained in the buffer, the client will take ownership of the buffer
  * and a new empty buffer will be allocated for the shared buffer. */
 void resetSharedQueryBuf(client *c) {
-    serverAssert(c->querybuf == thread_shared_qb);
-    size_t remaining = sdslen(c->querybuf) - c->qb_pos;
+    serverAssert(c->io.querybuf == thread_shared_qb);
+    size_t remaining = sdslen(c->io.querybuf) - c->io.qb_pos;
 
     if (remaining > 0) {
         /* Let the client take ownership of the shared buffer. */
@@ -2595,28 +2595,28 @@ void resetSharedQueryBuf(client *c) {
         return;
     }
 
-    c->querybuf = NULL;
+    c->io.querybuf = NULL;
     sdsclear(thread_shared_qb);
-    c->qb_pos = 0;
-    c->qb_applied = 0;
+    c->io.qb_pos = 0;
+    c->io.qb_applied = 0;
 }
 
 /* Trims the client query buffer to the current position. */
 void trimClientQueryBuffer(client *c) {
-    if (c->querybuf == thread_shared_qb) {
+    if (c->io.querybuf == thread_shared_qb) {
         resetSharedQueryBuf(c);
     }
 
-    if (c->querybuf == NULL) {
+    if (c->io.querybuf == NULL) {
         return;
     }
 
-    serverAssert(c->qb_pos <= sdslen(c->querybuf));
+    serverAssert(c->io.qb_pos <= sdslen(c->io.querybuf));
 
-    if (c->qb_pos > 0) {
-        sdsrange(c->querybuf, c->qb_pos, -1);
-        c->qb_pos = 0;
-        c->qb_applied = 0;
+    if (c->io.qb_pos > 0) {
+        sdsrange(c->io.querybuf, c->io.qb_pos, -1);
+        c->io.qb_pos = 0;
+        c->io.qb_applied = 0;
     }
 }
 
@@ -2645,13 +2645,13 @@ void beforeNextClient(client *c) {
          * or the beginning of next command, and the current command is not applied yet,
          * so the repl_applied is not equal to qb_pos. */
         if (c->repl_data->repl_applied) {
-            sdsrange(c->querybuf, c->repl_data->repl_applied, -1);
-            c->qb_pos -= c->repl_data->repl_applied;
+            sdsrange(c->io.querybuf, c->repl_data->repl_applied, -1);
+            c->io.qb_pos -= c->repl_data->repl_applied;
             /* qb_applied is an absolute offset, shift it together with the trimmed
              * querybuf. commandProcessed() advances repl_applied to qb_applied after
              * each command, so qb_applied >= repl_applied should always true here. */
-            serverAssert(c->qb_applied >= (size_t)c->repl_data->repl_applied);
-            c->qb_applied -= c->repl_data->repl_applied;
+            serverAssert(c->io.qb_applied >= (size_t)c->repl_data->repl_applied);
+            c->io.qb_applied -= c->repl_data->repl_applied;
             c->repl_data->repl_applied = 0;
         }
     } else {
@@ -3607,7 +3607,7 @@ void handleQbLimitReached(client *c) {
     if (server.hide_user_data_from_log) {
         serverLog(LL_WARNING, "Closing client that reached max query buffer length: %s", ci);
     } else {
-        bytes = sdscatrepr(bytes, c->querybuf, 64);
+        bytes = sdscatrepr(bytes, c->io.querybuf, 64);
         serverLog(LL_WARNING, "Closing client that reached max query buffer length: %s (qbuf initial bytes: %s)", ci,
                   bytes);
     }
@@ -3629,13 +3629,13 @@ void handleQbLimitReached(client *c) {
 int handleReadResult(client *c) {
     serverAssert(inMainThread());
     server.stat_total_reads_processed++;
-    if (c->nread <= 0) {
-        if (c->nread == -1) {
+    if (c->io.nread <= 0) {
+        if (c->io.nread == -1) {
             if (connGetState(c->conn) != CONN_STATE_CONNECTED) {
                 serverLog(LL_VERBOSE, "Reading from client: %s", connGetLastError(c->conn));
                 freeClientAsync(c);
             }
-        } else if (c->nread == 0) {
+        } else if (c->io.nread == 0) {
             if (server.verbosity <= LL_VERBOSE) {
                 sds info = catClientInfoString(sdsempty(), c, server.hide_user_data_from_log);
                 serverLog(LL_VERBOSE, "Client closed connection %s", info);
@@ -3647,18 +3647,18 @@ int handleReadResult(client *c) {
     }
 
     c->last_interaction = server.unixtime;
-    c->net_input_bytes += c->nread;
+    c->io.net_input_bytes += c->io.nread;
     if (isReplicatedClient(c)) {
         /* A reader-active primary link advances read_reploff with decoded
          * bytes (replDecodeToQueryBuf); c->nread counts wire bytes here. */
-        if (!(c->flag.primary && server.repl_stream_reader)) c->repl_data->read_reploff += c->nread;
+        if (!(c->flag.primary && server.repl_stream_reader)) c->repl_data->read_reploff += c->io.nread;
         if (getClientType(c) == CLIENT_TYPE_PRIMARY) {
-            server.stat_net_repl_input_bytes += c->nread;
+            server.stat_net_repl_input_bytes += c->io.nread;
         } else {
-            server.stat_net_cluster_slot_import_bytes += c->nread;
+            server.stat_net_cluster_slot_import_bytes += c->io.nread;
         }
     } else {
-        server.stat_net_input_bytes += c->nread;
+        server.stat_net_input_bytes += c->io.nread;
     }
 
     /* Handle QB limit */
@@ -3691,7 +3691,7 @@ void handleParseError(client *c) {
         addReplyError(c, "Protocol error: too big bulk count string");
         setProtocolError("too big bulk count string", c);
     } else if (flags & READ_FLAGS_ERROR_MBULK_UNEXPECTED_CHARACTER) {
-        addReplyErrorFormat(c, "Protocol error: expected '$', got '%c'", c->querybuf[c->qb_pos]);
+        addReplyErrorFormat(c, "Protocol error: expected '$', got '%c'", c->io.querybuf[c->io.qb_pos]);
         setProtocolError("expected $ but got something else", c);
     } else if (flags & READ_FLAGS_ERROR_MBULK_INVALID_BULK_LEN) {
         addReplyError(c, "Protocol error: invalid bulk length");
@@ -3746,14 +3746,14 @@ parseResult handleParseResults(client *c) {
         /* in case the client's query was an empty line we will ignore it and proceed to process the rest of the buffer
          * if any */
         resetClient(c);
-        c->reqtype = 0;
+        c->io.reqtype = 0;
         return PARSE_OK;
     }
 
     if (c->read_flags & READ_FLAGS_PARSING_NEGATIVE_MBULK_LEN) {
         /* Multibulk processing could see a <= 0 length. */
         resetClient(c);
-        c->reqtype = 0;
+        c->io.reqtype = 0;
         return PARSE_OK;
     }
 
@@ -3911,7 +3911,7 @@ void resetClient(client *c) {
 
 void resetClientIOState(client *c) {
     c->nwritten = 0;
-    c->nread = 0;
+    c->io.nread = 0;
     c->io_read_state = c->io_write_state = CLIENT_IDLE;
     c->parsed_cmd = NULL;
     c->flag.pending_command = 0;
@@ -3983,30 +3983,30 @@ void parseInlineBuffer(client *c) {
     int is_replicated = c->read_flags & READ_FLAGS_REPLICATED;
 
     /* Search for end of line */
-    newline = memchr(c->querybuf + c->qb_pos, '\n', sdslen(c->querybuf) - c->qb_pos);
+    newline = memchr(c->io.querybuf + c->io.qb_pos, '\n', sdslen(c->io.querybuf) - c->io.qb_pos);
 
     /* Nothing to do without a \r\n */
     if (newline == NULL) {
-        if (sdslen(c->querybuf) - c->qb_pos > PROTO_INLINE_MAX_SIZE) {
+        if (sdslen(c->io.querybuf) - c->io.qb_pos > PROTO_INLINE_MAX_SIZE) {
             c->read_flags |= READ_FLAGS_ERROR_BIG_INLINE_REQUEST;
         }
         return;
     }
 
     /* Handle the \r\n case. */
-    if (newline != c->querybuf + c->qb_pos && *(newline - 1) == '\r') newline--, linefeed_chars++;
+    if (newline != c->io.querybuf + c->io.qb_pos && *(newline - 1) == '\r') newline--, linefeed_chars++;
 
     /* Split the input buffer up to the \r\n */
-    querylen = newline - (c->querybuf + c->qb_pos);
+    querylen = newline - (c->io.querybuf + c->io.qb_pos);
 
     /* Reject a raw NUL byte in the line, because sdssplitargs() doesn't
      * handle it. Binary payloads must use the quoted \x00 escape form. */
-    if (memchr(c->querybuf + c->qb_pos, '\0', querylen)) {
+    if (memchr(c->io.querybuf + c->io.qb_pos, '\0', querylen)) {
         c->read_flags |= READ_FLAGS_ERROR_NUL_IN_INLINE_PROTOCOL;
         return;
     }
 
-    argv = sdsnsplitargs(c->querybuf + c->qb_pos, querylen, &argc);
+    argv = sdsnsplitargs(c->io.querybuf + c->io.qb_pos, querylen, &argc);
     if (argv == NULL) {
         c->read_flags |= READ_FLAGS_ERROR_UNBALANCED_QUOTES;
         return;
@@ -4030,7 +4030,7 @@ void parseInlineBuffer(client *c) {
     }
 
     /* Move querybuffer position to the next query in the buffer. */
-    c->qb_pos += querylen + linefeed_chars;
+    c->io.qb_pos += querylen + linefeed_chars;
 
     /* Set up argv array on client structure */
     if (argc) {
@@ -4066,8 +4066,8 @@ void parseInlineBuffer(client *c) {
     c->net_input_bytes_curr_cmd = (c->argv_len_sum + (c->argc - 1) + 2);
     c->read_flags |= READ_FLAGS_PARSING_COMPLETED;
     /* Record qb_pos so commandProcessed() can update reploff precisely. */
-    c->qb_applied = c->qb_pos;
-    c->reqtype = 0;
+    c->io.qb_applied = c->io.qb_pos;
+    c->io.reqtype = 0;
 }
 
 /* Helper function. Record protocol error details in server log,
@@ -4084,12 +4084,12 @@ static void setProtocolError(const char *errstr, client *c) {
         if (server.hide_user_data_from_log) {
             snprintf(buf, sizeof(buf), "*redacted*");
         } else {
-            if (c->querybuf && sdslen(c->querybuf) - c->qb_pos < PROTO_DUMP_LEN) {
-                snprintf(buf, sizeof(buf), "'%s'", c->querybuf + c->qb_pos);
-            } else if (c->querybuf) {
+            if (c->io.querybuf && sdslen(c->io.querybuf) - c->io.qb_pos < PROTO_DUMP_LEN) {
+                snprintf(buf, sizeof(buf), "'%s'", c->io.querybuf + c->io.qb_pos);
+            } else if (c->io.querybuf) {
                 snprintf(buf, sizeof(buf), "'%.*s' (... more %zu bytes ...) '%.*s'",
-                         PROTO_DUMP_LEN / 2, c->querybuf + c->qb_pos, sdslen(c->querybuf) - c->qb_pos - PROTO_DUMP_LEN,
-                         PROTO_DUMP_LEN / 2, c->querybuf + sdslen(c->querybuf) - PROTO_DUMP_LEN / 2);
+                         PROTO_DUMP_LEN / 2, c->io.querybuf + c->io.qb_pos, sdslen(c->io.querybuf) - c->io.qb_pos - PROTO_DUMP_LEN,
+                         PROTO_DUMP_LEN / 2, c->io.querybuf + sdslen(c->io.querybuf) - PROTO_DUMP_LEN / 2);
             }
 
             /* Remove non printable chars. */
@@ -4123,7 +4123,7 @@ void parseMultibulkBuffer(client *c) {
     /* Record qb_pos for commandProcessed(). Written unconditionally because a
      * client may become replicated mid-command (e.g. CLUSTER SYNCSLOTS ESTABLISH
      * installs slot_migration_job inside its own handler). */
-    if (c->read_flags & READ_FLAGS_PARSING_COMPLETED) c->qb_applied = c->qb_pos;
+    if (c->read_flags & READ_FLAGS_PARSING_COMPLETED) c->io.qb_applied = c->io.qb_pos;
 
     if (c->read_flags & READ_FLAGS_AUTH_REQUIRED) {
         /* Execute client's AUTH command before parsing more, because it affects
@@ -4135,9 +4135,9 @@ void parseMultibulkBuffer(client *c) {
     cmdQueue *queue = &c->cmd_queue;
     serverAssert(queue->len == 0);
     while ((flag & READ_FLAGS_PARSING_COMPLETED) &&
-           sdslen(c->querybuf) > c->qb_pos &&
-           c->querybuf[c->qb_pos] == '*') {
-        c->reqtype = PROTO_REQ_MULTIBULK;
+           sdslen(c->io.querybuf) > c->io.qb_pos &&
+           c->io.querybuf[c->io.qb_pos] == '*') {
+        c->io.reqtype = PROTO_REQ_MULTIBULK;
         /* Push a new parser state to the command queue */
         if (queue->len == queue->cap) {
             if (queue->cap == 0) {
@@ -4184,21 +4184,21 @@ static int parseMultibulk(client *c,
     int is_replicated = c->read_flags & READ_FLAGS_REPLICATED;
     int auth_required = c->read_flags & READ_FLAGS_AUTH_REQUIRED;
 
-    if (c->multibulklen == 0) {
+    if (c->io.multibulklen == 0) {
         /* The client (argc) should have been reset */
         serverAssertWithInfo(c, NULL, *argc == 0);
 
         /* Multi bulk length cannot be read without a \r\n */
-        newline = memchr(c->querybuf + c->qb_pos, '\r', sdslen(c->querybuf) - c->qb_pos);
+        newline = memchr(c->io.querybuf + c->io.qb_pos, '\r', sdslen(c->io.querybuf) - c->io.qb_pos);
         if (newline == NULL) {
-            if (sdslen(c->querybuf) - c->qb_pos > PROTO_INLINE_MAX_SIZE) {
+            if (sdslen(c->io.querybuf) - c->io.qb_pos > PROTO_INLINE_MAX_SIZE) {
                 return READ_FLAGS_ERROR_BIG_MULTIBULK;
             }
             return 0;
         }
 
         /* Buffer should also contain \n */
-        if (newline - (c->querybuf + c->qb_pos) > (ssize_t)(sdslen(c->querybuf) - c->qb_pos - 2)) return 0;
+        if (newline - (c->io.querybuf + c->io.qb_pos) > (ssize_t)(sdslen(c->io.querybuf) - c->io.qb_pos - 2)) return 0;
 
         /* Check that what follows \r is a real \n */
         if (unlikely(newline[1] != '\n')) {
@@ -4207,27 +4207,27 @@ static int parseMultibulk(client *c,
 
         /* We know for sure there is a whole line since newline != NULL,
          * so go ahead and find out the multi bulk length. */
-        serverAssertWithInfo(c, NULL, c->querybuf[c->qb_pos] == '*');
-        size_t multibulklen_slen = newline - (c->querybuf + 1 + c->qb_pos);
-        ok = string2ll(c->querybuf + 1 + c->qb_pos, multibulklen_slen, &ll);
+        serverAssertWithInfo(c, NULL, c->io.querybuf[c->io.qb_pos] == '*');
+        size_t multibulklen_slen = newline - (c->io.querybuf + 1 + c->io.qb_pos);
+        ok = string2ll(c->io.querybuf + 1 + c->io.qb_pos, multibulklen_slen, &ll);
         if (!ok || ll > INT_MAX) {
             return READ_FLAGS_ERROR_INVALID_MULTIBULK_LEN;
         } else if (ll > 10 && auth_required) {
             return READ_FLAGS_ERROR_UNAUTHENTICATED_MULTIBULK_LEN;
         }
 
-        c->qb_pos = (newline - c->querybuf) + 2;
+        c->io.qb_pos = (newline - c->io.querybuf) + 2;
 
         if (ll <= 0) {
             return READ_FLAGS_PARSING_NEGATIVE_MBULK_LEN;
         }
 
-        c->multibulklen = ll;
-        c->bulklen = -1;
+        c->io.multibulklen = ll;
+        c->io.bulklen = -1;
 
         /* Set up argv array */
         if (*argv) zfree(*argv);
-        *argv_len = min(c->multibulklen, 1024);
+        *argv_len = min(c->io.multibulklen, 1024);
         *argv = zmalloc(sizeof(robj *) * *argv_len);
         *argv_len_sum = 0;
 
@@ -4265,22 +4265,22 @@ static int parseMultibulk(client *c,
         *net_input_bytes_curr_cmd += (multibulklen_slen + 3);
     }
 
-    serverAssertWithInfo(c, NULL, c->multibulklen > 0);
-    while (c->multibulklen) {
+    serverAssertWithInfo(c, NULL, c->io.multibulklen > 0);
+    while (c->io.multibulklen) {
         /* Read bulk length if unknown */
-        if (c->bulklen == -1) {
-            newline = memchr(c->querybuf + c->qb_pos, '\r', sdslen(c->querybuf) - c->qb_pos);
+        if (c->io.bulklen == -1) {
+            newline = memchr(c->io.querybuf + c->io.qb_pos, '\r', sdslen(c->io.querybuf) - c->io.qb_pos);
             if (newline == NULL) {
-                if (sdslen(c->querybuf) - c->qb_pos > PROTO_INLINE_MAX_SIZE) {
+                if (sdslen(c->io.querybuf) - c->io.qb_pos > PROTO_INLINE_MAX_SIZE) {
                     return READ_FLAGS_ERROR_BIG_BULK_COUNT;
                 }
                 break;
             }
 
             /* Buffer should also contain \n */
-            if (newline - (c->querybuf + c->qb_pos) > (ssize_t)(sdslen(c->querybuf) - c->qb_pos - 2)) return 0;
+            if (newline - (c->io.querybuf + c->io.qb_pos) > (ssize_t)(sdslen(c->io.querybuf) - c->io.qb_pos - 2)) return 0;
 
-            if (c->querybuf[c->qb_pos] != '$') {
+            if (c->io.querybuf[c->io.qb_pos] != '$') {
                 return READ_FLAGS_ERROR_MBULK_UNEXPECTED_CHARACTER;
             }
 
@@ -4289,15 +4289,15 @@ static int parseMultibulk(client *c,
                 return READ_FLAGS_ERROR_INVALID_CRLF;
             }
 
-            size_t bulklen_slen = newline - (c->querybuf + c->qb_pos + 1);
-            ok = string2ll(c->querybuf + c->qb_pos + 1, bulklen_slen, &ll);
+            size_t bulklen_slen = newline - (c->io.querybuf + c->io.qb_pos + 1);
+            ok = string2ll(c->io.querybuf + c->io.qb_pos + 1, bulklen_slen, &ll);
             if (!ok || ll < 0 || (!(is_replicated) && ll > server.proto_max_bulk_len)) {
                 return READ_FLAGS_ERROR_MBULK_INVALID_BULK_LEN;
             } else if (ll > 16384 && auth_required) {
                 return READ_FLAGS_ERROR_UNAUTHENTICATED_BULK_LEN;
             }
 
-            c->qb_pos = newline - c->querybuf + 2;
+            c->io.qb_pos = newline - c->io.querybuf + 2;
             if (!(is_replicated) && ll >= PROTO_MBULK_BIG_ARG) {
                 /* When the client is not a replicated client (because replicated
                  * client's querybuf can only be trimmed after data applied
@@ -4312,72 +4312,72 @@ static int parseMultibulk(client *c,
                  * or equal to ll+2. If the data length is greater than
                  * ll+2, trimming querybuf is just a waste of time, because
                  * at this time the querybuf contains not only our bulk. */
-                if (sdslen(c->querybuf) - c->qb_pos <= (size_t)ll + 2) {
-                    if (c->querybuf == thread_shared_qb) {
+                if (sdslen(c->io.querybuf) - c->io.qb_pos <= (size_t)ll + 2) {
+                    if (c->io.querybuf == thread_shared_qb) {
                         /* Let the client take the ownership of the shared buffer. */
                         initSharedQueryBuf();
                     }
-                    sdsrange(c->querybuf, c->qb_pos, -1);
-                    c->qb_pos = 0;
-                    c->qb_applied = 0;
+                    sdsrange(c->io.querybuf, c->io.qb_pos, -1);
+                    c->io.qb_pos = 0;
+                    c->io.qb_applied = 0;
                     /* Hint the sds library about the amount of bytes this string is
                      * going to contain. */
-                    c->querybuf = sdsMakeRoomForNonGreedy(c->querybuf, ll + 2 - sdslen(c->querybuf));
+                    c->io.querybuf = sdsMakeRoomForNonGreedy(c->io.querybuf, ll + 2 - sdslen(c->io.querybuf));
                     /* We later set the peak to the used portion of the buffer, but here we over
                      * allocated because we know what we need, make sure it'll not be shrunk before used. */
-                    if (c->querybuf_peak < (size_t)ll + 2) c->querybuf_peak = ll + 2;
+                    if (c->io.querybuf_peak < (size_t)ll + 2) c->io.querybuf_peak = ll + 2;
                 }
             }
-            c->bulklen = ll;
+            c->io.bulklen = ll;
             /* Per-slot network bytes-in calculation, 2nd component. */
             *net_input_bytes_curr_cmd += (bulklen_slen + 3);
         }
 
         /* Read bulk argument */
-        if (sdslen(c->querybuf) - c->qb_pos < (size_t)(c->bulklen + 2)) {
+        if (sdslen(c->io.querybuf) - c->io.qb_pos < (size_t)(c->io.bulklen + 2)) {
             /* Not enough data (+2 == trailing \r\n) */
             break;
         } else {
             /* Check if we have space in argv, grow if needed */
             if (*argc >= *argv_len) {
                 *argv_len = min(*argv_len < INT_MAX / 2 ? (*argv_len) * 2 : INT_MAX,
-                                *argc + c->multibulklen);
+                                *argc + c->io.multibulklen);
                 *argv = zrealloc(*argv, sizeof(robj *) * (*argv_len));
             }
 
             /* Check that what follows argv is a real \r\n */
-            if (unlikely(c->querybuf[c->qb_pos + c->bulklen] != '\r' ||
-                         c->querybuf[c->qb_pos + c->bulklen + 1] != '\n')) {
+            if (unlikely(c->io.querybuf[c->io.qb_pos + c->io.bulklen] != '\r' ||
+                         c->io.querybuf[c->io.qb_pos + c->io.bulklen + 1] != '\n')) {
                 return READ_FLAGS_ERROR_INVALID_CRLF;
             }
 
             /* Optimization: if a non-replicated client's buffer contains JUST our bulk element
              * instead of creating a new object by *copying* the sds we
              * just use the current sds string. */
-            if (!is_replicated && c->qb_pos == 0 && c->bulklen >= PROTO_MBULK_BIG_ARG &&
-                sdslen(c->querybuf) == (size_t)(c->bulklen + 2)) {
-                (*argv)[(*argc)++] = createObject(OBJ_STRING, c->querybuf);
-                *argv_len_sum += c->bulklen;
-                sdsIncrLen(c->querybuf, -2); /* remove CRLF */
+            if (!is_replicated && c->io.qb_pos == 0 && c->io.bulklen >= PROTO_MBULK_BIG_ARG &&
+                sdslen(c->io.querybuf) == (size_t)(c->io.bulklen + 2)) {
+                (*argv)[(*argc)++] = createObject(OBJ_STRING, c->io.querybuf);
+                *argv_len_sum += c->io.bulklen;
+                sdsIncrLen(c->io.querybuf, -2); /* remove CRLF */
                 /* Assume that if we saw a fat argument we'll see another one
                  * likely... */
-                c->querybuf = sdsnewlen(SDS_NOINIT, c->bulklen + 2);
-                sdsclear(c->querybuf);
+                c->io.querybuf = sdsnewlen(SDS_NOINIT, c->io.bulklen + 2);
+                sdsclear(c->io.querybuf);
             } else {
-                (*argv)[(*argc)++] = createStringObject(c->querybuf + c->qb_pos, c->bulklen);
-                *argv_len_sum += c->bulklen;
-                c->qb_pos += c->bulklen + 2;
+                (*argv)[(*argc)++] = createStringObject(c->io.querybuf + c->io.qb_pos, c->io.bulklen);
+                *argv_len_sum += c->io.bulklen;
+                c->io.qb_pos += c->io.bulklen + 2;
             }
-            c->bulklen = -1;
-            c->multibulklen--;
+            c->io.bulklen = -1;
+            c->io.multibulklen--;
         }
     }
 
     /* We're done when c->multibulklen == 0 */
-    if (c->multibulklen == 0) {
+    if (c->io.multibulklen == 0) {
         /* Per-slot network bytes-in calculation, 3rd and 4th components. */
         *net_input_bytes_curr_cmd += (*argv_len_sum + (*argc * 2));
-        c->reqtype = 0;
+        c->io.reqtype = 0;
         return READ_FLAGS_PARSING_COMPLETED;
     }
     return 0;
@@ -4410,7 +4410,7 @@ void commandProcessed(client *c) {
         /* Advance reploff by exactly this command's bytes. Use qb_applied
          * (current command's right boundary) instead of qb_pos, which may
          * have run ahead due to multi-command parsing. */
-        c->repl_data->reploff = c->repl_data->read_reploff - sdslen(c->querybuf) + c->qb_applied;
+        c->repl_data->reploff = c->repl_data->read_reploff - sdslen(c->io.querybuf) + c->io.qb_applied;
         /* Every applied non-MULTI command should consume >0 bytes from the
          * replication stream, so reploff must strictly advance. A no-op
          * advance means qb_applied was not maintained for the command we
@@ -4428,7 +4428,7 @@ void commandProcessed(client *c) {
     if (isReplicatedClient(c)) {
         long long applied = c->repl_data->reploff - prev_offset;
         if (applied) {
-            char *stream = c->querybuf + c->repl_data->repl_applied;
+            char *stream = c->io.querybuf + c->repl_data->repl_applied;
             if (c->slot_migration_job) {
                 /* What was applied ends with a command (or EXEC), so the db
                  * of the client is the one the proxied stream ends in. */
@@ -4503,7 +4503,7 @@ int processPendingCommandAndInputBuffer(client *c) {
      * Note: when a primary client steps into this function,
      * it can always satisfy this condition, because its querybuf
      * contains data not applied. */
-    if ((c->querybuf && sdslen(c->querybuf) > 0) || c->cmd_queue.off < c->cmd_queue.len) {
+    if ((c->io.querybuf && sdslen(c->io.querybuf) > 0) || c->cmd_queue.off < c->cmd_queue.len) {
         return processInputBuffer(c);
     }
     return C_OK;
@@ -4534,17 +4534,17 @@ void parseInputBuffer(client *c) {
     if (conn) connSetPostponeUpdateState(conn, clientConnPostponeMaskFromIOState(c) | CONN_POSTPONE_READ);
 
     /* Determine request type when unknown. */
-    if (!c->reqtype) {
-        if (c->querybuf[c->qb_pos] == '*') {
-            c->reqtype = PROTO_REQ_MULTIBULK;
+    if (!c->io.reqtype) {
+        if (c->io.querybuf[c->io.qb_pos] == '*') {
+            c->io.reqtype = PROTO_REQ_MULTIBULK;
         } else {
-            c->reqtype = PROTO_REQ_INLINE;
+            c->io.reqtype = PROTO_REQ_INLINE;
         }
     }
 
-    if (c->reqtype == PROTO_REQ_INLINE) {
+    if (c->io.reqtype == PROTO_REQ_INLINE) {
         parseInlineBuffer(c);
-    } else if (c->reqtype == PROTO_REQ_MULTIBULK) {
+    } else if (c->io.reqtype == PROTO_REQ_MULTIBULK) {
         parseMultibulkBuffer(c);
     } else {
         serverPanic("Unknown request type");
@@ -4623,7 +4623,7 @@ static bool consumeCommandQueue(client *c) {
     c->net_input_bytes_curr_cmd = p->input_bytes;
     c->parsed_cmd = p->cmd;
     c->slot = p->slot;
-    c->qb_applied += p->input_bytes;
+    c->io.qb_applied += p->input_bytes;
     if (queue->off == queue->len) {
         /* The queue is empty. Don't free it here, because if parsing is done in
          * I/O threads, we want to free it in I/O threads too, to avoid
@@ -4746,7 +4746,7 @@ static void prefetchCommandQueueKeys(client *c) {
 
 int processInputBuffer(client *c) {
     /* Parse the query buffer and/or execute already parsed commands. */
-    while ((c->querybuf && c->qb_pos < sdslen(c->querybuf)) ||
+    while ((c->io.querybuf && c->io.qb_pos < sdslen(c->io.querybuf)) ||
            c->cmd_queue.off < c->cmd_queue.len) {
         if (!canParseCommand(c)) {
             break;
@@ -4783,7 +4783,7 @@ int processInputBuffer(client *c) {
             continue;
         }
 
-        if (c->querybuf == thread_shared_qb) {
+        if (c->io.querybuf == thread_shared_qb) {
             /* Before processing the command, reset the shared query buffer to its default state.
              * This avoids unintentionally modifying the shared qb during processCommand as we may use
              * the shared qb for other clients during processEventsWhileBlocked */
@@ -4813,14 +4813,14 @@ static bool readToQueryBuf(client *c) {
 
     /* If the replica RDB client is marked as closed ASAP, do not try to read from it */
     if (c->flag.close_asap) {
-        c->nread = 0;
+        c->io.nread = 0;
         return false;
     }
 
     int is_replicated = c->read_flags & READ_FLAGS_REPLICATED;
 
     readlen = PROTO_IOBUF_LEN;
-    qblen = c->querybuf ? sdslen(c->querybuf) : 0;
+    qblen = c->io.querybuf ? sdslen(c->io.querybuf) : 0;
     /* If this is a multi bulk request, and we are processing a bulk reply
      * that is large enough, try to maximize the probability that the query
      * buffer contains exactly the SDS string representing the object, even
@@ -4828,8 +4828,8 @@ static bool readToQueryBuf(client *c) {
      * parseMultibulkBuffer() can avoid copying buffers to create the
      * robj representing the argument. */
 
-    if (c->reqtype == PROTO_REQ_MULTIBULK && c->multibulklen && c->bulklen != -1 && c->bulklen >= PROTO_MBULK_BIG_ARG) {
-        ssize_t remaining = (size_t)(c->bulklen + 2) - (qblen - c->qb_pos);
+    if (c->io.reqtype == PROTO_REQ_MULTIBULK && c->io.multibulklen && c->io.bulklen != -1 && c->io.bulklen >= PROTO_MBULK_BIG_ARG) {
+        ssize_t remaining = (size_t)(c->io.bulklen + 2) - (qblen - c->io.qb_pos);
         big_arg = 1;
 
         /* Note that the 'remaining' variable may be zero in some edge case,
@@ -4841,55 +4841,55 @@ static bool readToQueryBuf(client *c) {
         if (isReplicatedClient(c) && readlen < PROTO_IOBUF_LEN) readlen = PROTO_IOBUF_LEN;
     }
 
-    if (c->querybuf == NULL) {
+    if (c->io.querybuf == NULL) {
         serverAssert(sdslen(thread_shared_qb) == 0);
-        c->querybuf = big_arg ? sdsempty() : thread_shared_qb;
-        qblen = sdslen(c->querybuf);
+        c->io.querybuf = big_arg ? sdsempty() : thread_shared_qb;
+        qblen = sdslen(c->io.querybuf);
     }
 
     /* c->querybuf may be expanded. If so, the old thread_shared_qb will be released.
      * Although we have ensured that c->querybuf will not be expanded in the current
      * thread_shared_qb, we still add this check for code robustness. */
-    int use_thread_shared_qb = (c->querybuf == thread_shared_qb) ? 1 : 0;
+    int use_thread_shared_qb = (c->io.querybuf == thread_shared_qb) ? 1 : 0;
     if (!is_replicated && // replicated clients' querybuf can grow greedy.
-        (big_arg || sdsalloc(c->querybuf) < PROTO_IOBUF_LEN)) {
+        (big_arg || sdsalloc(c->io.querybuf) < PROTO_IOBUF_LEN)) {
         /* When reading a BIG_ARG we won't be reading more than that one arg
          * into the query buffer, so we don't need to pre-allocate more than we
          * need, so using the non-greedy growing. For an initial allocation of
          * the query buffer, we also don't wanna use the greedy growth, in order
          * to avoid collision with the RESIZE_THRESHOLD mechanism. */
-        c->querybuf = sdsMakeRoomForNonGreedy(c->querybuf, readlen);
+        c->io.querybuf = sdsMakeRoomForNonGreedy(c->io.querybuf, readlen);
         /* We later set the peak to the used portion of the buffer, but here we over
          * allocated because we know what we need, make sure it'll not be shrunk before used. */
-        if (c->querybuf_peak < qblen + readlen) c->querybuf_peak = qblen + readlen;
+        if (c->io.querybuf_peak < qblen + readlen) c->io.querybuf_peak = qblen + readlen;
     } else {
-        c->querybuf = sdsMakeRoomFor(c->querybuf, readlen);
+        c->io.querybuf = sdsMakeRoomFor(c->io.querybuf, readlen);
 
         /* Read as much as possible from the socket to save read(2) system calls. */
-        readlen = sdsavail(c->querybuf);
+        readlen = sdsavail(c->io.querybuf);
     }
-    if (use_thread_shared_qb) serverAssert(c->querybuf == thread_shared_qb);
+    if (use_thread_shared_qb) serverAssert(c->io.querybuf == thread_shared_qb);
 
-    c->nread = connRead(c->conn, c->querybuf + qblen, readlen);
-    if (c->nread <= 0) {
+    c->io.nread = connRead(c->conn, c->io.querybuf + qblen, readlen);
+    if (c->io.nread <= 0) {
         return false;
     }
 
-    sdsIncrLen(c->querybuf, c->nread);
-    qblen = sdslen(c->querybuf);
-    if (c->querybuf_peak < qblen) c->querybuf_peak = qblen;
+    sdsIncrLen(c->io.querybuf, c->io.nread);
+    qblen = sdslen(c->io.querybuf);
+    if (c->io.querybuf_peak < qblen) c->io.querybuf_peak = qblen;
     if (!is_replicated) {
         /* The commands cached in the MULTI/EXEC queue have not been executed yet,
          * so they are also considered a part of the query buffer in a broader sense.
          *
          * For unauthenticated clients, the query buffer cannot exceed 1MB at most. */
-        size_t qb_memory = sdslen(c->querybuf) + (c->mstate ? c->mstate->argv_len_sums : 0);
+        size_t qb_memory = sdslen(c->io.querybuf) + (c->mstate ? c->mstate->argv_len_sums : 0);
         if (qb_memory > server.client_max_querybuf_len ||
             (qb_memory > 1024 * 1024 && (c->read_flags & READ_FLAGS_AUTH_REQUIRED))) {
             c->read_flags |= READ_FLAGS_QB_LIMIT_REACHED;
         }
     }
-    return (size_t)c->nread == readlen;
+    return (size_t)c->io.nread == readlen;
 }
 
 #define REPL_MAX_READS_PER_IO_EVENT 25
@@ -4901,15 +4901,15 @@ __attribute__((noinline)) static bool readAndDecodePrimaryStream(client *primary
                                                                  bool *full_read) {
     uint8_t wire_buf[PROTO_IOBUF_LEN];
     if (primary->flag.close_asap) {
-        primary->nread = 0;
+        primary->io.nread = 0;
         *full_read = false;
     } else {
-        primary->nread = connRead(primary->conn, wire_buf, sizeof(wire_buf));
-        *full_read = primary->nread == (int)sizeof(wire_buf);
+        primary->io.nread = connRead(primary->conn, wire_buf, sizeof(wire_buf));
+        *full_read = primary->io.nread == (int)sizeof(wire_buf);
     }
     if (handleReadResult(primary) != C_OK) return false;
 
-    *decoded_bytes = replDecodeToQueryBuf(primary, wire_buf, (size_t)primary->nread, output_budget);
+    *decoded_bytes = replDecodeToQueryBuf(primary, wire_buf, (size_t)primary->io.nread, output_budget);
     return true;
 }
 
@@ -5100,8 +5100,8 @@ sds catClientInfoString(sds s, client *client, int hide_user_data) {
             " ssub=%i", client->pubsub_data ? (int)hashtableSize(client->pubsub_data->pubsubshard_channels) : 0,
             " multi=%i", client->mstate ? client->mstate->count : -1,
             " watch=%i", client->mstate ? (int)listLength(&client->mstate->watched_keys) : 0,
-            " qbuf=%U", client->querybuf ? (unsigned long long)sdslen(client->querybuf) : 0,
-            " qbuf-free=%U", client->querybuf ? (unsigned long long)sdsavail(client->querybuf) : 0,
+            " qbuf=%U", client->io.querybuf ? (unsigned long long)sdslen(client->io.querybuf) : 0,
+            " qbuf-free=%U", client->io.querybuf ? (unsigned long long)sdsavail(client->io.querybuf) : 0,
             " argv-mem=%U", (unsigned long long)client->argv_len_sum,
             " multi-mem=%U", client->mstate ? (unsigned long long)client->mstate->argv_len_sums : 0,
             " rbs=%U", (unsigned long long)client->buf_usable_size,
@@ -5117,7 +5117,7 @@ sds catClientInfoString(sds s, client *client, int hide_user_data) {
             " resp=%i", client->resp,
             " lib-name=%s", client->lib_name ? (char *)objectGetVal(client->lib_name) : "",
             " lib-ver=%s", client->lib_ver ? (char *)objectGetVal(client->lib_ver) : "",
-            " tot-net-in=%U", client->net_input_bytes,
+            " tot-net-in=%U", client->io.net_input_bytes,
             " tot-net-out=%U", client->net_output_bytes,
             " tot-cmds=%U", client->commands_processed));
     return ret;
@@ -6743,7 +6743,7 @@ size_t getClientMemoryUsage(client *c, size_t *output_buffer_mem_usage) {
     size_t mem = getClientOutputBufferMemoryUsage(c);
 
     if (output_buffer_mem_usage != NULL) *output_buffer_mem_usage = mem;
-    mem += c->querybuf ? sdsAllocSize(c->querybuf) : 0;
+    mem += c->io.querybuf ? sdsAllocSize(c->io.querybuf) : 0;
     mem += zmalloc_size(c);
     mem += c->buf_usable_size;
     /* Compression staging capacity is retained for reuse, so account it as
@@ -7301,7 +7301,7 @@ void ioThreadReadQueryFromClient(client *c) {
     }
 
     /* Check for read errors. */
-    if (c->nread <= 0) {
+    if (c->io.nread <= 0) {
         goto done;
     }
 

@@ -291,15 +291,15 @@ ssize_t replDecodeToQueryBuf(client *primary, const void *wire_buf, size_t wire_
     /* Decoded output grows the query buffer, so it must be private. The
      * reader path never assigns the thread-shared query buffer, so the
      * buffer here is always private or NULL. */
-    if (primary->querybuf == NULL) primary->querybuf = sdsempty();
+    if (primary->io.querybuf == NULL) primary->io.querybuf = sdsempty();
 
-    size_t before = sdslen(primary->querybuf);
+    size_t before = sdslen(primary->io.querybuf);
     const void *input = wire_buf;
     size_t input_len = wire_len;
     streamPushReaderResult result;
     do {
-        size_t produced = sdslen(primary->querybuf) - before;
-        result = streamPushReaderFeed(reader, input, input_len, &primary->querybuf, output_budget - produced);
+        size_t produced = sdslen(primary->io.querybuf) - before;
+        result = streamPushReaderFeed(reader, input, input_len, &primary->io.querybuf, output_budget - produced);
         if (result == STREAM_PUSH_READER_ERR) return -1;
         input = NULL;
         input_len = 0;
@@ -309,10 +309,10 @@ ssize_t replDecodeToQueryBuf(client *primary, const void *wire_buf, size_t wire_
         }
     } while (result == STREAM_PUSH_READER_FRAME_DONE &&
              streamPushReaderHasPendingDecode(reader) &&
-             sdslen(primary->querybuf) - before < output_budget);
+             sdslen(primary->io.querybuf) - before < output_budget);
 
-    size_t produced = sdslen(primary->querybuf) - before;
-    if (primary->querybuf_peak < sdslen(primary->querybuf)) primary->querybuf_peak = sdslen(primary->querybuf);
+    size_t produced = sdslen(primary->io.querybuf) - before;
+    if (primary->io.querybuf_peak < sdslen(primary->io.querybuf)) primary->io.querybuf_peak = sdslen(primary->io.querybuf);
 
     primary->repl_data->read_reploff += (long long)produced;
 
@@ -2633,7 +2633,7 @@ void replicationCreatePrimaryClientWithHandler(connection *conn, int dbid, Conne
 
     /* Allocate a private query buffer for the primary client instead of using the shared query buffer.
      * This is done because the primary's query buffer data needs to be preserved for my sub-replicas to use. */
-    server.primary->querybuf = sdsempty();
+    server.primary->io.querybuf = sdsempty();
     initClientReplicationData(server.primary);
     server.primary->repl_data->reploff = server.primary_initial_offset;
     server.primary->repl_data->read_reploff = server.primary->repl_data->reploff;
@@ -3967,7 +3967,7 @@ int streamReplDataBufToDb(client *c) {
                 }
             } while (replStreamHasPendingDecode());
         } else {
-            c->querybuf = sdscatlen(c->querybuf, o->buf, used);
+            c->io.querybuf = sdscatlen(c->io.querybuf, o->buf, used);
             c->repl_data->read_reploff += used;
             processInputBuffer(c);
             replStreamProgressCallback(processed_bytes, used, &last_progress_callback);
@@ -5441,9 +5441,9 @@ void replicationCachePrimary(client *c) {
      * we want to discard the non processed query buffers and non processed
      * offsets, including pending transactions, already populated arguments,
      * pending outputs to the primary. */
-    sdsclear(server.primary->querybuf);
-    server.primary->qb_pos = 0;
-    server.primary->qb_applied = 0;
+    sdsclear(server.primary->io.querybuf);
+    server.primary->io.qb_pos = 0;
+    server.primary->io.qb_applied = 0;
     server.primary->repl_data->repl_applied = 0;
     server.primary->repl_data->read_reploff = server.primary->repl_data->reploff;
     if (c->flag.multi) discardTransaction(c);
@@ -5454,9 +5454,9 @@ void replicationCachePrimary(client *c) {
     c->bufpos = 0;
     resetClient(c);
     resetClientIOState(c);
-    c->reqtype = 0;
-    c->multibulklen = 0;
-    c->bulklen = -1;
+    c->io.reqtype = 0;
+    c->io.multibulklen = 0;
+    c->io.bulklen = -1;
     discardCommandQueue(c);
 
     /* Save the primary. Server.primary will be set to null later by

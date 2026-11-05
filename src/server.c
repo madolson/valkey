@@ -983,47 +983,47 @@ long long getInstantaneousMetric(int metric) {
  * The function always returns 0 as it never terminates the client. */
 int clientsCronResizeQueryBuffer(client *c) {
     /* If the client query buffer is NULL, it is using the shared query buffer and there is nothing to do. */
-    if (c->querybuf == NULL) return 0;
-    size_t querybuf_size = sdsalloc(c->querybuf);
+    if (c->io.querybuf == NULL) return 0;
+    size_t querybuf_size = sdsalloc(c->io.querybuf);
     time_t idletime = server.unixtime - c->last_interaction;
 
     /* Only resize the query buffer if the buffer is actually wasting at least a
      * few kbytes */
-    if (sdsavail(c->querybuf) > 1024 * 4) {
+    if (sdsavail(c->io.querybuf) > 1024 * 4) {
         /* There are two conditions to resize the query buffer: */
         if (idletime > 2) {
             /* 1) Query is idle for a long time. */
-            size_t remaining = sdslen(c->querybuf) - c->qb_pos;
+            size_t remaining = sdslen(c->io.querybuf) - c->io.qb_pos;
             if (!isReplicatedClient(c) && !remaining) {
                 /* If the client is not replicated and no data is pending,
                  * The client can safely use the shared query buffer in the next read - free the client's querybuf. */
-                sdsfree(c->querybuf);
+                sdsfree(c->io.querybuf);
                 /* By setting the querybuf to NULL, the client will use the shared query buffer in the next read.
                  * We don't move the client to the shared query buffer immediately, because if we allocated a private
                  * query buffer for the client, it's likely that the client will use it again soon. */
-                c->querybuf = NULL;
+                c->io.querybuf = NULL;
             } else {
-                c->querybuf = sdsRemoveFreeSpace(c->querybuf, 1);
+                c->io.querybuf = sdsRemoveFreeSpace(c->io.querybuf, 1);
             }
-        } else if (querybuf_size > PROTO_RESIZE_THRESHOLD && querybuf_size / 2 > c->querybuf_peak) {
+        } else if (querybuf_size > PROTO_RESIZE_THRESHOLD && querybuf_size / 2 > c->io.querybuf_peak) {
             /* 2) Query buffer is too big for latest peak and is larger than
              *    resize threshold. Trim excess space but only up to a limit,
              *    not below the recent peak and current c->querybuf (which will
              *    be soon get used). If we're in the middle of a bulk then make
              *    sure not to resize to less than the bulk length. */
-            size_t resize = sdslen(c->querybuf);
-            if (resize < c->querybuf_peak) resize = c->querybuf_peak;
-            if (c->bulklen != -1 && resize < (size_t)c->bulklen + 2) resize = c->bulklen + 2;
-            c->querybuf = sdsResize(c->querybuf, resize, 1);
+            size_t resize = sdslen(c->io.querybuf);
+            if (resize < c->io.querybuf_peak) resize = c->io.querybuf_peak;
+            if (c->io.bulklen != -1 && resize < (size_t)c->io.bulklen + 2) resize = c->io.bulklen + 2;
+            c->io.querybuf = sdsResize(c->io.querybuf, resize, 1);
         }
     }
 
     /* Reset the peak again to capture the peak memory usage in the next
      * cycle. */
-    c->querybuf_peak = c->querybuf ? sdslen(c->querybuf) : 0;
+    c->io.querybuf_peak = c->io.querybuf ? sdslen(c->io.querybuf) : 0;
     /* We reset to either the current used, or currently processed bulk size,
      * which ever is bigger. */
-    if (c->bulklen != -1 && (size_t)c->bulklen + 2 > c->querybuf_peak) c->querybuf_peak = c->bulklen + 2;
+    if (c->io.bulklen != -1 && (size_t)c->io.bulklen + 2 > c->io.querybuf_peak) c->io.querybuf_peak = c->io.bulklen + 2;
     return 0;
 }
 
@@ -1094,7 +1094,7 @@ size_t ClientsPeakMemInput[CLIENTS_PEAK_MEM_USAGE_SLOTS] = {0};
 size_t ClientsPeakMemOutput[CLIENTS_PEAK_MEM_USAGE_SLOTS] = {0};
 
 int clientsCronTrackExpensiveClients(client *c, int time_idx) {
-    size_t qb_size = c->querybuf ? sdsAllocSize(c->querybuf) : 0;
+    size_t qb_size = c->io.querybuf ? sdsAllocSize(c->io.querybuf) : 0;
     size_t argv_size = c->argv ? zmalloc_size(c->argv) : 0;
     size_t in_usage = qb_size + c->argv_len_sum + argv_size;
     size_t out_usage = getClientOutputBufferMemoryUsage(c);
@@ -7644,7 +7644,7 @@ void sendChildInfo(childInfoType info_type, size_t keys, char *pname) {
 void dismissClientMemory(client *c) {
     /* Dismiss client query buffer and static reply buffer. */
     dismissMemory(c->buf, c->buf_usable_size);
-    if (c->querybuf) dismissSds(c->querybuf);
+    if (c->io.querybuf) dismissSds(c->io.querybuf);
     /* Dismiss argv array only if we estimate it contains a big buffer. */
     if (c->argc && c->argv_len_sum / c->argc >= server.page_size) {
         for (int i = 0; i < c->argc; i++) {

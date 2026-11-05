@@ -786,6 +786,14 @@ rust-client-cargo:
 .PHONY: rust-client-cargo
 endif
 
+# client_io.h is generated from the crate and checked in, so C-only builds
+# need neither cargo nor cbindgen.
+rust-client-header:
+	cd rust/valkey-client && cbindgen --config cbindgen.toml --crate valkey-client -q > ../../client_io.h
+check-rust-client-header:
+	cd rust/valkey-client && cbindgen --config cbindgen.toml --crate valkey-client -q | diff -u ../../client_io.h -
+.PHONY: rust-client-header check-rust-client-header
+
 # valkey-server
 $(SERVER_NAME): $(ENGINE_SERVER_OBJ) $(LUA_MODULE)
 	$(SERVER_LD) -o $@ $(ENGINE_SERVER_OBJ) ../deps/libvalkey/lib/libvalkey.a ../deps/hdr_histogram/libhdrhistogram.a ../deps/fpconv/libfpconv.a ../deps/lz4/liblz4.a $(FINAL_LIBS) $(LUA_LDFLAGS)

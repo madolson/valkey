@@ -67,16 +67,9 @@ pub unsafe extern "C" fn vc_parse_input_buffer(c: *mut client) {
     if !conn.is_null() {
         conn_set_postpone_update_state(conn, postpone_mask_from_io_state(c) | CONN_POSTPONE_READ as c_int);
     }
-    if (*c).reqtype == 0 {
-        // querybuf is an sds (char *); qb_pos indexes into it.
-        let b = *(*c).querybuf.add((*c).qb_pos);
-        (*c).reqtype = if b == b'*' as std::os::raw::c_char {
-            PROTO_REQ_MULTIBULK as c_int
-        } else {
-            PROTO_REQ_INLINE as c_int
-        };
-    }
-    match (*c).reqtype as u32 {
+    // Shape 2: the read state is a Rust-defined type embedded in client.
+    (*c).io.detect_reqtype();
+    match (*c).io.reqtype as u32 {
         PROTO_REQ_INLINE => parseInlineBuffer(c),
         PROTO_REQ_MULTIBULK => parseMultibulkBuffer(c),
         _ => {
