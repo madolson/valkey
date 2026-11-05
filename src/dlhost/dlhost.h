@@ -15,6 +15,7 @@
 #define DLHOST_MSG_DATA 1  /* host -> engine: RESP bytes for one connection */
 #define DLHOST_MSG_CLOSE 2 /* host -> engine: connection closed */
 #define DLHOST_MSG_PARSED 5 /* host -> engine: commands already parsed into argv */
+#define DLHOST_MSG_WAKE 6   /* -> engine: a sequence this engine waits on has executed */
 
 typedef struct dlhostMsg {
     struct dlhostMsg *next;
@@ -25,6 +26,11 @@ typedef struct dlhostMsg {
     size_t pos;          /* consumed by the engine */
     void *parsed;        /* DLHOST_MSG_PARSED: engine-allocated, from dlhostEngineParseFn */
     int nparsed;
+    /* Chained dispatch: seqs[i] is parsed[i]'s position in its connection's
+     * command order. A command runs only after every earlier one has run on
+     * whichever engine owns it. NULL: run on arrival. */
+    unsigned long long *seqs;
+    int cur; /* next parsed[] entry not yet handed to the client */
     char data[];
 } dlhostMsg;
 
@@ -50,6 +56,15 @@ typedef struct dlhostOps {
     void (*msg_done)(dlhostMsg *m);
     /* Engine finished startup and is entering aeMain. */
     void (*ready)(int idx);
+    /* Chained dispatch. seq_ready: 1 if every command of hconn before `seq`
+     * has executed; otherwise registers engine `idx` to get a WAKE message
+     * for hconn once they have, and returns 0. seq_done: commands of hconn
+     * before `seq` have all executed; wakes the engine waiting on `seq`. */
+    int (*seq_ready)(void *hconn, int idx, unsigned long long seq);
+    void (*seq_done)(void *hconn, int idx, unsigned long long seq);
+    /* Queue a WAKE for hconn to engine `idx` itself (resume in a later
+     * event-loop iteration, not inside beforeSleep). */
+    void (*self_wake)(void *hconn, int idx);
 } dlhostOps;
 
 /* Exported by the engine shared object. */

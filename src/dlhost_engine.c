@@ -23,12 +23,22 @@ static const dlhostOps *host_ops;
 static int engine_idx;
 static dlhostInbox *inbox;
 
-typedef struct {
+typedef struct hostConn {
     connection c;
     void *hconn;
     void **slot;
     dlhostMsg *in_head, *in_tail; /* input not yet read by the client */
+    /* Chained dispatch: sequenced messages not yet fully handed over, the
+     * end of the run the client is executing, and the waiting list link. */
+    dlhostMsg *run_head, *run_tail;
+    int running;
+    unsigned long long run_end;
+    struct hostConn *wprev, *wnext;
+    int on_wait_list;
 } hostConn;
+
+/* Connections whose current run blocked; checked in beforeSleep. */
+static hostConn *wait_list;
 
 static int hcGetType(void) {
     return CONN_TYPE_SOCKET;
@@ -51,6 +61,39 @@ static void hcShutdown(connection *conn) {
     UNUSED(conn);
 }
 
+static void freeParsedMsg(dlhostMsg *m) {
+    if (m->parsed) { /* free what dlhostEngineParse() built and nobody took */
+        parsedCommand *pc = m->parsed;
+        for (int i = m->cur; i < m->nparsed; i++) {
+            for (int j = 0; j < pc[i].argc; j++) decrRefCount(pc[i].argv[j]);
+            zfree(pc[i].argv);
+        }
+        zfree(pc);
+        m->parsed = NULL;
+    }
+    host_ops->msg_done(m);
+}
+
+static void waitListRemove(hostConn *hc) {
+    if (!hc->on_wait_list) return;
+    if (hc->wprev)
+        hc->wprev->wnext = hc->wnext;
+    else
+        wait_list = hc->wnext;
+    if (hc->wnext) hc->wnext->wprev = hc->wprev;
+    hc->wprev = hc->wnext = NULL;
+    hc->on_wait_list = 0;
+}
+
+static void waitListAdd(hostConn *hc) {
+    if (hc->on_wait_list) return;
+    hc->wprev = NULL;
+    hc->wnext = wait_list;
+    if (wait_list) wait_list->wprev = hc;
+    wait_list = hc;
+    hc->on_wait_list = 1;
+}
+
 static void hcClose(connection *conn) {
     hostConn *hc = (hostConn *)conn;
     if (connHasRefs(conn)) {
@@ -62,6 +105,12 @@ static void hcClose(connection *conn) {
         hc->in_head = m->next;
         host_ops->msg_done(m);
     }
+    while (hc->run_head) {
+        dlhostMsg *m = hc->run_head;
+        hc->run_head = m->next;
+        freeParsedMsg(m);
+    }
+    waitListRemove(hc);
     int by_engine = *hc->slot != DLHOST_SLOT_CLOSED;
     *hc->slot = DLHOST_SLOT_CLOSED;
     host_ops->engine_closed(hc->hconn, engine_idx, by_engine);
@@ -221,25 +270,78 @@ void *dlhostEngineParse(const struct iovec *cmds, int n) {
     return pc;
 }
 
+static void queueCommands(client *c, parsedCommand *pc, int n) {
+    cmdQueue *q = &c->cmd_queue;
+    serverAssert(q->len + n < 65535);
+    if (q->len + n > q->cap) {
+        q->cap = q->len + n;
+        q->cmds = zrealloc(q->cmds, sizeof(parsedCommand) * q->cap);
+    }
+    memcpy(q->cmds + q->len, pc, sizeof(parsedCommand) * n);
+    q->len += n;
+}
+
+/* Run the client's queue. Returns C_ERR if the client was freed. */
+static int runQueue(client *c) {
+    if (processInputBuffer(c) == C_ERR) return C_ERR;
+    trimCommandQueue(c);
+    beforeNextClient(c);
+    return C_OK;
+}
+
 /* Append pre-parsed commands to the client's command queue and run them;
  * processInputBuffer() consumes the queue, and resumes it after a block. */
 static void handleParsed(hostConn *hc, dlhostMsg *m) {
     client *c = connGetPrivateData(&hc->c);
-    parsedCommand *pc = m->parsed;
-    cmdQueue *q = &c->cmd_queue;
-    serverAssert(q->len + m->nparsed < 65535);
-    if (q->len + m->nparsed > q->cap) {
-        q->cap = q->len + m->nparsed;
-        q->cmds = zrealloc(q->cmds, sizeof(parsedCommand) * q->cap);
-    }
-    memcpy(q->cmds + q->len, pc, sizeof(parsedCommand) * m->nparsed);
-    q->len += m->nparsed;
-    zfree(pc);
+    queueCommands(c, m->parsed, m->nparsed);
+    zfree(m->parsed);
     m->parsed = NULL;
     host_ops->msg_done(m);
-    if (processInputBuffer(c) == C_ERR) return;
-    trimCommandQueue(c);
-    beforeNextClient(c);
+    runQueue(c);
+}
+
+/* Every command handed to the client has executed: nothing queued, not
+ * blocked or about to resume. A client closing after QUIT never finishes, so
+ * nothing later on the connection runs. */
+static int runFinished(client *c) {
+    return c->cmd_queue.off >= c->cmd_queue.len && !c->flag.blocked && !c->flag.unblocked &&
+           !c->flag.pending_command && !c->flag.close_after_reply && !c->flag.close_asap && c->cmd == NULL;
+}
+
+/* Chained dispatch: hand the client the next run of consecutive sequence
+ * numbers once the command before it has executed on whichever engine owns
+ * it, and tell the host when the run has executed. */
+static void pumpRuns(hostConn *hc) {
+    client *c = connGetPrivateData(&hc->c);
+    for (;;) {
+        if (hc->running) {
+            if (!runFinished(c)) {
+                waitListAdd(hc);
+                return;
+            }
+            hc->running = 0;
+            waitListRemove(hc);
+            host_ops->seq_done(hc->hconn, engine_idx, hc->run_end);
+        }
+        dlhostMsg *m = hc->run_head;
+        if (!m) return;
+        unsigned long long s = m->seqs[m->cur];
+        if (!host_ops->seq_ready(hc->hconn, engine_idx, s)) return; /* a WAKE follows */
+        int k = 1;
+        while (m->cur + k < m->nparsed && m->seqs[m->cur + k] == s + k) k++;
+        queueCommands(c, (parsedCommand *)m->parsed + m->cur, k);
+        m->cur += k;
+        if (m->cur == m->nparsed) {
+            hc->run_head = m->next;
+            if (!hc->run_head) hc->run_tail = NULL;
+            zfree(m->parsed);
+            m->parsed = NULL;
+            host_ops->msg_done(m);
+        }
+        hc->running = 1;
+        hc->run_end = s + k;
+        if (runQueue(c) == C_ERR) return;
+    }
 }
 
 static void handleMsg(dlhostMsg *m) {
@@ -254,18 +356,25 @@ static void handleMsg(dlhostMsg *m) {
         return;
     }
     if (s == DLHOST_SLOT_CLOSED) {
-        if (m->parsed) { /* free what dlhostEngineParse() built */
-            parsedCommand *pc = m->parsed;
-            for (int i = 0; i < m->nparsed; i++) {
-                for (int j = 0; j < pc[i].argc; j++) decrRefCount(pc[i].argv[j]);
-                zfree(pc[i].argv);
-            }
-            zfree(pc);
-        }
+        freeParsedMsg(m);
+        return;
+    }
+    if (m->type == DLHOST_MSG_WAKE) {
         host_ops->msg_done(m);
+        if (s) pumpRuns(s);
         return;
     }
     hostConn *hc = s ? s : hcCreate(m);
+    if (m->type == DLHOST_MSG_PARSED && m->seqs) {
+        m->next = NULL;
+        if (hc->run_tail)
+            hc->run_tail->next = m;
+        else
+            hc->run_head = m;
+        hc->run_tail = m;
+        pumpRuns(hc);
+        return;
+    }
     if (m->type == DLHOST_MSG_PARSED) {
         handleParsed(hc, m);
         return;
@@ -309,7 +418,24 @@ void dlhostEngineSetup(const dlhostOps *ops, int idx, dlhostInbox *ib) {
 }
 
 void dlhostEngineBeforeSleep(void) {
-    if (host_ops) host_ops->flush(engine_idx);
+    if (!host_ops) return;
+    /* Runs that blocked and have since finished (unblocked clients resumed
+     * their queues earlier in beforeSleep). Advance their sequence; resume
+     * any later run of theirs in the next iteration, not here, where its
+     * replies would wait for the next wakeup. */
+    hostConn *hc = wait_list;
+    while (hc) {
+        hostConn *next = hc->wnext;
+        client *c = connGetPrivateData(&hc->c);
+        if (runFinished(c)) {
+            hc->running = 0;
+            waitListRemove(hc);
+            host_ops->seq_done(hc->hconn, engine_idx, hc->run_end);
+            if (hc->run_head) host_ops->self_wake(hc->hconn, engine_idx);
+        }
+        hc = next;
+    }
+    host_ops->flush(engine_idx);
 }
 
 /* Called from main() right before aeMain(). */

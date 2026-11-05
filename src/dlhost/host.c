@@ -23,6 +23,24 @@
  *                            keys (no mixed pipelines)
  *   --raw                    hand engines raw RESP to re-parse on their main
  *                            thread, instead of argv built on the IO thread
+ *   --order reply|single|chain
+ *                            how a connection whose commands span engines is
+ *                            ordered (default reply):
+ *                            reply:  commands go to their engines at once and
+ *                                    run in any order; only replies are put
+ *                                    back in request order
+ *                            single: one engine in flight per connection; a
+ *                                    command for another engine waits until
+ *                                    every earlier command has replied
+ *                            chain:  commands go to their engines at once,
+ *                                    numbered per connection; an engine runs
+ *                                    command s only after command s-1 ran
+ *                                    (DLHOST_MSG_WAKE from the engine that ran it)
+ *
+ * MULTI is answered by the host and deferred: the transaction goes to the
+ * engine of its first command, and a later command for another engine is
+ * replaced by one that fails, so EXEC returns EXECABORT, as cluster mode
+ * does for CROSSSLOT.
  */
 #define _GNU_SOURCE
 #include <dlfcn.h>
@@ -53,6 +71,9 @@
 #define MAXIO 64
 #define DLHOST_MSG_REPLY 3
 #define DLHOST_MSG_ECLOSED 4
+#define ORD_SWALLOW 0x80 /* order ring flag: drop this reply (host-injected command) */
+enum { ORDER_REPLY, ORDER_SINGLE, ORDER_CHAIN };
+enum { K_OTHER, K_MULTI, K_EXEC, K_DISCARD };
 
 uint16_t crc16(const char *buf, int len);
 
@@ -75,6 +96,16 @@ typedef struct hconn {
     uint8_t *order;
     size_t ohead, otail, ocap; /* ring of engine ids, one per request */
     void *eslot[MAXN];
+    int multi;        /* 0, 1: MULTI answered but no command yet, 2: on multi_engine */
+    int multi_engine;
+    /* ORDER_SINGLE */
+    int held;         /* input stopped at a command for another engine */
+    int cur_engine;   /* engine of the last command dispatched */
+    size_t inflight;  /* engine commands dispatched whose reply is not yet out */
+    /* ORDER_CHAIN */
+    unsigned long long next_seq;            /* IO thread only */
+    _Atomic unsigned long long exec_seq;    /* commands before this one ran */
+    _Atomic unsigned long long waiter[MAXN]; /* 1 + seq engine i waits for, 0 none */
 } hconn;
 
 typedef struct iothread {
@@ -94,6 +125,7 @@ static const char *rundir = "/tmp/chunky-dlmopen-run";
 static int copy_dlopen = 0;
 static int raw_mode = 0;
 static int node_ports = 0;
+static int order_mode = ORDER_REPLY;
 static dlhostEngineParseFn eng_parse[MAXN];
 static void (*ns_ctype_init[MAXN])(void);
 
@@ -184,6 +216,8 @@ static dlhostMsg *msgNew(int type, hconn *hc, size_t len) {
     m->pos = 0;
     m->parsed = NULL;
     m->nparsed = 0;
+    m->seqs = NULL;
+    m->cur = 0;
     atomic_fetch_add_explicit(&hc->refs, 1, memory_order_relaxed);
     return m;
 }
@@ -243,7 +277,44 @@ static void opReady(int idx) {
     atomic_fetch_add(&engines_ready, 1);
 }
 
+static void wakeEngine(hconn *hc, int f) {
+    dlhostMsg *m = msgNew(DLHOST_MSG_WAKE, hc, 0);
+    m->engine_slot = &hc->eslot[f];
+    inboxPush(&engine_inbox[f], m, m);
+}
+
+/* seq_cst on both sides: either the waiter sees exec_seq advance, or the
+ * engine advancing it sees the waiter. */
+static int opSeqReady(void *h, int idx, unsigned long long seq) {
+    hconn *hc = h;
+    if (atomic_load(&hc->exec_seq) == seq) return 1;
+    atomic_store(&hc->waiter[idx], seq + 1);
+    if (atomic_load(&hc->exec_seq) == seq) {
+        atomic_store(&hc->waiter[idx], 0);
+        return 1;
+    }
+    return 0;
+}
+
+static void opSeqDone(void *h, int idx, unsigned long long seq) {
+    hconn *hc = h;
+    atomic_store(&hc->exec_seq, seq);
+    for (int f = 0; f < N; f++) {
+        if (f == idx) continue;
+        unsigned long long w = seq + 1;
+        if (atomic_load(&hc->waiter[f]) == w && atomic_compare_exchange_strong(&hc->waiter[f], &w, 0))
+            wakeEngine(hc, f);
+    }
+}
+
+static void opSelfWake(void *h, int idx) {
+    wakeEngine(h, idx);
+}
+
 static const dlhostOps ops = {
+    .seq_ready = opSeqReady,
+    .seq_done = opSeqDone,
+    .self_wake = opSelfWake,
     .reply = opReply,
     .flush = opFlush,
     .engine_closed = opEngineClosed,
@@ -327,10 +398,11 @@ static int isKeyless(const char *c, size_t l) {
 }
 
 /* Parse one request at p. Returns its length (0 if incomplete, -1 on
- * protocol error) and sets *engine. */
-static long parseRequest(const char *p, size_t len, int *engine) {
-    *engine = 0;
-    if (p[0] != '*') { /* inline command: route to engine 0 */
+ * protocol error), sets *engine (-1 for keyless) and *kind. */
+static long parseRequest(const char *p, size_t len, int *engine, int *kind) {
+    *engine = -1;
+    *kind = K_OTHER;
+    if (p[0] != '*') { /* inline command: keyless */
         size_t l = lineLen(p, len);
         return l ? (long)l : 0;
     }
@@ -356,7 +428,12 @@ static long parseRequest(const char *p, size_t len, int *engine) {
         *engine = HOSTE;
         return (long)o;
     }
-    if (argc >= 2 && N > 1 && !isKeyless(a0, l0)) *engine = keyHashSlot(a1, (int)l1) * N / 16384;
+    if (argc == 1) {
+        if (l0 == 5 && !strncasecmp(a0, "multi", 5)) *kind = K_MULTI;
+        if (l0 == 4 && !strncasecmp(a0, "exec", 4)) *kind = K_EXEC;
+        if (l0 == 7 && !strncasecmp(a0, "discard", 7)) *kind = K_DISCARD;
+    }
+    if (argc >= 2 && !isKeyless(a0, l0)) *engine = N > 1 ? keyHashSlot(a1, (int)l1) * N / 16384 : 0;
     return (long)o;
 }
 
@@ -425,6 +502,7 @@ static void appendClusterSlots(buf *b) {
 }
 
 #define MAXSPANS 1024
+static void connParse(iothread *t, hconn *hc);
 static void connRead(iothread *t, hconn *hc) {
     if (hc->close_engine) return; /* nothing after QUIT runs */
     for (;;) {
@@ -438,49 +516,134 @@ static void connRead(iothread *t, hconn *hc) {
         hc->in.len += n;
         if ((size_t)n < 65536) break;
     }
-    /* Split into requests, then copy each engine's requests into one msg. */
-    long start[MAXSPANS], len[MAXSPANS];
+    connParse(t, hc);
+}
+
+static const char SYN_MULTI[] = "*1\r\n$5\r\nMULTI\r\n";
+/* Unknown command: inside MULTI it flags the transaction (EXECABORT). */
+static const char SYN_XSLOT[] = "*1\r\n$18\r\nCROSSSLOT-IN-MULTI\r\n";
+
+/* Split buffered input into requests, then copy each engine's requests into
+ * one msg. With ORDER_SINGLE, stops at the first request for an engine other
+ * than the one with commands in flight; connFlush() resumes it. */
+static void connParse(iothread *t, hconn *hc) {
+    const char *sp[MAXSPANS];
+    long len[MAXSPANS];
     int eng[MAXSPANS];
+    uint8_t flg[MAXSPANS];
+    unsigned long long seq[MAXSPANS];
+    hc->held = 0;
     for (;;) {
         int ns = 0;
         size_t tot[MAXN + 1] = {0};
         size_t o = hc->in.off;
-        while (ns < MAXSPANS && o < hc->in.len) {
-            int e;
-            long l = parseRequest(hc->in.p + o, hc->in.len - o, &e);
+#define ADDSPAN(P, L, E, F)                                     \
+    do {                                                        \
+        sp[ns] = (P), len[ns] = (L), eng[ns] = (E), flg[ns] = (F); \
+        if ((E) != HOSTE) {                                     \
+            tot[E] += (L);                                      \
+            seq[ns] = hc->next_seq++;                           \
+            hc->inflight++;                                     \
+            hc->cur_engine = (E);                               \
+        }                                                       \
+        ns++;                                                   \
+    } while (0)
+        while (ns < MAXSPANS - 2 && o < hc->in.len) {
+            int e, kind;
+            const char *p = hc->in.p + o;
+            long l = parseRequest(p, hc->in.len - o, &e, &kind);
             if (l < 0) {
                 connClose(t, hc);
                 return;
             }
             if (l == 0) break;
-            start[ns] = o;
-            len[ns] = l;
-            eng[ns] = e;
-            tot[e] += l;
-            ns++;
+            const char *hrep = NULL; /* host answers it */
+            int syn_multi = 0, xslot = 0;
+            if (e == HOSTE) {
+                hrep = "";
+            } else if (order_mode == ORDER_CHAIN && p[0] != '*') {
+                /* Inline commands go as raw bytes, which are not sequenced. */
+                hrep = "-ERR inline commands are not supported with --order chain\r\n";
+            } else if (hc->multi == 0) {
+                if (kind == K_MULTI)
+                    hrep = "+OK\r\n";
+                else if (e < 0)
+                    e = 0;
+            } else if (hc->multi == 1) {
+                if (kind == K_MULTI)
+                    hrep = "-ERR MULTI calls can not be nested\r\n";
+                else if (kind == K_EXEC)
+                    hrep = "*0\r\n";
+                else if (kind == K_DISCARD)
+                    hrep = "+OK\r\n";
+                else {
+                    if (e < 0) e = 0;
+                    syn_multi = 1;
+                }
+            } else {
+                if (e >= 0 && e != hc->multi_engine) xslot = 1;
+                e = hc->multi_engine;
+            }
+            if (!hrep && order_mode == ORDER_SINGLE && hc->inflight && hc->cur_engine != e) {
+                hc->held = 1;
+                break;
+            }
             o += l;
+            if (hrep) {
+                if (e == HOSTE)
+                    appendClusterSlots(&hc->rep[HOSTE]);
+                else
+                    bufAppend(&hc->rep[HOSTE], hrep, strlen(hrep));
+                if (hc->multi == 0 && kind == K_MULTI)
+                    hc->multi = 1;
+                else if (hc->multi == 1 && (kind == K_EXEC || kind == K_DISCARD))
+                    hc->multi = 0;
+                markDirty(t, hc);
+                ADDSPAN(p, l, HOSTE, 0);
+                continue;
+            }
+            if (syn_multi) {
+                ADDSPAN(SYN_MULTI, (long)sizeof(SYN_MULTI) - 1, e, ORD_SWALLOW);
+                hc->multi = 2;
+                hc->multi_engine = e;
+            } else if (hc->multi == 2 && (kind == K_EXEC || kind == K_DISCARD)) {
+                hc->multi = 0;
+            }
+            if (xslot)
+                ADDSPAN(SYN_XSLOT, (long)sizeof(SYN_XSLOT) - 1, e, 0);
+            else
+                ADDSPAN(p, l, e, 0);
         }
+#undef ADDSPAN
         if (ns == 0) break;
+        int full = ns >= MAXSPANS - 2;
         dlhostMsg *m[MAXN + 1] = {0};
         int inl[MAXN + 1] = {0};
         for (int i = 0; i < ns; i++)
-            if (hc->in.p[start[i]] != '*') inl[eng[i]] = 1;
+            if (eng[i] != HOSTE && sp[i][0] != '*') inl[eng[i]] = 1;
         for (int e = 0; e < N; e++) {
             if (!tot[e]) continue;
             if (!raw_mode && !inl[e]) {
                 /* Build the engine's argv here, on the IO thread. */
                 struct iovec iov[MAXSPANS];
+                unsigned long long sq[MAXSPANS];
                 int n = 0;
                 for (int i = 0; i < ns; i++)
                     if (eng[i] == e) {
-                        iov[n].iov_base = hc->in.p + start[i];
+                        iov[n].iov_base = (void *)sp[i];
                         iov[n].iov_len = len[i];
+                        sq[n] = seq[i];
                         n++;
                     }
-                m[e] = msgNew(DLHOST_MSG_PARSED, hc, 0);
+                int chain = order_mode == ORDER_CHAIN;
+                m[e] = msgNew(DLHOST_MSG_PARSED, hc, chain ? n * sizeof(sq[0]) : 0);
                 m[e]->engine_slot = &hc->eslot[e];
                 m[e]->parsed = eng_parse[e](iov, n);
                 m[e]->nparsed = n;
+                if (chain) {
+                    m[e]->seqs = (unsigned long long *)m[e]->data;
+                    memcpy(m[e]->seqs, sq, n * sizeof(sq[0]));
+                }
                 continue;
             }
             m[e] = msgNew(DLHOST_MSG_DATA, hc, tot[e]);
@@ -489,22 +652,20 @@ static void connRead(iothread *t, hconn *hc) {
         }
         for (int i = 0; i < ns; i++) {
             if (eng[i] == HOSTE) {
-                appendClusterSlots(&hc->rep[HOSTE]);
-                markDirty(t, hc);
                 orderPush(hc, HOSTE);
                 continue;
             }
             dlhostMsg *x = m[eng[i]];
             if (x->type == DLHOST_MSG_DATA) {
-                memcpy(x->data + x->len, hc->in.p + start[i], len[i]);
+                memcpy(x->data + x->len, sp[i], len[i]);
                 x->len += len[i];
             }
-            orderPush(hc, eng[i]);
+            orderPush(hc, eng[i] | flg[i]);
         }
         for (int e = 0; e < N; e++)
             if (m[e]) chainAdd(t, e, m[e]);
         hc->in.off = o;
-        if (ns < MAXSPANS) break;
+        if (!full || hc->held) break;
     }
     if (hc->in.off == hc->in.len) hc->in.off = hc->in.len = 0;
 }
@@ -512,7 +673,8 @@ static void connRead(iothread *t, hconn *hc) {
 static void connFlush(iothread *t, hconn *hc) {
     int close_now = 0;
     while (hc->ohead != hc->otail) {
-        int e = hc->order[hc->ohead % hc->ocap];
+        int v = hc->order[hc->ohead % hc->ocap];
+        int e = v & ~ORD_SWALLOW;
         buf *b = &hc->rep[e];
         size_t k = respSkip(b->p + b->off, b->len - b->off);
         if (!k) {
@@ -520,10 +682,15 @@ static void connFlush(iothread *t, hconn *hc) {
             if (hc->close_engine == e + 1) close_now = 1;
             break;
         }
-        bufAppend(&hc->out, b->p + b->off, k);
+        if (!(v & ORD_SWALLOW)) bufAppend(&hc->out, b->p + b->off, k);
         b->off += k;
         if (b->off == b->len) b->off = b->len = 0;
         hc->ohead++;
+        if (e != HOSTE) hc->inflight--;
+    }
+    if (hc->held && !hc->inflight && !hc->close_engine) {
+        connParse(t, hc); /* re-marks hc dirty if the host answered something */
+        if (hc->closed) return;
     }
     while (hc->out.off < hc->out.len) {
         ssize_t n = write(hc->fd, hc->out.p + hc->out.off, hc->out.len - hc->out.off);
@@ -780,6 +947,19 @@ int main(int argc, char **argv) {
             raw_mode = 1;
         else if (!strcmp(argv[i], "--copy-dlopen"))
             copy_dlopen = 1;
+        else if (!strcmp(argv[i], "--order") && i + 1 < argc) {
+            const char *o = argv[++i];
+            if (!strcmp(o, "reply"))
+                order_mode = ORDER_REPLY;
+            else if (!strcmp(o, "single"))
+                order_mode = ORDER_SINGLE;
+            else if (!strcmp(o, "chain"))
+                order_mode = ORDER_CHAIN;
+            else {
+                fprintf(stderr, "--order reply|single|chain\n");
+                return 1;
+            }
+        }
         else if (!strcmp(argv[i], "--")) {
             i++;
             break;
@@ -791,6 +971,10 @@ int main(int argc, char **argv) {
     extra_argc = argc - i;
     extra_argv = argv + i;
     if (N < 1 || N > MAXN || M < 1 || M > MAXIO) return 1;
+    if (order_mode == ORDER_CHAIN && raw_mode) {
+        fprintf(stderr, "--order chain needs parsed commands (no --raw)\n");
+        return 1;
+    }
     for (int k = 0; keyless[k]; k++) keyless_len[k] = strlen(keyless[k]);
     signal(SIGPIPE, SIG_IGN);
     /* ld.so allocates the engines' dynamic TLS (__tls_get_addr) with this
@@ -862,7 +1046,9 @@ int main(int argc, char **argv) {
      * before its exit() takes the whole process down. Exit directly. */
     signal(SIGTERM, onTerm);
     signal(SIGINT, onTerm);
-    fprintf(stderr, "dlhost: %d engines (%s), %d io threads, port %d, %s\n", N,
-            copy_dlopen ? "dlopen copies" : "dlmopen", M, port, raw_mode ? "raw RESP" : "argv parsed on IO threads");
+    static const char *order_names[] = {"reply", "single", "chain"};
+    fprintf(stderr, "dlhost: %d engines (%s), %d io threads, port %d, %s, order %s\n", N,
+            copy_dlopen ? "dlopen copies" : "dlmopen", M, port, raw_mode ? "raw RESP" : "argv parsed on IO threads",
+            order_names[order_mode]);
     for (;;) pause();
 }
