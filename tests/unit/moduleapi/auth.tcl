@@ -103,7 +103,36 @@ start_server {tags {"modules"}} {
         } else {
             fail "Subscriber was not disconnected after its channel permission was revoked"
         }
-        r auth.changecount
+        assert_equal 1 [r auth.changecount]
+    }
+
+    foreach api {SetModuleUserACL SetModuleUserACLString} {
+        test "Subscribers are killed when $api revokes their channel permission from a blocked client callback" {
+            r auth.createmoduleuser
+            r auth.setmoduleuseracl allchannels
+            set rd [valkey_deferring_client]
+            test_defer {$rd close}
+            $rd hello 3
+            $rd read
+            $rd auth.authmoduleuser
+            $rd read
+            $rd client setname deathrow
+            $rd read
+            $rd subscribe foo
+            $rd read
+
+            if {$api eq "SetModuleUserACLString"} {
+                $rd auth.blockrevoke string
+            } else {
+                $rd auth.blockrevoke
+            }
+            wait_for_condition 50 100 {
+                ![string match {*deathrow*} [r client list]]
+            } else {
+                fail "Subscriber was not disconnected after its channel permission was revoked"
+            }
+            assert_equal 1 [r auth.changecount]
+        }
     }
 
     test "Unload the module - testacl" {

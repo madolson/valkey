@@ -2687,7 +2687,8 @@ static void ACLKillPubsubClientsIfNeeded(user *new, user *original) {
         client *c = listNodeValue(ln);
         if (c->user != original) continue;
         if (ACLShouldKillPubsubClient(c, channels)) {
-            freeClientOrCloseLater(c, 0);
+            /* Free asynchronously, a module callback may still hold the client. */
+            freeClientOrCloseLater(c, 1);
         }
     }
 
