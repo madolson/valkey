@@ -2812,6 +2812,23 @@ cleanup:
     return error;
 }
 
+/* Like ACLSetUser(), but also disconnects the user's pub/sub clients whose
+ * channel permissions the operation revokes. */
+int ACLSetUserAndKillPubsubClients(user *u, const char *op, ssize_t oplen) {
+    user *tempu = ACLCreateUnlinkedUser();
+    ACLCopyUser(tempu, u);
+    int retval = ACLSetUser(tempu, op, oplen);
+    if (retval == C_OK) {
+        ACLKillPubsubClientsIfNeeded(tempu, u);
+        ACLCopyUser(u, tempu);
+    }
+    /* Callers rely on the errno set by ACLSetUser(). */
+    int saved_errno = errno;
+    ACLFreeUser(tempu);
+    errno = saved_errno;
+    return retval;
+}
+
 /* Given an argument vector describing a user in the form:
  *
  *      user <username> ... ACL rules and flags ...

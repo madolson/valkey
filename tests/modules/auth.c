@@ -43,6 +43,16 @@ int Auth_CreateModuleUser(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int a
     return ValkeyModule_ReplyWithSimpleString(ctx, "OK");
 }
 
+int Auth_SetModuleUserACL(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
+    if (argc != 2) return ValkeyModule_WrongArity(ctx);
+    if (!global) return ValkeyModule_ReplyWithError(ctx, "ERR no module user");
+
+    if (ValkeyModule_SetModuleUserACL(global, ValkeyModule_StringPtrLen(argv[1], NULL)) == VALKEYMODULE_ERR) {
+        return ValkeyModule_ReplyWithError(ctx, "ERR invalid ACL operation");
+    }
+    return ValkeyModule_ReplyWithSimpleString(ctx, "OK");
+}
+
 int Auth_AuthModuleUser(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
     VALKEYMODULE_NOT_USED(argv);
     VALKEYMODULE_NOT_USED(argc);
@@ -241,6 +251,10 @@ int ValkeyModule_OnLoad(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int arg
 
     if (ValkeyModule_CreateCommand(ctx,"auth.createmoduleuser",
         Auth_CreateModuleUser,"",0,0,0) == VALKEYMODULE_ERR)
+        return VALKEYMODULE_ERR;
+
+    if (ValkeyModule_CreateCommand(ctx,"auth.setmoduleuseracl",
+        Auth_SetModuleUserACL,"",0,0,0) == VALKEYMODULE_ERR)
         return VALKEYMODULE_ERR;
 
     if (ValkeyModule_CreateCommand(ctx,"auth.authmoduleuser",

@@ -84,6 +84,27 @@ start_server {tags {"modules"}} {
         assert_equal {auth.redact (redacted) 2 (redacted)} [lindex [lindex $slowlog_resp 0] 3]
     }
 
+    test {Subscribers are killed when a module revokes their channel permission} {
+        r auth.createmoduleuser
+        r auth.setmoduleuseracl allchannels
+        set rd [valkey_deferring_client]
+        test_defer {$rd close}
+        $rd auth.authmoduleuser
+        $rd read
+        $rd client setname deathrow
+        $rd read
+        $rd subscribe foo
+        $rd read
+
+        r auth.setmoduleuseracl resetchannels
+        wait_for_condition 50 100 {
+            ![string match {*deathrow*} [r client list]]
+        } else {
+            fail "Subscriber was not disconnected after its channel permission was revoked"
+        }
+        r auth.changecount
+    }
+
     test "Unload the module - testacl" {
         assert_equal {OK} [r module unload testacl]
     }
