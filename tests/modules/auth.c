@@ -4,6 +4,7 @@
 
 #include "valkeymodule.h"
 
+#include <errno.h>
 #include <string.h>
 #include <unistd.h>
 #include <pthread.h>
@@ -47,8 +48,8 @@ int Auth_SetModuleUserACL(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int a
     if (argc != 2) return ValkeyModule_WrongArity(ctx);
     if (!global) return ValkeyModule_ReplyWithError(ctx, "ERR no module user");
 
-    if (ValkeyModule_SetModuleUserACL(global, ValkeyModule_StringPtrLen(argv[1], NULL)) == VALKEYMODULE_ERR) {
-        return ValkeyModule_ReplyWithError(ctx, "ERR invalid ACL operation");
+    if (ValkeyModule_SetModuleUserACL(global, ValkeyModule_StringPtrLen(argv[1], NULL)) != VALKEYMODULE_OK) {
+        return ValkeyModule_ReplyWithError(ctx, errno == EINVAL ? "ERR EINVAL" : "ERR unexpected errno");
     }
     return ValkeyModule_ReplyWithSimpleString(ctx, "OK");
 }

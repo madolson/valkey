@@ -86,6 +86,7 @@ start_server {tags {"modules"}} {
 
     test {Subscribers are killed when a module revokes their channel permission} {
         r auth.createmoduleuser
+        assert_error {ERR EINVAL} {r auth.setmoduleuseracl not-an-acl-op}
         r auth.setmoduleuseracl allchannels
         set rd [valkey_deferring_client]
         test_defer {$rd close}
