@@ -5054,11 +5054,14 @@ int processCommand(client *c) {
         call(c, flags);
         if (listLength(server.ready_keys) && !isInsideYieldingLongCommand()) {
             /* Serving blocked clients runs their commands with server.current_client
-             * pointing at them, while c is still executing. Protect c so nothing
-             * frees it synchronously, like a client eviction in their processCommand(). */
-            protectClient(c);
+             * pointing at them, while c is still executing. Mark c protected so nothing
+             * frees it synchronously, like a client eviction in their processCommand().
+             * Only the flag: unlike protectClient(), keep the handlers, since the event
+             * loop doesn't run here and removing them costs syscalls on a hot path. */
+            int was_protected = c->flag.protected;
+            c->flag.protected = 1;
             handleClientsBlockedOnKeys();
-            unprotectClient(c);
+            c->flag.protected = was_protected;
         }
     }
     return C_OK;
