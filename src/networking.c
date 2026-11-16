@@ -2577,11 +2577,20 @@ void trimClientQueryBuffer(client *c) {
     }
 }
 
-/* Clients blocked on keys that became ready are served between clients, so their
- * commands never run nested inside another client's. Not while yielding or
- * processing events while blocked, they are served once that is over. */
+/* Clients blocked on keys that became ready are served when no command is running,
+ * so theirs never nest inside another client's. Not while yielding or processing
+ * events while blocked, they are served once that is over. */
 static int shouldServeBlockedClients(void) {
     return listLength(server.ready_keys) && !isInsideYieldingLongCommand() && !ProcessingEventsWhileBlocked;
+}
+
+/* A replicated stream is applied without stopping, so its blocked clients are
+ * served between its commands. They can't nest in its commands, but they may
+ * free it. Returns C_ERR if they did. */
+static int serveBlockedClientsBetweenCommands(client *c) {
+    uint64_t id = c->id;
+    handleClientsBlockedOnKeys();
+    return lookupClientByID(id) == c ? C_OK : C_ERR;
 }
 
 /* Perform processing of the client before moving on to processing the next client.
@@ -4712,13 +4721,15 @@ int processInputBuffer(client *c) {
             break;
         }
 
-        /* A key we just readied has blocked clients. End this client's turn so
-         * beforeNextClient() serves them before our next command. A replicated
-         * stream is applied without stopping, its waiters are served once its
-         * turn ends. */
-        if (shouldServeBlockedClients() && !isReplicatedClient(c)) {
-            queueClientForReprocessing(c);
-            break;
+        /* A key we just readied has blocked clients, serve them before our next command. */
+        if (shouldServeBlockedClients()) {
+            if (isReplicatedClient(c)) {
+                if (serveBlockedClientsBetweenCommands(c) == C_ERR) return C_ERR;
+            } else {
+                /* End this client's turn, beforeNextClient() serves them. */
+                queueClientForReprocessing(c);
+                break;
+            }
         }
 
         c->read_flags = isReplicatedClient(c) ? READ_FLAGS_REPLICATED : 0;
@@ -4769,6 +4780,7 @@ int processInputBuffer(client *c) {
         }
     }
 
+    if (isReplicatedClient(c) && shouldServeBlockedClients()) return serveBlockedClientsBetweenCommands(c);
     return C_OK;
 }
 
@@ -4919,10 +4931,8 @@ void readQueryFromClient(connection *conn) {
             trimCommandQueue(c);
             if (decode_repl_stream && replStreamHasPendingDecode()) full_read = false;
         }
-        /* Don't repeat if beforeNextClient() will serve blocked clients, they may free c. */
         repeat = (c->flag.primary &&
                   !c->flag.close_asap &&
-                  !shouldServeBlockedClients() &&
                   ++iter < REPL_MAX_READS_PER_IO_EVENT &&
                   decoded_bytes < REPL_DECODE_EVENT_BUDGET &&
                   full_read);
