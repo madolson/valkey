@@ -5056,8 +5056,8 @@ int processCommand(client *c) {
             /* Serving blocked clients runs their commands with server.current_client
              * pointing at them, while c is still executing. Mark c protected so nothing
              * frees it synchronously, like a client eviction in their processCommand().
-             * Only the flag: unlike protectClient(), keep the handlers, since the event
-             * loop doesn't run here and removing them costs syscalls on a hot path. */
+             * Set just the flag: protectClient() also removes the handlers, which costs
+             * syscalls on every command that serves blocked clients. */
             int was_protected = c->flag.protected;
             c->flag.protected = 1;
             handleClientsBlockedOnKeys();
