@@ -797,14 +797,12 @@ start_server {} {
         set count 20000
         r rpush src {*}[lrepeat [expr {$count * 2}] [string repeat e 100]]
 
-        # The first waiter's reply pushes clients over the limit, so the
-        # second waiter's processCommand() evicts. The waiters can't be evicted,
-        # which leaves the executing client as the only candidate.
+        # The first waiter's ~2mb reply pushes clients over the limit, so the
+        # second waiter's processCommand() evicts the largest client, the one
+        # still executing.
         set waiters {}
         for {set i 0} {$i < 2} {incr i} {
             set rd [valkey_deferring_client]
-            $rd client no-evict on
-            $rd read
             $rd blmpop 0 1 mylist left count $count
             lappend waiters $rd
         }
@@ -815,7 +813,7 @@ start_server {} {
         $rd client setname executing
         $rd read
         set cmds [client_field executing tot-cmds]
-        while {[client_field executing tot-mem] < [mb 3]} {
+        while {[client_field executing tot-mem] < [mb 4]} {
             $rd get fat
             incr cmds
             wait_for_condition 100 10 {
