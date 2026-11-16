@@ -275,9 +275,6 @@ void bgIteratorClose(bgIterator *iter);
  * BGITERATION HOOKS REQUIRED TO SUPPORT ITERATION - CALLS INSERTED INTO MAIN VALKEY CODE
  ********************************************************************************************/
 
-/* Size of bgIterationEntryMetadata (internal to bgiteration.c) */
-#define BGITERATION_ENTRY_METADATA_SIZE 4
-
 /* Must be called once (and only once) at server startup.  */
 void bgIteration_init(void);
 
@@ -365,7 +362,7 @@ bool bgIteration_isEntryInuse(dbEntry *de);
 /* Notify bgIteration that a dbEntry has been added/modified.
  *  - If caller has a dbEntry*, dbEntryModified is more efficient
  *  - If caller has a dbid/key, a lookup is performed to find the dbEntry */
-void bgIteration_dbEntryModified(dbEntry *de);
+void bgIteration_dbEntryModified(int dbid, dbEntry *de);
 void bgIteration_keyModified(int dbid, const_sds key);
 
 #endif

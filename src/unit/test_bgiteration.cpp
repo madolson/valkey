@@ -30,9 +30,6 @@ size_t objectComputeSize(robj *key, robj *o, size_t sample_size, int dbid);
 //  test that the correct value is passed through.
 #define PRIVDATA reinterpret_cast<void *>(12345)
 
-typedef int32_t bgIterationEntryMetadata; // opaque 4 bytes
-static_assert(sizeof(bgIterationEntryMetadata) == BGITERATION_ENTRY_METADATA_SIZE);
-
 // A bgIteration cleanup function used for testing.
 static int cleanupCount;
 static bool cleanupTerminated;
@@ -282,7 +279,6 @@ class BgIterationTest : public ::testing::Test {
     void SetUp() override {
         server.main_thread_id = pthread_self();
         server.forkless_infrastructure_enabled = 1;
-        objectSetMetadataSize(BGITERATION_ENTRY_METADATA_SIZE);
 
         bgIteration_unitTestDisableCloning();
 
@@ -372,16 +368,6 @@ class BgIterationTest : public ::testing::Test {
     }
 
 
-    void expectDictEntryMetadataMatch(dbEntry *de1, dbEntry *de2) {
-        bgIterationEntryMetadata *dm1 = static_cast<bgIterationEntryMetadata *>(objectGetMetadata(de1));
-        bgIterationEntryMetadata *dm2 = static_cast<bgIterationEntryMetadata *>(objectGetMetadata(de2));
-
-        EXPECT_NE(dm1, nullptr);
-        EXPECT_NE(dm2, nullptr);
-        EXPECT_EQ(*dm1, *dm2);
-    }
-
-
     // Useful when debugging new tests.  It reads/prints all remaining items then crashes.
     void cleanupIteratorDebugPrint(bgIterator *iter) {
         bool done = false;
@@ -419,22 +405,6 @@ class BgIterationTest : public ::testing::Test {
     }
 
 
-    // Make a copy of the metadata
-    void *cloneMetadata(dbEntry *de) {
-        int size = objectGetMetadataSize(de);
-        void *metadata = zmalloc(size);
-        memcpy(metadata, objectGetMetadata(de), size);
-        return metadata;
-    }
-
-
-    // Compare a previous metadata copy to an existing entry
-    void compareAndFreeClonedMetadata(dbEntry *de, void *metadata) {
-        EXPECT_EQ(memcmp(objectGetMetadata(de), metadata, objectGetMetadataSize(de)), 0);
-        zfree(metadata);
-    }
-
-
     // The test expects the next item will be a specific key
     //  The item value is verified against the default unless provided as a parameter.
     void expectReadKey(bgIterator *iter, int itemNum, const char *value = nullptr) {
@@ -457,9 +427,8 @@ class BgIterationTest : public ::testing::Test {
 
 
     // The test expects the next item will be a specific key amd that the item is cloned.
-    //  Metadata is tested (to make sure the clone includes the proper metadata).
     //  The item value is verified against the default unless provided as a parameter.
-    void expectReadClonedKey(bgIterator *iter, int itemNum, void *metadata, const char *value = nullptr) {
+    void expectReadClonedKey(bgIterator *iter, int itemNum, const char *value = nullptr) {
         int db = getDbFromItemNum(itemNum);
 
         bgIteration_feedIterators();
@@ -469,7 +438,6 @@ class BgIterationTest : public ::testing::Test {
         ASSERT_EQ(item->type, BGITERATOR_ITEM_DBENTRY);
         EXPECT_EQ(item->dbid, db);
         EXPECT_TRUE(item->u.dbe.is_cloned);
-        compareAndFreeClonedMetadata(item->u.dbe.de, metadata);
         EXPECT_STREQ(objectGetKey(item->u.dbe.de), keyStr(itemNum));
         if (value) {
             EXPECT_THAT(item->u.dbe.de, robjEqualsStr(value));
@@ -858,23 +826,14 @@ class BgIterationTest : public ::testing::Test {
 
     // Simulates what happens when a write command (SET) actually executes.  This requires a
     //  scenario where we would NOT be blocked on the write.  It actually alters the value of
-    //  the key and updates the metadata.
+    //  the key.
     void simulateUnblockedWriteWithModification(client *c) {
         simulateUnblockedWrite_inCall(c);
 
-        // Fake execution of the command - touch the iterator_epoch counter and swap the value
+        // Fake execution of the command - swap the value
         // We need to duplicate the value because setKey() can reallocate it.
         robj *value = dupStringObject(c->argv[2]);
         setKey(c, c->db, c->argv[1], &value, SETKEY_ADD_OR_UPDATE);
-
-        // Let's make sure that setKey updated the iteration epoch (as it should have)
-        dbEntry *de = dbFind(c->db, static_cast<sds>(objectGetVal(c->argv[1])));
-        bgIterationEntryMetadata *md = static_cast<bgIterationEntryMetadata *>(objectGetMetadata(de));
-        bgIterationEntryMetadata md_after_setkey = *md;
-        // Now update the md again, and it should still match
-        bgIteration_dbEntryModified(de);
-        EXPECT_EQ(md, objectGetMetadata(de)); // the md location shouldn't have changed
-        EXPECT_EQ(md_after_setkey, *md);      // the md value should still be the same
 
         bgIteration_handleCommandReplication(c->db->id, c->cmd, c->argc, c->argv);
         server.in_call--;
@@ -1433,7 +1392,7 @@ TEST_F(BgIterationTest, modPastItem_eventual) {
 /////////////////////////////////////////////////////
 
 // In a consistent iteration, verify that a simple string is properly cloned, and that a write can
-//  occur without blocking.  Validate the cloned item and metadata.
+//  occur without blocking.  Validate the cloned item.
 TEST_F(BgIterationTest, modFutureItem_start_CloneExpeditedItem) {
     // Initialize cloning configurations.
     bgIteration_unitTestEnableCloning(50, 100);
@@ -1454,8 +1413,7 @@ TEST_F(BgIterationTest, modFutureItem_start_CloneExpeditedItem) {
     EXPECT_EQ(status.dbentry_clones_queued, 0u);
 
     // Since item 6 should be cloned, it will not block the client, allowing the write.
-    void *de6_md = cloneMetadata(getItem(6));
-    // This doesn't block, queues a cloned item, and modifies the item (touching metadata)
+    // This doesn't block, queues a cloned item, and modifies the item
     simulateClonedWriteWithModification(it, c);
 
     // At this point, one clone is in the queue.
@@ -1464,7 +1422,7 @@ TEST_F(BgIterationTest, modFutureItem_start_CloneExpeditedItem) {
 
     // On a consistent iterator, the event is expedited in-front of items already in queue!
     //  Read key 6 (which is cloned) out of order.  The value will still match the key.
-    expectReadClonedKey(it, 6, de6_md); // Also validates and frees the metadata
+    expectReadClonedKey(it, 6);
 
     // Quick status check.  At this point, cloned items have not been marked as processed yet.
     bgIteratorGetStatus(it, &status);
@@ -1513,8 +1471,7 @@ TEST_F(BgIterationTest, modFutureItem_start_LargeItemOrClonePoolFull) {
     EXPECT_EQ(status.dbentry_clones_queued, 0u);
 
     // Since item 6 should be cloned, it will not block the client, allowing the write.
-    void *de6_md = cloneMetadata(getItem(6));
-    // This doesn't block, queues a cloned item, and modifies the item (touching metadata)
+    // This doesn't block, queues a cloned item, and modifies the item
     simulateClonedWriteWithModification(it, c6);
 
     // At this point, one clone is in the queue.
@@ -1541,7 +1498,7 @@ TEST_F(BgIterationTest, modFutureItem_start_LargeItemOrClonePoolFull) {
 
     // On a consistent iterator, the expedited item in-front of items already in queue!
     //  Read key 6 out of order.
-    expectReadClonedKey(it, 6, de6_md);
+    expectReadClonedKey(it, 6);
 
     // Now, when we expect to read key 7, which was expedited, key 6 will be released back to Valkey
     //  and the clone will be deallocated here.
@@ -2103,6 +2060,43 @@ TEST_F(BgIterationTest, earlyTerminationFromMainAfterChildClose) {
     bgIteration_feedIterators();
     EXPECT_EQ(cleanupCount, 1);
     EXPECT_TRUE(cleanupTerminated);
+}
+
+
+// A consistent iteration marks a key created ahead of its cursor so that its scan skips it.  If
+//  the iteration is terminated before the scan reaches the key, the mark is left behind and must
+//  be swept, or the next consistent iteration would skip the key too.
+TEST_F(BgIterationTest, earlyTermination_start_sweepsSkipMarks) {
+    // Using DB1 so we have lots of buckets
+    simpleDelItem(14); // Delete the item before iterator creation
+    bgIterator *it = bgIteratorCreateFullScanIter("iter", BGITERATOR_CONSISTENCY_START, NULL,
+                                                  iteratorCleanupFn, PRIVDATA);
+    expectReadKey(it, 0);
+
+    // Create key 14 ahead of the cursor.  It isn't part of this snapshot, so it gets marked.
+    c = getWriteClient(14, "xxx");
+    simulateUnblockedWriteWithModification(c);
+    EXPECT_TRUE(getItem(14)->bgiter_skip);
+
+    // Terminate before the scan reaches key 14
+    bgIteratorTerminate(it);
+    bgIteration_feedIterators();
+    bgIteratorItem *item = bgIteratorRead(it);
+    EXPECT_EQ(item->type, BGITERATOR_ITEM_TERMINATED);
+    bgIteratorClose(it);
+    bgIteration_feedIterators(); // releases the iterator, then runs the sweep (no time budget in unit tests)
+    EXPECT_EQ(cleanupCount, 1);
+    EXPECT_TRUE(cleanupTerminated);
+
+    for (int i = 0; i < TOTAL_ITEMS; i++) EXPECT_FALSE(getItem(i)->bgiter_skip) << "item " << i;
+
+    // The next consistent iteration sees every key, including key 14
+    it = bgIteratorCreateFullScanIter("iter2", BGITERATOR_CONSISTENCY_START, NULL,
+                                      iteratorCleanupFn, PRIVDATA);
+    expectReadKeySequence(it, 0, 13);
+    expectReadKey(it, 14, "xxx");
+    expectReadKey(it, LAST_ITEM);
+    expectReadComplete(it);
 }
 
 

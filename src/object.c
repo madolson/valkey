@@ -205,6 +205,7 @@ static robj *createUnembeddedObjectWithKeyAndExpire(int type, void *val, const_s
     objectSetLRU(o, 0);
     o->hasembkey = has_embkey;
     o->hasembval = 0;
+    o->bgiter_skip = 0;
     o->val_ptr = val;
 
     /* If the allocation has enough space for an expire field, add it even if we
@@ -312,6 +313,7 @@ static robj *createEmbeddedStringObjectWithKeyAndExpire(const char *val_ptr,
     o->hasexpire = (expire != EXPIRY_NONE);
     o->hasembkey = has_embkey;
     o->hasembval = 1;
+    o->bgiter_skip = 0;
 
     /* If the allocation has enough space for an expire field, add it even if we
      * don't need it now. Then we don't need to realloc if it's needed later. */
@@ -458,7 +460,11 @@ robj *objectSetExpire(robj *o, long long expire) {
     } else if (expire == EXPIRY_NONE) {
         return o;
     } else {
-        return objectSetKeyAndExpire(o, objectGetKey(o), expire);
+        /* Same key, same position: the reallocated entry keeps its bgIteration skip mark. */
+        unsigned bgiter_skip = o->bgiter_skip;
+        robj *new = objectSetKeyAndExpire(o, objectGetKey(o), expire);
+        new->bgiter_skip = bgiter_skip;
+        return new;
     }
 }
 

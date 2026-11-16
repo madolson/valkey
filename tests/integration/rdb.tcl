@@ -790,6 +790,43 @@ start_server {overrides {forkless-infrastructure-enabled yes save ""}} {
 }
 
 start_server {overrides {forkless-infrastructure-enabled yes save ""}} {
+    test "keys created during a cancelled forkless bgsave are in the next forkless bgsave" {
+        populate 1000 "" 16
+        r config set rdb-key-save-delay 10000
+        r config set forkless-policy prefer-forkless
+        r bgsave
+        wait_for_condition 50 100 {
+            [s rdb_bgsave_in_progress] == 1
+        } else {
+            fail "forkless bgsave did not start"
+        }
+        assert_equal [s rdb_current_bgsave_type] forkless
+
+        # Most of these land ahead of the scan, so the cancelled save leaves them marked
+        for {set i 0} {$i < 100} {incr i} {
+            r set after_$i v$i
+        }
+        assert {[r bgsave cancel] eq {Background saving cancelled}}
+        wait_for_condition 50 100 {
+            [s rdb_bgsave_in_progress] == 0
+        } else {
+            fail "forkless bgsave did not stop"
+        }
+
+        r config set rdb-key-save-delay 0
+        r bgsave
+        waitForBgsave r
+        assert_equal [s rdb_last_bgsave_status] ok
+
+        catch {r debug reload nosave}
+        assert_equal [r dbsize] 1100
+        for {set i 0} {$i < 100} {incr i} {
+            assert_equal [r get after_$i] v$i
+        }
+    } {} {needs:debug}
+}
+
+start_server {overrides {forkless-infrastructure-enabled yes save ""}} {
     test "SWAPDB during forkless bgsave" {
         
         # Populate 5 databases with all data types

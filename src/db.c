@@ -380,6 +380,7 @@ static void dbSetValue(serverDb *db, robj *key, robj **valref, int overwrite, vo
         objectSetLRU(val, objectGetLRU(old));
         long long expire = objectGetExpire(old);
         new = objectSetKeyAndExpire(val, objectGetVal(key), expire);
+        new->bgiter_skip = old->bgiter_skip; /* Same key, same position. */
         bgIteration_updateDbEntryPtr(old, new);
         *oldref = new;
         /* Replace the old value at its location in the expire space. */
@@ -450,7 +451,7 @@ void setKey(client *c, serverDb *db, robj *key, robj **valref, int flags) {
     } else {
         dbSetValue(db, key, valref, 1, NULL);
     }
-    bgIteration_dbEntryModified(*valref);
+    bgIteration_dbEntryModified(db->id, *valref);
     if (!(flags & SETKEY_KEEPTTL)) removeExpire(db, key);
     if (!(flags & SETKEY_NO_SIGNAL)) signalModifiedKey(c, db, key);
 }
