@@ -4713,8 +4713,10 @@ int processInputBuffer(client *c) {
         }
 
         /* A key we just readied has blocked clients. End this client's turn so
-         * beforeNextClient() serves them before our next command. */
-        if (shouldServeBlockedClients()) {
+         * beforeNextClient() serves them before our next command. A replicated
+         * stream is applied without stopping, its waiters are served once its
+         * turn ends. */
+        if (shouldServeBlockedClients() && !isReplicatedClient(c)) {
             queueClientForReprocessing(c);
             break;
         }
