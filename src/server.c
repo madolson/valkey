@@ -5052,7 +5052,6 @@ int processCommand(client *c) {
     } else {
         int flags = CMD_CALL_FULL;
         call(c, flags);
-        if (listLength(server.ready_keys) && !isInsideYieldingLongCommand()) handleClientsBlockedOnKeys();
     }
     return C_OK;
 }

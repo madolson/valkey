@@ -783,5 +783,65 @@ start_server {} {
     } {} {needs:debug tls:skip}
 }
 
+start_server {} {
+    test {Client whose command serves blocked clients is evicted safely} {
+        r client no-evict on
+        r config set maxmemory-clients 100mb
+        r config set client-output-buffer-limit "normal 0 0 0"
+        # Keep replies in the output buffers so they count toward client memory.
+        r config set min-io-threads-avoid-copy-reply 0
+        r config set min-string-size-avoid-copy-reply 0
+        r config set min-string-size-avoid-copy-reply-threaded 0
+
+        r setrange fat 300000 x
+        set count 20000
+        r rpush src {*}[lrepeat [expr {$count * 2}] [string repeat e 100]]
+
+        # The first waiter's ~2mb reply pushes clients over the limit, so the
+        # second waiter's processCommand() evicts the largest client, the one
+        # still executing.
+        set waiters {}
+        for {set i 0} {$i < 2} {incr i} {
+            set rd [valkey_deferring_client]
+            $rd blmpop 0 1 mylist left count $count
+            lappend waiters $rd
+        }
+        wait_for_blocked_clients_count 2
+
+        # Grow the executing client with unread replies.
+        set rd [valkey_deferring_client]
+        $rd client setname executing
+        $rd read
+        set cmds [client_field executing tot-cmds]
+        while {[client_field executing tot-mem] < [mb 4]} {
+            $rd get fat
+            incr cmds
+            wait_for_condition 100 10 {
+                [client_field executing tot-cmds] >= $cmds
+            } else {
+                fail "executing client did not run its GET"
+            }
+        }
+        r config set maxmemory-clients [expr {[s mem_clients_normal] + [mb 1]}]
+        set evicted [s evicted_clients]
+
+        # RENAME readies mylist while the executing client is mid-command.
+        $rd rename src mylist
+
+        foreach w $waiters {
+            assert_equal $count [llength [lindex [$w read] 1]]
+            $w close
+        }
+        wait_for_condition 100 10 {
+            ![client_exists executing]
+        } else {
+            fail "executing client was not evicted"
+        }
+        assert_equal [expr {$evicted + 1}] [s evicted_clients]
+        assert_equal 0 [r exists src]
+        $rd close
+    }
+}
+
 } ;# tags
 

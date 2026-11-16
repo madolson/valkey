@@ -2577,10 +2577,28 @@ void trimClientQueryBuffer(client *c) {
     }
 }
 
+/* Clients blocked on keys that became ready are served when no command is running,
+ * so theirs never nest inside another client's. Not while yielding or processing
+ * events while blocked, they are served once that is over. */
+static int shouldServeBlockedClients(void) {
+    return listLength(server.ready_keys) && !isInsideYieldingLongCommand() && !ProcessingEventsWhileBlocked;
+}
+
+/* A replicated stream is applied without stopping, so its blocked clients are
+ * served between its commands. They can't nest in its commands, but they may
+ * free it. Returns C_ERR if they did. */
+static int serveBlockedClientsBetweenCommands(client *c) {
+    uint64_t id = c->id;
+    handleClientsBlockedOnKeys();
+    return lookupClientByID(id) == c ? C_OK : C_ERR;
+}
+
 /* Perform processing of the client before moving on to processing the next client.
  * This is useful for performing operations that affect the global state but can't
  * wait until we're done with all clients. In other words, it can't wait until beforeSleep().
- * With IO threads enabled, this function offloads the write to the IO threads if possible. */
+ * With IO threads enabled, this function offloads the write to the IO threads if possible.
+ * It also serves the clients blocked on keys that became ready, which may free the client,
+ * so don't use it afterwards. */
 void beforeNextClient(client *c) {
     /* Notice, this code is also called from 'processUnblockedClients'.
      * But in case of a module blocked client (see RM_Call 'K' flag) we do not reach this code path.
@@ -2621,15 +2639,17 @@ void beforeNextClient(client *c) {
      * users (see ACL LOAD). */
     if (c->flag.close_asap) {
         freeClient(c);
-        return;
+    } else {
+        updateClientMemUsageAndBucket(c);
+        /* If IO threads are enabled try to write immediately the reply instead of waiting to beforeSleep,
+         * unless aof_fsync is set to always in which case we need to wait for beforeSleep after writing the aof buffer. */
+        if (server.aof_fsync != AOF_FSYNC_ALWAYS) {
+            trySendWriteToIOThreads(c);
+        }
     }
 
-    updateClientMemUsageAndBucket(c);
-    /* If IO threads are enabled try to write immediately the reply instead of waiting to beforeSleep,
-     * unless aof_fsync is set to always in which case we need to wait for beforeSleep after writing the aof buffer. */
-    if (server.aof_fsync != AOF_FSYNC_ALWAYS) {
-        trySendWriteToIOThreads(c);
-    }
+    /* Serve the clients blocked on keys c readied. They may free c. */
+    if (shouldServeBlockedClients()) handleClientsBlockedOnKeys();
 }
 
 /* Free the clients marked as CLOSE_ASAP, return the number of clients
@@ -4701,6 +4721,17 @@ int processInputBuffer(client *c) {
             break;
         }
 
+        /* A key we just readied has blocked clients, serve them before our next command. */
+        if (shouldServeBlockedClients()) {
+            if (isReplicatedClient(c)) {
+                if (serveBlockedClientsBetweenCommands(c) == C_ERR) return C_ERR;
+            } else {
+                /* End this client's turn, beforeNextClient() serves them. */
+                queueClientForReprocessing(c);
+                break;
+            }
+        }
+
         c->read_flags = isReplicatedClient(c) ? READ_FLAGS_REPLICATED : 0;
         c->read_flags |= authRequired(c) ? READ_FLAGS_AUTH_REQUIRED : 0;
 
@@ -4749,6 +4780,7 @@ int processInputBuffer(client *c) {
         }
     }
 
+    if (isReplicatedClient(c) && shouldServeBlockedClients()) return serveBlockedClientsBetweenCommands(c);
     return C_OK;
 }
 

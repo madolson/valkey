@@ -2138,3 +2138,28 @@ start_server {tags {"stream"}} {
         assert_match "*wrong number of arguments for 'xinfo|help' command" $e
     }
 }
+
+start_server {tags {"stream repl external:skip"}} {
+    start_server {} {
+        set primary [srv -1 client]
+        set replica [srv 0 client]
+
+        test {Blocked XREAD on a replica is served after each replicated command} {
+            $replica replicaof [srv -1 host] [srv -1 port]
+            wait_for_sync $replica
+
+            set rd [valkey_deferring_client]
+            $rd xread block 0 streams s $
+            wait_for_blocked_clients_count 1
+
+            # Sent together so the replica applies both in one read.
+            set rdp [valkey_deferring_client -1]
+            $rdp write "XADD s MAXLEN 1 1-0 a 1\r\nXADD s MAXLEN 1 2-0 a 2\r\n"
+            $rdp flush
+            assert_equal {{s {{1-0 {a 1}}}}} [$rd read]
+
+            $rd close
+            $rdp close
+        }
+    }
+}
