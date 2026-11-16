@@ -4419,6 +4419,12 @@ void commandProcessed(client *c) {
  * The function returns C_ERR in case the client was freed as a side effect
  * of processing the command; otherwise, C_OK is returned. */
 int processCommandAndResetClient(client *c) {
+    /* A client's command never runs nested inside another one's, except when a
+     * long command processes events while blocked. */
+    static int nesting = 0;
+    serverAssert(nesting == 0 || ProcessingEventsWhileBlocked);
+    nesting++;
+
     int deadclient = 0;
     client *old_client = server.current_client;
     server.current_client = c;
@@ -4441,6 +4447,7 @@ int processCommandAndResetClient(client *c) {
     /* performEvictions may flush replica output buffers. This may
      * result in a replica, that may be the active client, to be
      * freed. */
+    nesting--;
     return deadclient ? C_ERR : C_OK;
 }
 
