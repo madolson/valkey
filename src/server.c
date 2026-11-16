@@ -5052,7 +5052,14 @@ int processCommand(client *c) {
     } else {
         int flags = CMD_CALL_FULL;
         call(c, flags);
-        if (listLength(server.ready_keys) && !isInsideYieldingLongCommand()) handleClientsBlockedOnKeys();
+        if (listLength(server.ready_keys) && !isInsideYieldingLongCommand()) {
+            /* Serving blocked clients runs their commands with server.current_client
+             * pointing at them, while c is still executing. Protect c so nothing
+             * frees it synchronously, like a client eviction in their processCommand(). */
+            protectClient(c);
+            handleClientsBlockedOnKeys();
+            unprotectClient(c);
+        }
     }
     return C_OK;
 }
