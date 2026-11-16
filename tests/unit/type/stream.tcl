@@ -2156,7 +2156,7 @@ start_server {tags {"stream repl external:skip"}} {
             set rdp [valkey_deferring_client -1]
             $rdp write "XADD s MAXLEN 1 1-0 a 1\r\nXADD s MAXLEN 1 2-0 a 2\r\n"
             $rdp flush
-            assert_equal {s {{1-0 {a 1}}}} [$rd read]
+            assert_equal {{s {{1-0 {a 1}}}}} [$rd read]
 
             $rd close
             $rdp close
