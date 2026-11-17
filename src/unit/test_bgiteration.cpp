@@ -1446,6 +1446,35 @@ TEST_F(BgIterationTest, modFutureItem_start_CloneExpeditedItem) {
 }
 
 
+// In a consistent iteration, an expedited key is marked so the scan skips it.  dbReplaceValue
+//  reallocates the entry without notifying bgIteration, so the mark must move with it, or the scan
+//  emits the key a second time.
+TEST_F(BgIterationTest, modFutureItem_start_ExpeditedItemReplacedInPlace) {
+    // Initialize cloning configurations, so the write is not blocked.
+    bgIteration_unitTestEnableCloning(50, 100);
+
+    bgIterator *it = bgIteratorCreateFullScanIter("iter", BGITERATOR_CONSISTENCY_START, NULL,
+                                                  iteratorCleanupFn, PRIVDATA);
+    expectReadKey(it, 0);
+
+    // Expedite key 6 (as a clone), then replace its value in place
+    c = getWriteClient(6, "xxx");
+    dbEntry *de6 = getItem(6);
+    simulateUnblockedWrite_inCall(c);
+    robj *value = createStringObjectFromCString("xxx");
+    dbReplaceValue(c->db, c->argv[1], &value);
+    EXPECT_NE(getItem(6), de6); // the entry was reallocated
+    bgIteration_handleCommandReplication(c->db->id, c->cmd, c->argc, c->argv);
+    server.in_call--;
+
+    expectReadClonedKey(it, 6); // the value from before the write
+    expectReadKeySequence(it, 1, 5);
+    // Key 6 is not emitted again
+    expectReadKeySequence(it, 7, LAST_ITEM);
+    expectReadComplete(it);
+}
+
+
 // Check that cloning for simple strings is respecting the size limits and pool size.  On a
 //  consistent iteration, we expect to block or clone on all future keys.  We validate that we can
 //  clone if the item is small enough and the cloning pool has more space left.

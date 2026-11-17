@@ -364,7 +364,8 @@ struct bgIterator {
 
     /* A set of dbEntry, compared by pointer.  Used to track items which have already been iterated
      * over by out-of-order expedited processing.  Ensures a bgIterator does not try to reprocess
-     * items.  Used only by main thread. */
+     * items.  Used only by main thread.  Always empty for a consistent iterator, which marks those
+     * items with bgiter_skip instead. */
     hashtable *early_iterate_entries;
 
     mutexQueue *items_for_iterator; // Created/Destroyed in main thread, used in both (threadsafe)
@@ -899,8 +900,9 @@ static void returnCurrentItemToMainThread(bgIterator *it) {
 /* =============================================================================================
  *                        Skip mark sweep
  * =============================================================================================
- * A consistent iterator sets bgiter_skip on keys created or modified ahead of its cursor, and its
- * scan clears each mark as it passes the key, so a completed iteration leaves no marks.  A
+ * A consistent iterator sets bgiter_skip on keys it handles ahead of its cursor (expedited, created,
+ * or modified), and its scan clears each mark as it passes the key, so a completed iteration leaves
+ * no marks.  A
  * terminated one leaves marks on keys its scan never reached, and the next consistent iterator
  * would wrongly skip them.  The sweep clears them with a scan of the whole keyspace, run in
  * time-budgeted steps from the feed task.  Nothing sets marks while it runs: keys start unmarked,
@@ -980,6 +982,7 @@ static void bgIteratorRelease(bgIterator *it) {
     it->keyset_iter->release(it->keyset_iter);
     it->keyset_iter = NULL;
 
+    serverAssert(!(it->iteration_flags & BGITERATOR_FLAG_CONSISTENT) || hashtableSize(it->early_iterate_entries) == 0);
     hashtableRelease(it->early_iterate_entries);
     it->early_iterate_entries = NULL;
 
@@ -1087,8 +1090,8 @@ static void feedIterator(bgIterator *it, monotime end_time_us) {
             dbEntry *de;
             fifoPop(dbEntryFifo, (void **)&de);
 
-            /* Remove new/modified items during consistent iteration.  The scan has now passed the
-             * key, so the mark is no longer needed. */
+            /* Remove items a consistent iteration already handled (expedited, created, or
+             * modified).  The scan has now passed the key, so the mark is no longer needed. */
             if (it->iteration_flags & BGITERATOR_FLAG_CONSISTENT && de->bgiter_skip) {
                 de->bgiter_skip = 0;
                 continue;
@@ -1136,8 +1139,12 @@ static void feedIterator(bgIterator *it, monotime end_time_us) {
 
 
 static bool addEarlyIterationKey(bgIterator *it, dbEntry *earlyEntry, int cur_dbid) {
-    bool wasAdded = hashtableAdd(it->early_iterate_entries, earlyEntry);
-    serverAssert(wasAdded);
+    if (it->iteration_flags & BGITERATOR_FLAG_CONSISTENT) {
+        earlyEntry->bgiter_skip = 1; // Set before the entry is queued to the iteration client
+    } else {
+        bool wasAdded = hashtableAdd(it->early_iterate_entries, earlyEntry);
+        serverAssert(wasAdded);
+    }
 
     int dbid = (it->iteration_flags & BGITERATOR_FLAG_CONSISTENT)
                    ? it->keyset_iter->originalDb(it->keyset_iter, cur_dbid)
@@ -1179,7 +1186,7 @@ static bool iteratorHasPassedKey(bgIterator *it, int dbid, const_sds key, dbEntr
 
     if (de && hashtableFind(it->early_iterate_entries, de, NULL)) return true;
 
-    // Created or modified during a consistent iteration, so not part of its snapshot.
+    // Already handled by a consistent iteration: expedited, or created/modified since it started.
     if (de && (it->iteration_flags & BGITERATOR_FLAG_CONSISTENT) && de->bgiter_skip) return true;
 
     return false;
@@ -2112,7 +2119,9 @@ static bgIterator *bgIteratorCreate(const char *name,
     it->iteration_type = iter_type;
     it->keyset_iter = keyset_iter;
     it->early_iterate_entries = hashtableCreate(&dbEntryPtrHashtableType);
-    hashtableExpand(it->early_iterate_entries, BGITER_EARLY_ITERATE_DICT_INITIAL_SIZE);
+    if (!(flags & BGITERATOR_FLAG_CONSISTENT)) {
+        hashtableExpand(it->early_iterate_entries, BGITER_EARLY_ITERATE_DICT_INITIAL_SIZE);
+    }
     it->current_item = NULL;
     it->client_is_active = false;
     it->completed = false;
@@ -2754,7 +2763,7 @@ void bgIteration_dbEntryModified(int dbid, dbEntry *de) {
     sds key = objectGetKey(de);
 
     /* A key created or modified ahead of a consistent iterator's cursor is not part of its
-     * snapshot.  (An existing key would have been expedited before the write.) */
+     * snapshot.  (An existing key would have been expedited, and so marked, before the write.) */
     listIter li;
     listNode *node;
     listRewind(allIterators, &li);

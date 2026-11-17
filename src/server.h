@@ -902,8 +902,8 @@ struct serverObject {
     unsigned hasexpire : 1;
     unsigned hasembkey : 1;
     unsigned hasembval : 1;
-    /* Set on a key created or modified ahead of the cursor of the running consistent bgIterator.
-     * Its scan skips the key and clears the bit (see bgiteration.c). */
+    /* Set on a key the running consistent bgIterator handled ahead of its cursor: expedited,
+     * created, or modified.  Its scan skips the key and clears the bit (see bgiteration.c). */
     unsigned bgiter_skip : 1;
     unsigned refcount : OBJ_REFCOUNT_BITS;
     void *val_ptr; /* Not always present. Use objectGetVal(obj) and
