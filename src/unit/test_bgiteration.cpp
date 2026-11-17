@@ -1079,6 +1079,29 @@ TEST_F(BgIterationTest, orderedIteration) {
 
 
 // Test that two simultaneous iterations work properly.
+// There is one skip mark per key, so a second consistent iterator is refused while one runs.
+TEST_F(BgIterationTest, secondConsistentIteratorIsRefused) {
+    bgIterator *it1 = bgIteratorCreateFullScanIter("consistent1", BGITERATOR_CONSISTENCY_START, NULL,
+                                                   iteratorCleanupFn, PRIVDATA);
+    ASSERT_NE(it1, nullptr);
+    EXPECT_EQ(bgIteratorCreateFullScanIter("consistent2", BGITERATOR_CONSISTENCY_START, NULL,
+                                           iteratorCleanupFn, PRIVDATA),
+              nullptr);
+    EXPECT_EQ(bgIteratorFind("consistent2"), nullptr);
+
+    // An iterator without consistency can still run alongside it
+    bgIterator *it2 = bgIteratorCreateFullScanIter("simple", BGITERATOR_CONSISTENCY_NONE, NULL,
+                                                   iteratorCleanupFn, PRIVDATA);
+    ASSERT_NE(it2, nullptr);
+
+    expectReadKeySequence(it1, 0, LAST_ITEM);
+    expectReadComplete(it1);
+    expectReadKeySequence(it2, 0, LAST_ITEM);
+    expectReadComplete(it2);
+    EXPECT_EQ(cleanupCount, 2);
+}
+
+
 TEST_F(BgIterationTest, twoOrderedIterations) {
     bgIterator *it1 = bgIteratorCreateFullScanIter("simple1", BGITERATOR_CONSISTENCY_NONE, NULL,
                                                    iteratorCleanupFn, PRIVDATA);

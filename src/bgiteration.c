@@ -2119,7 +2119,10 @@ static bgIterator *bgIteratorCreate(const char *name,
         listRewind(allIterators, &li);
         while ((node = listNext(&li)) != NULL) {
             bgIterator *other = listNodeValue(node);
-            serverAssert(!(other->iteration_flags & BGITERATOR_FLAG_CONSISTENT));
+            if (other->iteration_flags & BGITERATOR_FLAG_CONSISTENT) {
+                keyset_iter->release(keyset_iter);
+                return NULL;
+            }
         }
         // Callers wait for marks left by a terminated consistent iterator to be cleared.
         serverAssert(!skipSweep.pending);

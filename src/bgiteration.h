@@ -96,7 +96,10 @@ typedef void (*bgIteratorCleanupFunc)(bool terminated, void *privdata);
  * to implement the iteration client which will read from the returned bgIterator.
  *
  * There is no need to delete/destroy a bgIterator.  It will automatically be cleaned up after the
- * last item is read. */
+ * last item is read.
+ *
+ * Only one BGITERATOR_CONSISTENCY_START iterator can run at a time.  Creating a second one returns
+ * NULL. */
 bgIterator *bgIteratorCreateFullScanIter(
     const char *name,
     bgIteratorConsistency consistency,
@@ -124,7 +127,10 @@ bgIterator *bgIteratorCreateFullScanIter(
  * just copy its data and leave the array untouched.
  *
  * There is no need to delete/destroy a bgIterator.  It will automatically be cleaned up after the
- * last item is read. */
+ * last item is read.
+ *
+ * Only one BGITERATOR_CONSISTENCY_START iterator can run at a time.  Creating a second one returns
+ * NULL. */
 bgIterator *bgIteratorCreateSlotsIter(
     const char *name,
     bgIteratorConsistency consistency,
