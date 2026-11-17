@@ -1811,6 +1811,16 @@ start_server {overrides {save ""}} {
         }
     }
 }
+
+start_server {overrides {save "" maxmemory-policy allkeys-lfu}} {
+    test {bgsave with an LFU policy does not dirty the saved keys} {
+        populate 200000
+        r bgsave
+        waitForBgsave r
+        # Saving reads each key's LFU counter. Writing it back would copy every page holding a key.
+        assert_lessthan [s rdb_last_cow_size] [expr {[s used_memory] / 4}]
+    }
+}
 } ;# system_name
 
 exec cp -f tests/assets/scriptbackup.rdb $server_path
