@@ -1723,7 +1723,8 @@ long long serverCron(struct aeEventLoop *eventLoop, long long id, void *clientDa
              * CONFIG_BGSAVE_RETRY_DELAY seconds already elapsed. */
             if (server.dirty >= sp->changes && server.unixtime - server.lastsave > sp->seconds &&
                 (server.unixtime - server.lastbgsave_try > CONFIG_BGSAVE_RETRY_DELAY ||
-                 server.lastbgsave_status == C_OK)) {
+                 server.lastbgsave_status == C_OK) &&
+                !server.rdb_bgsave_scheduled) { /* A scheduled save is started below. */
                 serverLog(LL_NOTICE, "%d changes in %d seconds. Saving...", sp->changes, (int)sp->seconds);
                 rdbStartBgsave(resolveBgsaveType());
                 break;
@@ -3173,15 +3174,6 @@ void initServer(void) {
     }
     server.dbnum = server.cluster_enabled ? server.config_databases_cluster : server.config_databases;
     server.db = zcalloc(sizeof(serverDb *) * server.dbnum);
-
-    /* Set object metadata size before creating any database key objects */
-    if (server.forkless_infrastructure_enabled) {
-        /* NOTE: At this time, there is only one reason for dbEntry metadata: bgIteration.  However,
-         * if/when new metadata options are added, we will need to compute the size of a variable
-         * size metadata, and provide appropriate accessors to access the specific portion of the
-         * metadata (each of which may/may not exist, based on immutable startup parameters).  */
-        objectSetMetadataSize(BGITERATION_ENTRY_METADATA_SIZE);
-    }
 
     createDatabaseIfNeeded(0); /* The default database should always exist */
 

@@ -201,13 +201,6 @@ enum {
     BGITER_CYCLE_BUDGET_MAX_MS = 10                  // Maximum time limit when starvation seen
 };
 
-// dbEntry metadata
-typedef struct {
-    uint32_t iterator_epoch; // iterator epoch of last modification
-} bgIterationEntryMetadata;
-static_assert(sizeof(bgIterationEntryMetadata) == BGITERATION_ENTRY_METADATA_SIZE, "");
-
-
 // These can be tweaked by unit tests
 static int bgiter_max_clone_item_bytes = BGITER_MAX_CLONE_ITEM_BYTES;
 static int bgiter_max_clone_pool_bytes = BGITER_MAX_CLONE_POOL_BYTES;
@@ -364,15 +357,15 @@ struct bgIterator {
     bgIteratorCleanupFunc cleanup;   // Optional cleanup function to be run on main thread
     void *privdata;                  // Client's private data to be passed to cleanup function
 
-    int iteration_flags;                 // Consistent and/or Replication
-    int iteration_type;                  // Full scan or cluster slot
-    uint32_t consistent_modification_id; // iterator epoch at time of iterator creation
+    int iteration_flags; // Consistent and/or Replication
+    int iteration_type;  // Full scan or cluster slot
 
     genericIterator *keyset_iter; // Low-level iterator (polymorphic)
 
     /* A set of dbEntry, compared by pointer.  Used to track items which have already been iterated
      * over by out-of-order expedited processing.  Ensures a bgIterator does not try to reprocess
-     * items.  Used only by main thread. */
+     * items.  Used only by main thread.  Always empty for a consistent iterator, which marks those
+     * items with bgiter_skip instead. */
     hashtable *early_iterate_entries;
 
     mutexQueue *items_for_iterator; // Created/Destroyed in main thread, used in both (threadsafe)
@@ -456,9 +449,6 @@ static int last_item_count_target;
 
 // Eventloop ID of the timerproc (or AE_DELETED_EVENT_ID)
 static long long bgIterator_timeproc_id;
-
-// Incremented on each new iteration, this is updated in dbEntry metadata whenever an entry is modified.
-static uint32_t bgIteration_epoch = 1;
 
 /* If true, the iterators' cur_cmd_may_replicate flag was determined in the last call to
  * blockClientIfRequired.  Otherwise, we skipped over computing this flag (maybe because it was a
@@ -819,13 +809,10 @@ static dbEntry *tryCloneDbEntry(dbEntry *de) {
 
         if (itemSize <= bgiter_max_clone_item_bytes) {
             bgiteration_current_clone_memory_pool_size += itemSize;
-            dbEntry *clone = createStringObjectWithKeyAndExpire((char *)objectGetVal(de),
-                                                                sdslen(objectGetVal(de)),
-                                                                objectGetKey(de),
-                                                                objectGetExpire(de));
-            ((bgIterationEntryMetadata *)objectGetMetadata(clone))->iterator_epoch =
-                ((bgIterationEntryMetadata *)objectGetMetadata(de))->iterator_epoch;
-            return clone;
+            return createStringObjectWithKeyAndExpire((char *)objectGetVal(de),
+                                                      sdslen(objectGetVal(de)),
+                                                      objectGetKey(de),
+                                                      objectGetExpire(de));
         }
     }
 
@@ -911,6 +898,92 @@ static void returnCurrentItemToMainThread(bgIterator *it) {
 
 
 /* =============================================================================================
+ *                        Skip mark sweep
+ * =============================================================================================
+ * A consistent iterator sets bgiter_skip on keys it handles ahead of its cursor (expedited, created,
+ * or modified), and its scan clears each mark as it passes the key, so a completed iteration leaves
+ * no marks.  A
+ * terminated one leaves marks on keys its scan never reached, and the next consistent iterator
+ * would wrongly skip them.  The sweep clears them with a scan of the whole keyspace, run in
+ * time-budgeted steps from the feed task.  Nothing sets marks while it runs: keys start unmarked,
+ * a key re-added under a new name or DB gets a fresh unmarked object, and the next consistent
+ * iterator finishes the sweep before it starts.  The scan is not paused for rehashing; it only
+ * needs to visit each key that exists for the whole sweep at least once. */
+static struct {
+    bool pending;
+    int dbid;      // current DB index
+    int didx;      // hashtable index within the DB's kvstore
+    size_t cursor; // cursor within the hashtable
+} skipSweep;
+
+// Position the sweep on the first non-empty hashtable at or after skipSweep.dbid.
+static void skipSweepSeekDb(void) {
+    skipSweep.cursor = 0;
+    for (; skipSweep.dbid < server.dbnum; skipSweep.dbid++) {
+        serverDb *db = server.db[skipSweep.dbid];
+        if (db == NULL || db->keys == NULL) continue;
+        skipSweep.didx = kvstoreGetFirstNonEmptyHashtableIndex(db->keys);
+        if (skipSweep.didx != KVSTORE_INDEX_NOT_FOUND) return;
+    }
+    skipSweep.pending = false;
+}
+
+// (Re)start the sweep from the first DB.
+static void skipSweepStart(void) {
+    skipSweep.pending = true;
+    skipSweep.dbid = 0;
+    skipSweepSeekDb();
+}
+
+static void skipSweepScanCallback(void *privdata, void *entry) {
+    UNUSED(privdata);
+    dbEntry *de = entry;
+    if (de->bgiter_skip) de->bgiter_skip = 0; // Don't dirty unmarked entries
+}
+
+static void skipSweepStep(monotime end_time_us) {
+    while (skipSweep.pending && getMonotonicUs() < end_time_us) {
+        serverDb *db = server.db[skipSweep.dbid];
+        kvstore *kvs = (db != NULL) ? db->keys : NULL;
+        hashtable *ht = (kvs != NULL) ? kvstoreGetHashtable(kvs, skipSweep.didx) : NULL;
+        skipSweep.cursor = (ht != NULL) ? hashtableScan(ht, skipSweep.cursor, skipSweepScanCallback, NULL) : 0;
+        if (skipSweep.cursor != 0) continue;
+
+        // Done with this hashtable.  Move to the next one, or the next DB.
+        skipSweep.didx = (kvs != NULL) ? kvstoreGetNextNonEmptyHashtableIndex(kvs, skipSweep.didx)
+                                       : KVSTORE_INDEX_NOT_FOUND;
+        if (skipSweep.didx == KVSTORE_INDEX_NOT_FOUND) {
+            skipSweep.dbid++;
+            skipSweepSeekDb();
+        }
+    }
+}
+
+static void assertNoSkipMarkCallback(void *privdata, void *entry) {
+    UNUSED(privdata);
+    serverAssert(!((dbEntry *)entry)->bgiter_skip);
+}
+
+/* Debug check that no key is marked.  A stale mark makes a consistent iteration silently leave the
+ * key out of its snapshot. */
+static void debugAssertNoSkipMarks(void) {
+    for (int dbid = 0; dbid < server.dbnum; dbid++) {
+        serverDb *db = server.db[dbid];
+        if (db == NULL || db->keys == NULL) continue;
+        for (int didx = kvstoreGetFirstNonEmptyHashtableIndex(db->keys); didx != KVSTORE_INDEX_NOT_FOUND;
+             didx = kvstoreGetNextNonEmptyHashtableIndex(db->keys, didx)) {
+            hashtable *ht = kvstoreGetHashtable(db->keys, didx);
+            if (ht == NULL) continue;
+            size_t cursor = 0;
+            do {
+                cursor = hashtableScan(ht, cursor, assertNoSkipMarkCallback, NULL);
+            } while (cursor != 0);
+        }
+    }
+}
+
+
+/* =============================================================================================
  *                        Background Iterator (private)
  * ============================================================================================= */
 
@@ -932,8 +1005,12 @@ static void bgIteratorRelease(bgIterator *it) {
     it->keyset_iter->release(it->keyset_iter);
     it->keyset_iter = NULL;
 
+    serverAssert(!(it->iteration_flags & BGITERATOR_FLAG_CONSISTENT) || hashtableSize(it->early_iterate_entries) == 0);
     hashtableRelease(it->early_iterate_entries);
     it->early_iterate_entries = NULL;
+
+    // A scan that didn't finish leaves skip marks on the keys it never reached.
+    if ((it->iteration_flags & BGITERATOR_FLAG_CONSISTENT) && !it->completed) skipSweepStart();
 
     sdsfree(it->name);
     zfree(it);
@@ -1036,9 +1113,10 @@ static void feedIterator(bgIterator *it, monotime end_time_us) {
             dbEntry *de;
             fifoPop(dbEntryFifo, (void **)&de);
 
-            // Remove new/modified items during consistent iteration.
-            if (it->iteration_flags & BGITERATOR_FLAG_CONSISTENT &&
-                ((bgIterationEntryMetadata *)objectGetMetadata(de))->iterator_epoch > it->consistent_modification_id) {
+            /* Remove items a consistent iteration already handled (expedited, created, or
+             * modified).  The scan has now passed the key, so the mark is no longer needed. */
+            if (it->iteration_flags & BGITERATOR_FLAG_CONSISTENT && de->bgiter_skip) {
+                de->bgiter_skip = 0;
                 continue;
             }
 
@@ -1084,8 +1162,12 @@ static void feedIterator(bgIterator *it, monotime end_time_us) {
 
 
 static bool addEarlyIterationKey(bgIterator *it, dbEntry *earlyEntry, int cur_dbid) {
-    bool wasAdded = hashtableAdd(it->early_iterate_entries, earlyEntry);
-    serverAssert(wasAdded);
+    if (it->iteration_flags & BGITERATOR_FLAG_CONSISTENT) {
+        earlyEntry->bgiter_skip = 1; // Set before the entry is queued to the iteration client
+    } else {
+        bool wasAdded = hashtableAdd(it->early_iterate_entries, earlyEntry);
+        serverAssert(wasAdded);
+    }
 
     int dbid = (it->iteration_flags & BGITERATOR_FLAG_CONSISTENT)
                    ? it->keyset_iter->originalDb(it->keyset_iter, cur_dbid)
@@ -1126,6 +1208,9 @@ static bool iteratorHasPassedKey(bgIterator *it, int dbid, const_sds key, dbEntr
     if (it->keyset_iter->hasPassedItem(it->keyset_iter, key, dbid)) return true;
 
     if (de && hashtableFind(it->early_iterate_entries, de, NULL)) return true;
+
+    // Already handled by a consistent iteration: expedited, or created/modified since it started.
+    if (de && (it->iteration_flags & BGITERATOR_FLAG_CONSISTENT) && de->bgiter_skip) return true;
 
     return false;
 }
@@ -1282,8 +1367,7 @@ static bool expediteKeysForWrite(bgIterator *it,
             sds key = objectGetVal(oKey);
             dbEntry *de = (server.db[dbid]) ? dbFind(server.db[dbid], key) : NULL;
             if (de == NULL) continue; // New key, no need to expedite
-            if (!iteratorHasPassedKey(it, dbid, key, de) &&
-                ((bgIterationEntryMetadata *)objectGetMetadata(de))->iterator_epoch <= it->consistent_modification_id) {
+            if (!iteratorHasPassedKey(it, dbid, key, de)) {
                 if (addEarlyIterationKey(it, de, dbid)) {
                     mustBlock = true;
                     hashtableAdd(waitingOnKeys, oKey);
@@ -1628,7 +1712,7 @@ static long long bgIteration_feedIterators_task(struct aeEventLoop *eventLoop,
     static monotime lastFeedEndTime; // STATIC: Persists For checking starvation
     monotime startTime = getMonotonicUs();
 
-    if (!bgIteration_iterationActive()) {
+    if (!bgIteration_iterationActive() && !skipSweep.pending) {
         // No more iterators exist.  Self-check, and terminate the "feed" task.
         serverAssert(dictSize(nameToIterator) == 0);
         serverAssert(dictSize(inUseEntries) == 0);
@@ -1675,6 +1759,8 @@ static long long bgIteration_feedIterators_task(struct aeEventLoop *eventLoop,
         if (it->completed || it->terminated) continue;
         feedIterator(it, endTime);
     }
+
+    skipSweepStep(endTime);
 
     lastFeedEndTime = getMonotonicUs();
     return BGITER_CYCLE_DELAY_MS;
@@ -2026,6 +2112,23 @@ static bgIterator *bgIteratorCreate(const char *name,
     // Consistent, with replication - doesn't make sense.
     serverAssert(!((flags & BGITERATOR_FLAG_CONSISTENT) && (flags & BGITERATOR_FLAG_REPLICATION)));
 
+    if (flags & BGITERATOR_FLAG_CONSISTENT) {
+        // There is one skip mark per key, so only one consistent iterator can run at a time.
+        listIter li;
+        listNode *node;
+        listRewind(allIterators, &li);
+        while ((node = listNext(&li)) != NULL) {
+            bgIterator *other = listNodeValue(node);
+            if (other->iteration_flags & BGITERATOR_FLAG_CONSISTENT) {
+                keyset_iter->release(keyset_iter);
+                return NULL;
+            }
+        }
+        // Callers wait for marks left by a terminated consistent iterator to be cleared.
+        serverAssert(!skipSweep.pending);
+        if (server.enable_debug_assert) debugAssertNoSkipMarks();
+    }
+
     bgIterator *it = zmalloc(sizeof(bgIterator));
     it->name = sdsnew(name);
     it->repldone = repldone;
@@ -2041,10 +2144,11 @@ static bgIterator *bgIteratorCreate(const char *name,
     it->item_count_target = last_item_count_target;
     it->iteration_flags = flags;
     it->iteration_type = iter_type;
-    it->consistent_modification_id = bgIteration_epoch++;
     it->keyset_iter = keyset_iter;
     it->early_iterate_entries = hashtableCreate(&dbEntryPtrHashtableType);
-    hashtableExpand(it->early_iterate_entries, BGITER_EARLY_ITERATE_DICT_INITIAL_SIZE);
+    if (!(flags & BGITERATOR_FLAG_CONSISTENT)) {
+        hashtableExpand(it->early_iterate_entries, BGITER_EARLY_ITERATE_DICT_INITIAL_SIZE);
+    }
     it->current_item = NULL;
     it->client_is_active = false;
     it->completed = false;
@@ -2272,6 +2376,12 @@ bool bgIteration_iterationActive(void) {
 
 
 // PUBLIC API
+bool bgIteration_skipSweepPending(void) {
+    return skipSweep.pending;
+}
+
+
+// PUBLIC API
 void bgIteration_beforeSleep(void) {
     if (!bgIteration_iterationActive()) return;
     receiveItemsBackFromIterators(false);
@@ -2298,11 +2408,8 @@ void bgIteration_keyDelete(int dbid, const_sds key) {
         bgIterator *it = listNodeValue(node);
         if (it->completed || it->terminated || !it->keyset_iter->isKeyInScope(it->keyset_iter, key)) continue;
 
-        if (it->iteration_flags & BGITERATOR_FLAG_CONSISTENT &&
-            ((bgIterationEntryMetadata *)objectGetMetadata(de))->iterator_epoch <= it->consistent_modification_id) {
-            if (!iteratorHasPassedKey(it, dbid, key, de)) {
-                addEarlyIterationKey(it, de, dbid); // (may also add to inUseEntries)
-            }
+        if (it->iteration_flags & BGITERATOR_FLAG_CONSISTENT && !iteratorHasPassedKey(it, dbid, key, de)) {
+            addEarlyIterationKey(it, de, dbid); // (may also add to inUseEntries)
         }
 
         /* Since the key is being removed from the main dictionary, also remove it from the
@@ -2329,6 +2436,8 @@ void bgIteration_flushall(void) {
 
 // PUBLIC API
 void bgIteration_swapdb(int db1, int db2) {
+    // The sweep goes by DB index, so a swap could move unswept keys behind it.  Start over.
+    if (skipSweep.pending) skipSweepStart();
     if (bgIteration_iterationActive()) handleSwapdb(db1, db2);
 }
 
@@ -2682,10 +2791,20 @@ bool bgIteration_isEntryInuse(dbEntry *de) {
 
 
 // PUBLIC API
-void bgIteration_dbEntryModified(dbEntry *de) {
-    if (bgIteration_iterationActive()) {
-        bgIterationEntryMetadata *md = (bgIterationEntryMetadata *)objectGetMetadata(de);
-        if (md) md->iterator_epoch = bgIteration_epoch;
+void bgIteration_dbEntryModified(int dbid, dbEntry *de) {
+    if (!bgIteration_iterationActive()) return;
+    sds key = objectGetKey(de);
+
+    /* A key created or modified ahead of a consistent iterator's cursor is not part of its
+     * snapshot.  (An existing key would have been expedited, and so marked, before the write.) */
+    listIter li;
+    listNode *node;
+    listRewind(allIterators, &li);
+    while ((node = listNext(&li)) != NULL) {
+        bgIterator *it = listNodeValue(node);
+        if (!(it->iteration_flags & BGITERATOR_FLAG_CONSISTENT)) continue;
+        if (!it->keyset_iter->isKeyInScope(it->keyset_iter, key)) continue;
+        if (!iteratorHasPassedKey(it, dbid, key, de)) de->bgiter_skip = 1;
     }
 }
 
@@ -2694,7 +2813,7 @@ void bgIteration_dbEntryModified(dbEntry *de) {
 void bgIteration_keyModified(int dbid, const_sds key) {
     if (bgIteration_iterationActive()) {
         dbEntry *de = dbFind(server.db[dbid], (sds)key);
-        if (de) bgIteration_dbEntryModified(de);
+        if (de) bgIteration_dbEntryModified(dbid, de);
     }
 }
 

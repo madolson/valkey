@@ -50,6 +50,7 @@
 #include "compression.h"
 #include "compression_stream.h"
 #include "forkless.h"
+#include "bgiteration.h"
 
 #include <math.h>
 #include <fcntl.h>
@@ -1326,7 +1327,10 @@ int rdbSaveKeyValuePair(rio *rdb, robj *key, robj *val, long long expiretime, in
 
     /* Save the LFU info. */
     if (savelfu) {
-        uint8_t freq = objectGetLFUFrequency(val);
+        /* Read without writing the decayed counter back: a forkless save runs this on a
+         * background thread, and only the main thread may write the object header. */
+        uint8_t freq;
+        lfu_getFrequency(objectGetLRU(val), &freq);
         /* We can encode this in exactly two bytes: the opcode and an 8
          * bit counter, since the frequency is logarithmic with a 0-255 range.
          * Note that we do not store the halving time because to reset it
@@ -1881,6 +1885,11 @@ int resolveBgsaveType(void) {
 /* Start a background save, choosing fork or forkless based on bgsave_type. */
 int rdbStartBgsave(int bgsave_type) {
     if (bgsave_type == RDB_BGSAVE_TYPE_FORKLESS) {
+        /* Wait for the skip mark sweep of a cancelled forkless save; serverCron retries. */
+        if (bgIteration_skipSweepPending()) {
+            server.rdb_bgsave_scheduled = 1;
+            return C_ERR;
+        }
         return forklessSaveToDisk(server.rdb_filename);
     } else {
         rdbSaveInfo rsi, *rsiptr;
@@ -4683,7 +4692,12 @@ void bgsaveCommand(client *c) {
                              "possible.");
         }
     } else if (resolveBgsaveType() == RDB_BGSAVE_TYPE_FORKLESS) {
-        if (forklessSaveToDisk(server.rdb_filename) == C_OK) {
+        if (bgIteration_skipSweepPending()) {
+            /* A cancelled forkless save left skip marks that are still being cleared. */
+            server.rdb_bgsave_scheduled = 1;
+            serverLog(LL_NOTICE, "Background saving scheduled to run after the forkless skip mark sweep");
+            addReplyStatus(c, "Background saving scheduled");
+        } else if (forklessSaveToDisk(server.rdb_filename) == C_OK) {
             addReplyStatus(c, "Background saving started");
         } else {
             addReplyErrorObject(c, shared.err);

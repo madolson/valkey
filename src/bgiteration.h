@@ -96,7 +96,10 @@ typedef void (*bgIteratorCleanupFunc)(bool terminated, void *privdata);
  * to implement the iteration client which will read from the returned bgIterator.
  *
  * There is no need to delete/destroy a bgIterator.  It will automatically be cleaned up after the
- * last item is read. */
+ * last item is read.
+ *
+ * Only one BGITERATOR_CONSISTENCY_START iterator can run at a time.  Creating a second one returns
+ * NULL. */
 bgIterator *bgIteratorCreateFullScanIter(
     const char *name,
     bgIteratorConsistency consistency,
@@ -124,7 +127,10 @@ bgIterator *bgIteratorCreateFullScanIter(
  * just copy its data and leave the array untouched.
  *
  * There is no need to delete/destroy a bgIterator.  It will automatically be cleaned up after the
- * last item is read. */
+ * last item is read.
+ *
+ * Only one BGITERATOR_CONSISTENCY_START iterator can run at a time.  Creating a second one returns
+ * NULL. */
 bgIterator *bgIteratorCreateSlotsIter(
     const char *name,
     bgIteratorConsistency consistency,
@@ -275,15 +281,17 @@ void bgIteratorClose(bgIterator *iter);
  * BGITERATION HOOKS REQUIRED TO SUPPORT ITERATION - CALLS INSERTED INTO MAIN VALKEY CODE
  ********************************************************************************************/
 
-/* Size of bgIterationEntryMetadata (internal to bgiteration.c) */
-#define BGITERATION_ENTRY_METADATA_SIZE 4
-
 /* Must be called once (and only once) at server startup.  */
 void bgIteration_init(void);
 
 
 /* Returns true if any iterators are currently active. */
 bool bgIteration_iterationActive(void);
+
+
+/* Returns true while skip marks left by a terminated consistent iteration are still being cleared
+ * in the background.  A consistent iterator can't be created until this returns false. */
+bool bgIteration_skipSweepPending(void);
 
 
 /* Called as a beforeSleep action, receives items back from bgIteration.  This is just a little
@@ -365,7 +373,7 @@ bool bgIteration_isEntryInuse(dbEntry *de);
 /* Notify bgIteration that a dbEntry has been added/modified.
  *  - If caller has a dbEntry*, dbEntryModified is more efficient
  *  - If caller has a dbid/key, a lookup is performed to find the dbEntry */
-void bgIteration_dbEntryModified(dbEntry *de);
+void bgIteration_dbEntryModified(int dbid, dbEntry *de);
 void bgIteration_keyModified(int dbid, const_sds key);
 
 #endif

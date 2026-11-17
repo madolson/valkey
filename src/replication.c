@@ -1391,6 +1391,13 @@ int startBgsaveForReplication(int mincapa, int req, int rdbver) {
         }
     }
 
+    /* A forkless disk save waits for the skip mark sweep of a cancelled forkless save.  The
+     * replicas stay in WAIT_BGSAVE_START and replicationCron starts the save later. */
+    if (chosen_save_type == RDB_BGSAVE_TYPE_FORKLESS && !socket_target && bgIteration_skipSweepPending()) {
+        serverLog(LL_NOTICE, "BGSAVE for SYNC delayed until the forkless skip mark sweep finishes");
+        return C_OK;
+    }
+
     serverLog(LL_NOTICE, "Starting BGSAVE for SYNC with target: %s using: %s, compression: %s, method: %s",
               (socket_target) ? "replicas sockets" : "disk",
               (req & REPLICA_REQ_RDB_CHANNEL) ? "dual-channel" : "normal sync",
