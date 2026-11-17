@@ -959,6 +959,29 @@ static void skipSweepStep(monotime end_time_us) {
     }
 }
 
+static void assertNoSkipMarkCallback(void *privdata, void *entry) {
+    UNUSED(privdata);
+    serverAssert(!((dbEntry *)entry)->bgiter_skip);
+}
+
+/* Debug check that no key is marked.  A stale mark makes a consistent iteration silently leave the
+ * key out of its snapshot. */
+static void debugAssertNoSkipMarks(void) {
+    for (int dbid = 0; dbid < server.dbnum; dbid++) {
+        serverDb *db = server.db[dbid];
+        if (db == NULL || db->keys == NULL) continue;
+        for (int didx = kvstoreGetFirstNonEmptyHashtableIndex(db->keys); didx != KVSTORE_INDEX_NOT_FOUND;
+             didx = kvstoreGetNextNonEmptyHashtableIndex(db->keys, didx)) {
+            hashtable *ht = kvstoreGetHashtable(db->keys, didx);
+            if (ht == NULL) continue;
+            size_t cursor = 0;
+            do {
+                cursor = hashtableScan(ht, cursor, assertNoSkipMarkCallback, NULL);
+            } while (cursor != 0);
+        }
+    }
+}
+
 
 /* =============================================================================================
  *                        Background Iterator (private)
@@ -2100,6 +2123,7 @@ static bgIterator *bgIteratorCreate(const char *name,
         }
         // Clear any marks left by a terminated consistent iterator before marking new ones.
         skipSweepStep(UINT64_MAX);
+        if (server.enable_debug_assert) debugAssertNoSkipMarks();
     }
 
     bgIterator *it = zmalloc(sizeof(bgIterator));
