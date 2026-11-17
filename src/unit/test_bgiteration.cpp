@@ -1814,6 +1814,68 @@ TEST_F(BgIterationTest, missingFutureItem_start) {
 }
 
 
+// no-repl, yes-consist: MOVE of a FUTURE item created after the start doesn't expedite it.
+TEST_F(BgIterationTest, missingFutureItem_start_move) {
+    simpleDelItem(14); // Delete the item before iterator creation
+    bgIterator *it = bgIteratorCreateFullScanIter("iter", BGITERATOR_CONSISTENCY_START, NULL,
+                                                  iteratorCleanupFn, PRIVDATA);
+    expectReadKey(it, 0);
+
+    c = getWriteClient(14, "xxx");
+    simulateUnblockedWriteWithModification(c);
+
+    // MOVE W0 0 (from DB1).  W0 is new, so there is nothing to expedite and nothing to block on.
+    freeTestClient(c);
+    c = static_cast<client *>(zcalloc(sizeof(client)));
+    c->cmd = lookupCommandByCString("move");
+    c->db = server.db[1];
+    c->argc = 3;
+    c->argv = static_cast<robj **>(zcalloc(sizeof(robj *) * c->argc));
+    c->argv[0] = createStringObjectFromCString(c->cmd->fullname);
+    c->argv[1] = createStringObjectFromCString(keyStr(14));
+    c->argv[2] = createStringObjectFromCString("0");
+    simulateUnblockedWrite_inCall(c);
+    server.in_call--;
+
+    expectReadKeySequence(it, 1, 13);
+    // Key 14 is missing - it didn't exist at start of consistent iteration
+    expectReadKey(it, LAST_ITEM);
+    expectReadComplete(it);
+}
+
+
+// no-repl, yes-consist: COPY of a FUTURE item created after the start doesn't expedite it.
+TEST_F(BgIterationTest, missingFutureItem_start_copy) {
+    simpleDelItem(14); // Delete the item before iterator creation
+    bgIterator *it = bgIteratorCreateFullScanIter("iter", BGITERATOR_CONSISTENCY_START, NULL,
+                                                  iteratorCleanupFn, PRIVDATA);
+    expectReadKey(it, 0);
+
+    c = getWriteClient(14, "xxx");
+    simulateUnblockedWriteWithModification(c);
+
+    // COPY W0 W0 DB 0 (from DB1).  W0 is new, so there is nothing to expedite and nothing to block on.
+    freeTestClient(c);
+    c = static_cast<client *>(zcalloc(sizeof(client)));
+    c->cmd = lookupCommandByCString("copy");
+    c->db = server.db[1];
+    c->argc = 5;
+    c->argv = static_cast<robj **>(zcalloc(sizeof(robj *) * c->argc));
+    c->argv[0] = createStringObjectFromCString(c->cmd->fullname);
+    c->argv[1] = createStringObjectFromCString(keyStr(14));
+    c->argv[2] = createStringObjectFromCString(keyStr(14));
+    c->argv[3] = createStringObjectFromCString("DB");
+    c->argv[4] = createStringObjectFromCString("0");
+    simulateUnblockedWrite_inCall(c);
+    server.in_call--;
+
+    expectReadKeySequence(it, 1, 13);
+    // Key 14 is missing - it didn't exist at start of consistent iteration
+    expectReadKey(it, LAST_ITEM);
+    expectReadComplete(it);
+}
+
+
 // yes-repl, no-consist: creation of FUTURE item is handled by the replication, and then the key is
 //  later skipped (treated like an early iteration case).
 TEST_F(BgIterationTest, missingFutureItem_eventual) {
