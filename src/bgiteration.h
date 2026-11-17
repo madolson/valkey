@@ -283,6 +283,11 @@ void bgIteration_init(void);
 bool bgIteration_iterationActive(void);
 
 
+/* Returns true while skip marks left by a terminated consistent iteration are still being cleared
+ * in the background.  A consistent iterator can't be created until this returns false. */
+bool bgIteration_skipSweepPending(void);
+
+
 /* Called as a beforeSleep action, receives items back from bgIteration.  This is just a little
  * quicker than waiting for bgIteration's internal timer. */
 void bgIteration_beforeSleep(void);

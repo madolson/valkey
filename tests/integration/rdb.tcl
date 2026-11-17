@@ -814,8 +814,14 @@ start_server {overrides {forkless-infrastructure-enabled yes save ""}} {
         }
 
         r config set rdb-key-save-delay 0
+        # The save may be scheduled behind the skip mark sweep, so wait for it to run
+        set saves [s rdb_saves]
         r bgsave
-        waitForBgsave r
+        wait_for_condition 100 100 {
+            [s rdb_saves] > $saves && [s rdb_bgsave_in_progress] == 0
+        } else {
+            fail "forkless bgsave did not run"
+        }
         assert_equal [s rdb_last_bgsave_status] ok
 
         catch {r debug reload nosave}
@@ -823,6 +829,42 @@ start_server {overrides {forkless-infrastructure-enabled yes save ""}} {
         for {set i 0} {$i < 100} {incr i} {
             assert_equal [r get after_$i] v$i
         }
+    } {} {needs:debug}
+}
+
+start_server {overrides {forkless-infrastructure-enabled yes save ""}} {
+    test "BGSAVE during the skip mark sweep of a cancelled forkless bgsave is scheduled" {
+        # Enough keys that the sweep is still running when the next BGSAVE arrives
+        r debug populate 2000000
+        r config set rdb-key-save-delay 10000
+        r config set forkless-policy prefer-forkless
+        r bgsave
+        wait_for_condition 50 100 {
+            [s rdb_bgsave_in_progress] == 1
+        } else {
+            fail "forkless bgsave did not start"
+        }
+        assert {[r bgsave cancel] eq {Background saving cancelled}}
+        wait_for_condition 500 10 {
+            [s rdb_bgsave_in_progress] == 0
+        } else {
+            fail "forkless bgsave did not stop"
+        }
+
+        # The BGSAVE doesn't block the server to finish the sweep; it runs after it from serverCron
+        r config set rdb-key-save-delay 0
+        set saves [s rdb_saves]
+        assert_equal {Background saving scheduled} [r bgsave]
+        wait_for_condition 100 100 {
+            [s rdb_saves] > $saves && [s rdb_bgsave_in_progress] == 0
+        } else {
+            fail "scheduled forkless bgsave did not run"
+        }
+        assert_equal [s rdb_last_bgsave_status] ok
+        assert_equal [s rdb_last_bgsave_type] forkless
+
+        catch {r debug reload nosave}
+        assert_equal [r dbsize] 2000000
     } {} {needs:debug}
 }
 

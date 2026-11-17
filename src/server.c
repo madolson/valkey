@@ -1723,7 +1723,8 @@ long long serverCron(struct aeEventLoop *eventLoop, long long id, void *clientDa
              * CONFIG_BGSAVE_RETRY_DELAY seconds already elapsed. */
             if (server.dirty >= sp->changes && server.unixtime - server.lastsave > sp->seconds &&
                 (server.unixtime - server.lastbgsave_try > CONFIG_BGSAVE_RETRY_DELAY ||
-                 server.lastbgsave_status == C_OK)) {
+                 server.lastbgsave_status == C_OK) &&
+                !server.rdb_bgsave_scheduled) { /* A scheduled save is started below. */
                 serverLog(LL_NOTICE, "%d changes in %d seconds. Saving...", sp->changes, (int)sp->seconds);
                 rdbStartBgsave(resolveBgsaveType());
                 break;

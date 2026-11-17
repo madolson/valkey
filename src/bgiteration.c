@@ -2121,8 +2121,8 @@ static bgIterator *bgIteratorCreate(const char *name,
             bgIterator *other = listNodeValue(node);
             serverAssert(!(other->iteration_flags & BGITERATOR_FLAG_CONSISTENT));
         }
-        // Clear any marks left by a terminated consistent iterator before marking new ones.
-        skipSweepStep(UINT64_MAX);
+        // Callers wait for marks left by a terminated consistent iterator to be cleared.
+        serverAssert(!skipSweep.pending);
         if (server.enable_debug_assert) debugAssertNoSkipMarks();
     }
 
@@ -2369,6 +2369,12 @@ void bgIteration_init(void) {
 // PUBLIC API
 bool bgIteration_iterationActive(void) {
     return (allIterators != NULL && listLength(allIterators) > 0);
+}
+
+
+// PUBLIC API
+bool bgIteration_skipSweepPending(void) {
+    return skipSweep.pending;
 }
 
 
