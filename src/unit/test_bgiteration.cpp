@@ -287,6 +287,7 @@ class BgIterationTest : public ::testing::Test {
         bgIteration_unitTestDisableCloning();
 
         setupDatabase();
+        server.replicas = listCreate(); // propagateDeletion() checks for replicas
 
         EXPECT_CALL(mock, aeCreateTimeEvent(_, _, _, _, _)).WillRepeatedly(Return(0));
         bgIteration_init();
@@ -315,6 +316,8 @@ class BgIterationTest : public ::testing::Test {
             zfree(server.db[i]);
         }
         zfree(server.db);
+        listRelease(server.replicas);
+        server.replicas = NULL;
 
         if (c != NULL) freeTestClient(c);
         EXPECT_EQ(server.in_call, 0); // make sure tests are handling this properly
@@ -908,20 +911,16 @@ class BgIterationTest : public ::testing::Test {
 
         // Send bgIteration the DEL
         int db = getDbFromItemNum(itemNum);
-        robj *argv[2];
-        argv[0] = createStringObjectFromCString("DEL");
-        argv[1] = createStringObjectFromCString(keyStr(itemNum));
-        serverCommand *cmd = lookupCommandByCString("DEL");
+        robj *keyobj = createStringObjectFromCString(keyStr(itemNum));
         // KeyDelete should be called before the deletion occurs
-        bgIteration_keyDelete(db, static_cast<sds>(objectGetVal(argv[1])));
+        bgIteration_keyDelete(db, static_cast<sds>(objectGetVal(keyobj)));
 
         simpleDelItem(itemNum); // Simulate the actual del
 
         // Replication happens after the deletion occurs
         ASSERT_EQ(server.in_call, 0); // test sanity check
-        bgIteration_handleCommandReplication(db, cmd, 2, argv);
-        decrRefCount(argv[0]);
-        decrRefCount(argv[1]);
+        propagateDeletion(server.db[db], keyobj, 0, 0);
+        decrRefCount(keyobj);
 
         EXPECT_EQ(getItem(itemNum), nullptr);
     }
@@ -931,15 +930,10 @@ class BgIterationTest : public ::testing::Test {
     //  still exists after the HDEL (unless it was the last field).
     void simulateFieldExpiry(int itemNum) {
         int db = getDbFromItemNum(itemNum);
-        robj *argv[3];
-        argv[0] = createStringObjectFromCString("HDEL");
-        argv[1] = createStringObjectFromCString(keyStr(itemNum));
-        argv[2] = createStringObjectFromCString("f1");
-        serverCommand *cmd = lookupCommandByCString("HDEL");
+        robj *field = createStringObjectFromCString("f1"); // Released by propagateFieldsDeletion
 
         ASSERT_EQ(server.in_call, 0); // test sanity check
-        bgIteration_handleCommandReplication(db, cmd, 3, argv);
-        for (int i = 0; i < 3; i++) decrRefCount(argv[i]);
+        propagateFieldsDeletion(server.db[db], getItem(itemNum), 1, &field, 0);
     }
 
 
@@ -1970,12 +1964,7 @@ TEST_F(BgIterationTest, expireKeys_eventual_FutureKeyCreatedThenExpiredDuringSet
     bgIteration_keyDelete(getDbFromItemNum(8), static_cast<sds>(objectGetVal(c->argv[1])));
     simpleDelItem(8); // Simulate the actual del (after bgIteration_keyDelete called)
     //  Then the replication for the delete occurs
-    robj *argv[2];
-    argv[0] = createStringObjectFromCString("DEL");
-    argv[1] = c->argv[1];
-    serverCommand *cmd = lookupCommandByCString("DEL");
-    bgIteration_handleCommandReplication(getDbFromItemNum(8), cmd, 2, argv);
-    decrRefCount(argv[0]);
+    propagateDeletion(c->db, c->argv[1], 0, 0);
 
     // Now the SET will run, re-creating the item (which is still a future item)
     // We need to duplicate the value because setKey() can reallocate it.
@@ -2133,6 +2122,65 @@ TEST_F(BgIterationTest, fieldExpiry_eventual_AfterNewKeyWrite) {
     expectReadReplication(it, c); // Only the SET creating item 14 is replicated
     expectReadKeySequence(it, 3, 13);
     expectReadKey(it, LAST_ITEM); // 14 was created by the earlier replication
+    expectReadComplete(it);
+}
+
+
+// The last client write created a new (missing) future key, which was sent early.  A module timer
+// then writes a passed key and replicates it with VM_Replicate, outside of any command.  That write
+// must not consume the missing-key list of the earlier write, which would add the new key to the
+// early iterated set a second time.
+TEST_F(BgIterationTest, moduleReplicate_eventual_FromTimerAfterNewKeyWrite) {
+    simpleDelItem(7); // H2 doesn't exist before iteration
+    bgIterator *it = bgIteratorCreateFullScanIter("iter", BGITERATOR_CONSISTENCY_EVENTUAL, NULL,
+                                                  iteratorCleanupFn, PRIVDATA);
+    expectReadKey(it, 0); // Items 1 & 2 are in queue (same bucket)
+
+    c = getWriteClient(7, "xxx");
+    simulateUnblockedWriteWithModification(c);
+
+    client *c2 = getWriteClient(0, "yyy");
+    ASSERT_EQ(server.in_call, 0); // test sanity check
+    bgIteration_handleCommandReplication(c2->db->id, c2->cmd, c2->argc, c2->argv);
+
+    expectReadKeySequence(it, 1, 2);
+    expectReadReplication(it, c);
+    expectReadReplication(it, c2);
+    freeTestClient(c2);
+    expectReadKeySequence(it, 3, 6);
+    // H2 (item 7) is skipped: it was created by the replicated SET
+    expectReadKeySequence(it, 8, LAST_ITEM);
+    expectReadComplete(it);
+}
+
+
+// Same as above, but the module replicates from inside a READ command, which doesn't recompute the
+// missing-key list.
+TEST_F(BgIterationTest, moduleReplicate_eventual_FromReadAfterNewKeyWrite) {
+    simpleDelItem(7); // H2 doesn't exist before iteration
+    bgIterator *it = bgIteratorCreateFullScanIter("iter", BGITERATOR_CONSISTENCY_EVENTUAL, NULL,
+                                                  iteratorCleanupFn, PRIVDATA);
+    expectReadKey(it, 0); // Items 1 & 2 are in queue (same bucket)
+
+    c = getWriteClient(7, "xxx");
+    simulateUnblockedWriteWithModification(c);
+
+    client *readClient = getWriteClient(0, "unused");
+    readClient->cmd = lookupCommandByCString("get"); // Only the command matters here
+    EXPECT_FALSE(bgIteration_blockClientIfRequired(readClient));
+    server.in_call++;
+    client *c2 = getWriteClient(0, "yyy");
+    bgIteration_handleCommandReplication(c2->db->id, c2->cmd, c2->argc, c2->argv);
+    server.in_call--;
+    freeTestClient(readClient);
+
+    expectReadKeySequence(it, 1, 2);
+    expectReadReplication(it, c);
+    expectReadReplication(it, c2);
+    freeTestClient(c2);
+    expectReadKeySequence(it, 3, 6);
+    // H2 (item 7) is skipped: it was created by the replicated SET
+    expectReadKeySequence(it, 8, LAST_ITEM);
     expectReadComplete(it);
 }
 
@@ -3075,6 +3123,51 @@ TEST_F(BgIterationTest, multiCreatesNewKey_eventual) {
 }
 
 
+// Same as above, but the EXEC is sent after call() has returned.  This is what happens when a module
+//  timer runs EVAL through RM_Call:  the module context holds the execution unit open, so the EXEC
+//  is only sent from moduleFreeContext() -> postExecutionUnitOperations(), at in_call == 0.  The
+//  EXEC must still be replicated, or the replica gets a MULTI that is never closed.
+TEST_F(BgIterationTest, multiCreatesNewKey_eventual_ExecAfterCall) {
+    simpleDelItem(14); // W0 (DB1) doesn't exist before iteration
+    bgIterator *it = bgIteratorCreateFullScanIter("iter", BGITERATOR_CONSISTENCY_EVENTUAL, NULL,
+                                                  iteratorCleanupFn, PRIVDATA);
+    expectReadKey(it, 0); // Items 1 & 2 are in queue (same bucket)
+
+    c = getMultiClient("SET W0 xxx", 1);
+    int dbid = c->db->id;
+    simulateUnblockedWrite_inCall(c); // the EXEC
+
+    server.in_exec = 1;
+    advanceMultiClientToCommand(c, 0); // SET W0 xxx
+    EXPECT_CALL(mock, blockClientInUseOnKeys(c, _, _)).Times(0);
+    bool blocked = bgIteration_blockClientIfRequired(c);
+    EXPECT_FALSE(blocked);
+    server.in_call++;
+    robj *value = dupStringObject(c->argv[2]);
+    setKey(c, c->db, c->argv[1], &value, SETKEY_ADD_OR_UPDATE);
+    struct serverCommand *cmd_multi = lookupCommandByCString("multi");
+    bgIteration_handleCommandReplication(dbid, cmd_multi, 1, &shared.multi);
+    bgIteration_handleCommandReplication(dbid, c->cmd, c->argc, c->argv);
+    server.in_call--;
+    server.in_exec = 0;
+    server.in_call--;
+
+    // The execution unit ends, and propagatePendingCommands() closes the transaction with EXEC
+    ASSERT_EQ(server.in_call, 0); // test sanity check
+    struct serverCommand *cmd_exec = lookupCommandByCString("exec");
+    bgIteration_handleCommandReplication(dbid, cmd_exec, 1, &shared.exec);
+
+    expectReadKeySequence(it, 1, 2); // already queued (same bucket as key 0)
+    expectReadMultiReplication(it);
+    expectReadReplication(it, c); // SET W0 xxx (c is still advanced to the SET)
+    expectReadExecReplication(it);
+    expectReadKeySequence(it, 3, 13);
+    // W0 (item 14) is skipped: it was created by the replicated transaction
+    expectReadKey(it, LAST_ITEM);
+    expectReadComplete(it);
+}
+
+
 // A replicated MULTI/EXEC that creates a new key, followed by a read that lazily expires a passed
 //  key:  "MULTI; SET H2 xxx; GET B0; EXEC".  The GET is nested inside the EXEC, so:
 //   - the DEL from the expiry must not re-process the SET's missing keys (adding H2 twice)
@@ -3109,10 +3202,13 @@ TEST_F(BgIterationTest, multiCreatesNewKeyThenReadExpiresKey_eventual) {
     server.in_call++;
     bgIteration_keyDelete(dbid, static_cast<sds>(objectGetVal(c->argv[1])));
     simpleDelItem(0);
+    // What propagateDeletion() does, without sending a second MULTI from propagateToBgIteration()
     robj *argv[2];
     argv[0] = createStringObjectFromCString("DEL");
     argv[1] = c->argv[1];
+    server.propagating_implicit_del = true;
     bgIteration_handleCommandReplication(dbid, lookupCommandByCString("DEL"), 2, argv);
+    server.propagating_implicit_del = false;
     decrRefCount(argv[0]);
     server.in_call--;
     server.in_exec = 0;
