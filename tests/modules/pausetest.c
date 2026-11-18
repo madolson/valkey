@@ -11,6 +11,8 @@
  *   PAUSETEST.TIMER_REPLICATE  - schedules a timer that does VM_Replicate
  *   PAUSETEST.TIMER_VERBATIM   - schedules a timer that does VM_ReplicateVerbatim
  *   PAUSETEST.GET_RESULT       - returns the result of the last timer operation
+ *   PAUSETEST.SET_REPLICATE    - SET a key locally, then VM_Replicate it
+ *   PAUSETEST.SET_VERBATIM     - SET a key locally, then VM_ReplicateVerbatim
  */
 
 #include "valkeymodule.h"
@@ -94,6 +96,37 @@ int PauseTestGetResult_Command(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, 
     return VALKEYMODULE_OK;
 }
 
+/* Write the key locally the way a module command would. */
+static void setKey(ValkeyModuleCtx *ctx, ValkeyModuleString *keyname, ValkeyModuleString *val) {
+    ValkeyModuleKey *key = ValkeyModule_OpenKey(ctx, keyname, VALKEYMODULE_WRITE);
+    ValkeyModule_StringSet(key, val);
+    ValkeyModule_CloseKey(key);
+}
+
+/* PAUSETEST.SET_REPLICATE key value - SET locally, then VM_Replicate the SET. */
+int PauseTestSetReplicate_Command(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
+    if (argc != 3) return ValkeyModule_WrongArity(ctx);
+    setKey(ctx, argv[1], argv[2]);
+    if (ValkeyModule_Replicate(ctx, "SET", "ss", argv[1], argv[2]) == VALKEYMODULE_OK) {
+        ValkeyModule_ReplyWithSimpleString(ctx, "OK");
+    } else {
+        ValkeyModule_ReplyWithError(ctx, "ERR replicate failed");
+    }
+    return VALKEYMODULE_OK;
+}
+
+/* PAUSETEST.SET_VERBATIM key value - SET locally, then VM_ReplicateVerbatim. */
+int PauseTestSetVerbatim_Command(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
+    if (argc != 3) return ValkeyModule_WrongArity(ctx);
+    setKey(ctx, argv[1], argv[2]);
+    if (ValkeyModule_ReplicateVerbatim(ctx) == VALKEYMODULE_OK) {
+        ValkeyModule_ReplyWithSimpleString(ctx, "OK");
+    } else {
+        ValkeyModule_ReplyWithError(ctx, "ERR replicate failed");
+    }
+    return VALKEYMODULE_OK;
+}
+
 /* PAUSETEST.AVOIDTRAFFIC - Check VM_AvoidReplicaTraffic. */
 int PauseTestAvoidTraffic_Command(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
     UNUSED(argv);
@@ -117,6 +150,14 @@ int ValkeyModule_OnLoad(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int arg
         return VALKEYMODULE_ERR;
 
     if (ValkeyModule_CreateCommand(ctx, "PAUSETEST.TIMER_VERBATIM", PauseTestTimerVerbatim_Command, "", 0, 0, 0) ==
+        VALKEYMODULE_ERR)
+        return VALKEYMODULE_ERR;
+
+    if (ValkeyModule_CreateCommand(ctx, "PAUSETEST.SET_REPLICATE", PauseTestSetReplicate_Command, "write", 1, 1, 1) ==
+        VALKEYMODULE_ERR)
+        return VALKEYMODULE_ERR;
+
+    if (ValkeyModule_CreateCommand(ctx, "PAUSETEST.SET_VERBATIM", PauseTestSetVerbatim_Command, "write", 1, 1, 1) ==
         VALKEYMODULE_ERR)
         return VALKEYMODULE_ERR;
 
