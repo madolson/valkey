@@ -4,6 +4,7 @@
 
 #include "valkeymodule.h"
 
+#include <errno.h>
 #include <string.h>
 #include <unistd.h>
 #include <pthread.h>
@@ -41,6 +42,40 @@ int Auth_CreateModuleUser(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int a
     ValkeyModule_SetModuleUserACL(global, "on");
 
     return ValkeyModule_ReplyWithSimpleString(ctx, "OK");
+}
+
+int Auth_SetModuleUserACL(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
+    if (argc != 2) return ValkeyModule_WrongArity(ctx);
+    if (!global) return ValkeyModule_ReplyWithError(ctx, "ERR no module user");
+
+    if (ValkeyModule_SetModuleUserACL(global, ValkeyModule_StringPtrLen(argv[1], NULL)) != VALKEYMODULE_OK) {
+        return ValkeyModule_ReplyWithError(ctx, errno == EINVAL ? "ERR EINVAL" : "ERR unexpected errno");
+    }
+    return ValkeyModule_ReplyWithSimpleString(ctx, "OK");
+}
+
+/* Revokes the module user's channels from a blocked client reply callback,
+ * where the server is not executing the client's command. */
+int Auth_BlockRevoke_Reply(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
+    VALKEYMODULE_NOT_USED(argv);
+    VALKEYMODULE_NOT_USED(argc);
+    if (ValkeyModule_GetBlockedClientPrivateData(ctx)) {
+        ValkeyModule_SetModuleUserACLString(ctx, global, "resetchannels", NULL);
+    } else {
+        ValkeyModule_SetModuleUserACL(global, "resetchannels");
+    }
+    return ValkeyModule_ReplyWithSimpleString(ctx, "OK");
+}
+
+/* AUTH.BLOCKREVOKE [STRING] revokes with SetModuleUserACLString when STRING is given. */
+int Auth_BlockRevoke(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
+    VALKEYMODULE_NOT_USED(argv);
+    if (!global) return ValkeyModule_ReplyWithError(ctx, "ERR no module user");
+
+    static int use_string = 1;
+    ValkeyModuleBlockedClient *bc = ValkeyModule_BlockClient(ctx, Auth_BlockRevoke_Reply, NULL, NULL, 0);
+    ValkeyModule_UnblockClient(bc, argc > 1 ? &use_string : NULL);
+    return VALKEYMODULE_OK;
 }
 
 int Auth_AuthModuleUser(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
@@ -241,6 +276,14 @@ int ValkeyModule_OnLoad(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int arg
 
     if (ValkeyModule_CreateCommand(ctx,"auth.createmoduleuser",
         Auth_CreateModuleUser,"",0,0,0) == VALKEYMODULE_ERR)
+        return VALKEYMODULE_ERR;
+
+    if (ValkeyModule_CreateCommand(ctx,"auth.setmoduleuseracl",
+        Auth_SetModuleUserACL,"",0,0,0) == VALKEYMODULE_ERR)
+        return VALKEYMODULE_ERR;
+
+    if (ValkeyModule_CreateCommand(ctx,"auth.blockrevoke",
+        Auth_BlockRevoke,"",0,0,0) == VALKEYMODULE_ERR)
         return VALKEYMODULE_ERR;
 
     if (ValkeyModule_CreateCommand(ctx,"auth.authmoduleuser",
