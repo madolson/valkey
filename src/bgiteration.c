@@ -395,6 +395,12 @@ struct bgIterator {
 
     bool cur_cmd_may_replicate; // Used only in main thread during command processing
 
+    /* Set when the last MULTI was replicated to this iterator, so that the matching EXEC is
+     * replicated exactly when the MULTI was.  The EXEC can't use cur_cmd_may_replicate:  it may
+     * arrive outside of call() (after a nested call from a module), or after a later nested write
+     * changed the flag. */
+    bool multi_replicated; // Used only in main thread during command processing
+
     /* When a key is deleted (expire/evict):
      *   1. bgIteration_keyDelete() is called
      *   2. the key is physically deleted
@@ -2051,6 +2057,7 @@ static bgIterator *bgIteratorCreate(const char *name,
     it->completed = false;
     it->terminated = false;
     it->cur_cmd_may_replicate = false;
+    it->multi_replicated = false;
     it->last_key_delete_was_early = false;
     it->added_since_feed = 0;
 
@@ -2594,7 +2601,12 @@ void bgIteration_handleCommandReplication(int dbid,
         if (!(it->iteration_flags & BGITERATOR_FLAG_REPLICATION)) continue;
 
         bool replicate = false;
-        if (useReplicationFlags) replicate = it->cur_cmd_may_replicate;
+        if (cmd->proc == execCommand) {
+            replicate = it->multi_replicated;
+        } else if (useReplicationFlags) {
+            replicate = it->cur_cmd_may_replicate;
+        }
+        if (cmd->proc == multiCommand) it->multi_replicated = replicate;
 
         /* Deletes (and unlinks) are special.
          * Developer context:  For most commands, we call bgIteration_blockClientIfRequired before
