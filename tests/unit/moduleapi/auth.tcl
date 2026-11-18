@@ -68,6 +68,24 @@ start_server {tags {"modules"}} {
         assert_equal [r acl whoami] "default"
     }
 
+    test {Subscribers are killed when a module authenticates them as a user without channel permission} {
+        r acl setuser nochannels on nopass resetchannels +@all
+        set rd [valkey_deferring_client]
+        $rd HELLO 3 SETNAME deathrow
+        $rd read
+        $rd SUBSCRIBE foo
+        $rd read
+        $rd auth.authrealuser nochannels
+        $rd read
+        wait_for_condition 50 100 {
+            ![string match {*deathrow*} [r client list]]
+        } else {
+            fail "Subscriber was not killed after switching to a user without channel permission"
+        }
+        $rd close
+        r acl deluser nochannels
+    } {1}
+
     test {modules can redact arguments} {
         r config set slowlog-log-slower-than 0
         r slowlog reset

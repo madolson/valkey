@@ -11001,6 +11001,7 @@ static int authenticateClientWithUser(ValkeyModuleCtx *ctx,
     moduleNotifyUserChanged(ctx->client);
 
     clientSetUser(ctx->client, user, 1);
+    ACLKillPubsubClientIfUnauthorized(ctx->client);
 
     if (clientHasModuleAuthInProgress(ctx->client)) {
         ctx->client->flag.module_auth_has_result = 1;
