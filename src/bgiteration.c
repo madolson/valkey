@@ -1142,7 +1142,11 @@ static bool expediteSingleKeyWithoutOptimization(bgIterator *it,
     sds key = objectGetVal(oKey);
     dbEntry *de = (server.db[dbid]) ? dbFind(server.db[dbid], key) : NULL;
     if (de != NULL) {
-        if (!iteratorHasPassedKey(it, dbid, key, de)) {
+        // A key created or modified after a consistent iteration started isn't part of it.
+        bool newSinceConsistentStart =
+            it->iteration_flags & BGITERATOR_FLAG_CONSISTENT &&
+            ((bgIterationEntryMetadata *)objectGetMetadata(de))->iterator_epoch > it->consistent_modification_id;
+        if (!iteratorHasPassedKey(it, dbid, key, de) && !newSinceConsistentStart) {
             if (addEarlyIterationKey(it, de, dbid)) {
                 mustBlock = true;
                 hashtableAdd(waitingOnKeys, oKey);
