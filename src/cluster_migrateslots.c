@@ -9,7 +9,6 @@
 #include "io_threads.h"
 #include "module.h"
 #include "functions.h"
-#include "forkless.h"
 #include "sds.h"
 #include "server.h"
 

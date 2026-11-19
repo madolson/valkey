@@ -33,7 +33,6 @@
 #include "cluster_migrateslots.h"
 #include "script.h"
 #include "forkless.h"
-#include "bgiteration.h"
 #include "intset.h"
 #include "sds.h"
 #include "fpconv_dtoa.h"
