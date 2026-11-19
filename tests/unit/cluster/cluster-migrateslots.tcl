@@ -3226,7 +3226,7 @@ start_cluster 2 1 {tags {logreqres:skip external:skip cluster} overrides {cluste
         set_debug_prevent_pause 0
     }
 
-    test "Forkless sync to a replica falls back to fork when a slot migration starts during the scan" {
+    test "Forkless sync to a replica keeps running when a slot migration starts during the scan" {
         R 0 debug populate 2000 {b}
         R 0 config set rdb-key-save-delay 1000
         set loglines [count_log_lines 0]
@@ -3236,17 +3236,20 @@ start_cluster 2 1 {tags {logreqres:skip external:skip cluster} overrides {cluste
         set_debug_prevent_pause 1
         assert_match "OK" [R 1 CLUSTER MIGRATESLOTS SLOTSRANGE 16383 16383 NODE $node0_id]
         set jobname [get_job_name 1 16383]
-        wait_for_log_messages 0 {"*forkless save cancelled*"} $loglines 50 100
+        # The migration's SYNCSLOTS commands reach the replica through the
+        # replication stream that follows the snapshot.
         R 0 config set rdb-key-save-delay 0
-        wait_for_log_messages 0 {"*Starting BGSAVE for SYNC*method: fork"} $loglines 50 100
         wait_for_condition 50 100 {
             [getInfoProperty [R 2 info replication] master_link_status] eq "up"
         } else {
-            fail "Replica didn't resync"
+            fail "Replica didn't sync"
         }
+        verify_no_log_message 0 {*forkless save cancelled*} $loglines
         R 1 CLUSTER CANCELSLOTMIGRATIONS
         wait_for_migration_field 0 $jobname state failed
         set_debug_prevent_pause 0
+        wait_for_ofs_sync [Rn 0] [Rn 2]
+        assert_equal [R 0 DEBUG DIGEST] [R 2 DEBUG DIGEST]
         R 0 flushall
     }
 

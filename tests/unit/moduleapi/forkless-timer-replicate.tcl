@@ -77,6 +77,72 @@ start_server {tags {"modules repl external:skip"} overrides {save {} forkless-in
 }
 }
 
+# A module timer adds a field to hashes the forkless full sync has not sent yet.
+# The replica needs the fields the hashes had before the timer.
+start_server {tags {"modules repl external:skip"} overrides {save {} forkless-infrastructure-enabled yes forkless-policy prefer-forkless repl-diskless-sync yes repl-diskless-sync-delay 0 repl-timeout 60}} {
+    r module load $testmodule
+    set primary [srv 0 client]
+    set primary_host [srv 0 host]
+    set primary_port [srv 0 port]
+    # The hashes are spread among the filler of DB 0. The filler of DB 9 keeps
+    # the sync running after the timer.
+    $primary select 0
+    $primary debug populate 1000 filler 10
+    for {set i 0} {$i < 200} {incr i} { $primary hset h:$i f old }
+    $primary select 9
+    $primary debug populate 500 filler 10
+    $primary select 0
+
+    start_server {overrides {save {}}} {
+        set replica [srv 0 client]
+
+        test "Module timer partial writes to hashes a forkless full sync has not sent keep the replica in sync" {
+            # About 2.4s over DB 0, then 1s over DB 9.
+            test_config_set $primary rdb-key-save-delay 2000
+            set loglines [count_log_lines -1]
+            $replica replicaof $primary_host $primary_port
+            wait_for_condition 500 10 {
+                [s -1 rdb_bgsave_in_progress] == 1
+            } else {
+                fail "full sync did not start"
+            }
+            assert_equal {forkless} [s -1 rdb_current_bgsave_type]
+            # The progress is published once a second, so this is about 500 keys.
+            wait_for_condition 500 10 {
+                [s -1 current_save_keys_processed] > 0
+            } else {
+                fail "the sync did not progress"
+            }
+            assert_lessthan [s -1 current_save_keys_processed] 1000
+
+            assert_equal {OK} [$primary forklesstimer.hsetall h: 200 g new]
+            wait_for_condition 500 10 {
+                [lindex [$primary forklesstimer.stats] 0] == 1
+            } else {
+                fail "the timer did not run"
+            }
+            # The key API refuses the few hashes the scan holds in its queue.
+            lassign [$primary forklesstimer.stats] done set skipped
+            assert_morethan $set 100
+            assert_equal 1 [s -1 rdb_bgsave_in_progress]
+
+            $primary config set rdb-key-save-delay 0
+            wait_for_sync $replica
+            wait_for_ofs_sync $primary $replica
+
+            $replica select 0
+            set diverged {}
+            for {set i 0} {$i < 200} {incr i} {
+                if {[$primary hgetall h:$i] ne [$replica hgetall h:$i]} { lappend diverged h:$i }
+            }
+            assert_equal 0 [llength $diverged] \
+                "timer set=$set skipped=$skipped; replica differs on [llength $diverged] hashes, first: [lrange $diverged 0 4]"
+            assert_equal [$primary debug digest] [$replica debug digest]
+            verify_no_log_message -1 {*forkless save cancelled*} $loglines
+        }
+    }
+}
+
 # A module timer replicates one write that touches two keys during a forkless
 # full sync.
 start_server {tags {"modules repl external:skip"} overrides {save {} forkless-infrastructure-enabled yes forkless-policy prefer-forkless repl-diskless-sync yes repl-diskless-sync-delay 0 repl-timeout 60}} {

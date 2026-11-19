@@ -16,6 +16,7 @@ static int timer_done = 0;
 
 typedef struct {
     ValkeyModuleString *prefix;
+    ValkeyModuleString *field; /* NULL to set strings, else the hash field to set */
     ValkeyModuleString *value;
     long long count;
 } setAllArgs;
@@ -32,14 +33,21 @@ static void setAllTimer(ValkeyModuleCtx *ctx, void *data) {
         if (key == NULL) {
             timer_skipped++;
         } else {
-            ValkeyModule_StringSet(key, args->value);
-            ValkeyModule_CloseKey(key);
-            ValkeyModule_Replicate(ctx, "SET", "ss", keyname, args->value);
+            if (args->field) {
+                ValkeyModule_HashSet(key, VALKEYMODULE_HASH_NONE, args->field, args->value, NULL);
+                ValkeyModule_CloseKey(key);
+                ValkeyModule_Replicate(ctx, "HSET", "sss", keyname, args->field, args->value);
+            } else {
+                ValkeyModule_StringSet(key, args->value);
+                ValkeyModule_CloseKey(key);
+                ValkeyModule_Replicate(ctx, "SET", "ss", keyname, args->value);
+            }
             timer_set++;
         }
         ValkeyModule_FreeString(ctx, keyname);
     }
     ValkeyModule_FreeString(NULL, args->prefix);
+    if (args->field) ValkeyModule_FreeString(NULL, args->field);
     ValkeyModule_FreeString(NULL, args->value);
     ValkeyModule_Free(args);
     timer_done = 1;
@@ -58,7 +66,29 @@ static int setAllCommand(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int ar
         return ValkeyModule_ReplyWithError(ctx, "ERR invalid count");
     setAllArgs *args = ValkeyModule_Alloc(sizeof(*args));
     args->prefix = ValkeyModule_CreateStringFromString(NULL, argv[1]);
+    args->field = NULL;
     args->value = ValkeyModule_CreateStringFromString(NULL, argv[3]);
+    args->count = count;
+    timer_set = timer_skipped = 0;
+    timer_done = 0;
+    ValkeyModule_CreateTimer(ctx, 1, setAllTimer, args);
+    return ValkeyModule_ReplyWithSimpleString(ctx, "OK");
+}
+
+/* FORKLESSTIMER.HSETALL <prefix> <count> <field> <value>
+ * Like FORKLESSTIMER.SETALL, but sets <field> in the hashes <prefix>0 ..
+ * <prefix><count-1>, which keeps their other fields. */
+static int hsetAllCommand(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
+    if (argc != 5)
+        return ValkeyModule_WrongArity(ctx);
+    long long count;
+    if (ValkeyModule_StringToLongLong(argv[2], &count) != VALKEYMODULE_OK ||
+        count < 0)
+        return ValkeyModule_ReplyWithError(ctx, "ERR invalid count");
+    setAllArgs *args = ValkeyModule_Alloc(sizeof(*args));
+    args->prefix = ValkeyModule_CreateStringFromString(NULL, argv[1]);
+    args->field = ValkeyModule_CreateStringFromString(NULL, argv[3]);
+    args->value = ValkeyModule_CreateStringFromString(NULL, argv[4]);
     args->count = count;
     timer_set = timer_skipped = 0;
     timer_done = 0;
@@ -130,6 +160,9 @@ int ValkeyModule_OnLoad(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int arg
         return VALKEYMODULE_ERR;
     ValkeyModule_SetModuleOptions(ctx, VALKEYMODULE_OPTIONS_HANDLE_FORKLESS);
     if (ValkeyModule_CreateCommand(ctx, "forklesstimer.setall", setAllCommand,
+                                   "readonly", 0, 0, 0) == VALKEYMODULE_ERR)
+        return VALKEYMODULE_ERR;
+    if (ValkeyModule_CreateCommand(ctx, "forklesstimer.hsetall", hsetAllCommand,
                                    "readonly", 0, 0, 0) == VALKEYMODULE_ERR)
         return VALKEYMODULE_ERR;
     if (ValkeyModule_CreateCommand(ctx, "forklesstimer.mset", msetCommand,
