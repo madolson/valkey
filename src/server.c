@@ -3920,6 +3920,7 @@ static void propagateToBgIteration(int dbid, int argc, robj **argv, int target) 
             bgIteration_handleCommandReplication(lastDbidSentToBgIterator, cmd_exec, 1, &shared.exec);
             sentMultiToBgIterator = false;
         }
+        bgIteration_endExecutionUnit();
     }
 }
 

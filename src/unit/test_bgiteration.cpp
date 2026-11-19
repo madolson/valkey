@@ -2137,6 +2137,410 @@ TEST_F(BgIterationTest, fieldExpiry_eventual_AfterNewKeyWrite) {
 }
 
 
+// Like multiCreatesNewKey_eventual, but the EXEC closing the transaction arrives after call() has
+//  returned.  This is what happens to a script run through RM_Call from a module timer or thread:
+//  propagatePendingCommands runs from moduleFreeContext or moduleGILBeforeUnlock, after
+//  server.in_call is back to 0.  The EXEC must still follow its replicated MULTI.
+TEST_F(BgIterationTest, multiExecAfterCallReturns_eventual) {
+    simpleDelItem(14); // W0 (DB1) doesn't exist before iteration
+    bgIterator *it = bgIteratorCreateFullScanIter("iter", BGITERATOR_CONSISTENCY_EVENTUAL, NULL,
+                                                  iteratorCleanupFn, PRIVDATA);
+    expectReadKey(it, 0); // Items 1 & 2 are in queue (same bucket)
+
+    c = getMultiClient("SET W0 xxx", 1);
+    int dbid = c->db->id;
+    simulateUnblockedWrite_inCall(c); // the EXEC
+
+    server.in_exec = 1;
+    advanceMultiClientToCommand(c, 0); // SET W0 xxx
+    EXPECT_CALL(mock, blockClientInUseOnKeys(c, _, _)).Times(0);
+    bool blocked = bgIteration_blockClientIfRequired(c);
+    EXPECT_FALSE(blocked);
+    server.in_call++;
+    robj *value = dupStringObject(c->argv[2]);
+    setKey(c, c->db, c->argv[1], &value, SETKEY_ADD_OR_UPDATE);
+
+    struct serverCommand *cmd_multi = lookupCommandByCString("multi");
+    bgIteration_handleCommandReplication(dbid, cmd_multi, 1, &shared.multi);
+    bgIteration_handleCommandReplication(dbid, c->cmd, c->argc, c->argv);
+    server.in_call--;
+    server.in_exec = 0;
+    server.in_call--;
+
+    // The EXEC is sent outside of call()
+    struct serverCommand *cmd_exec = lookupCommandByCString("exec");
+    bgIteration_handleCommandReplication(dbid, cmd_exec, 1, &shared.exec);
+
+    expectReadKeySequence(it, 1, 2); // already queued (same bucket as key 0)
+    expectReadMultiReplication(it);
+    expectReadReplication(it, c); // SET W0 xxx
+    expectReadExecReplication(it);
+    expectReadKeySequence(it, 3, 13);
+    // W0 (item 14) is skipped: it was created by the replicated transaction
+    expectReadKey(it, LAST_ITEM);
+    expectReadComplete(it);
+}
+
+
+// The MULTI of an execution unit is held back until its first write that replicates, and the EXEC
+//  follows it.  Example: a module command inside MULTI/EXEC whose RM_Call writes an undeclared key
+//  the iterator has passed, after a write to a key it hasn't.
+TEST_F(BgIterationTest, multiSentBeforeFirstReplicatedWrite_eventual) {
+    bgIterator *it = bgIteratorCreateFullScanIter("iter", BGITERATOR_CONSISTENCY_EVENTUAL, NULL,
+                                                  iteratorCleanupFn, PRIVDATA);
+    expectReadKeySequence(it, 0, 2); // 0 is passed (and no longer in use).  3 & 4 are queued.
+
+    c = getWriteClient(6, "xxx"); // not reached by the iterator yet
+    int dbid = c->db->id;
+    simulateUnblockedWrite_inCall(c);
+    struct serverCommand *cmd_multi = lookupCommandByCString("multi");
+    bgIteration_handleCommandReplication(dbid, cmd_multi, 1, &shared.multi);
+    bgIteration_handleCommandReplication(dbid, c->cmd, c->argc, c->argv);
+
+    client *nested = getWriteClient(0, "yyy"); // already passed by the iterator
+    simulateUnblockedWrite_inCall(nested);
+    bgIteration_handleCommandReplication(dbid, nested->cmd, nested->argc, nested->argv);
+    server.in_call--;
+
+    struct serverCommand *cmd_exec = lookupCommandByCString("exec");
+    bgIteration_handleCommandReplication(dbid, cmd_exec, 1, &shared.exec);
+    server.in_call--;
+
+    expectReadKeySequence(it, 3, 4); // already queued
+    expectReadMultiReplication(it);
+    expectReadReplication(it, nested);
+    freeTestClient(nested);
+    expectReadExecReplication(it);
+    expectReadKeySequence(it, 5, LAST_ITEM);
+    expectReadComplete(it);
+}
+
+
+// The reverse: a replicated MULTI must be closed by its EXEC, even when a later nested write in the
+//  same execution unit (an RM_Call from a module command inside MULTI/EXEC) doesn't replicate.
+TEST_F(BgIterationTest, multiReplicatedSendsExec_eventual) {
+    bgIterator *it = bgIteratorCreateFullScanIter("iter", BGITERATOR_CONSISTENCY_EVENTUAL, NULL,
+                                                  iteratorCleanupFn, PRIVDATA);
+    expectReadKeySequence(it, 0, 2); // 0 is passed (and no longer in use).  3 & 4 are queued.
+
+    c = getWriteClient(0, "xxx"); // already passed by the iterator
+    int dbid = c->db->id;
+    simulateUnblockedWrite_inCall(c);
+    struct serverCommand *cmd_multi = lookupCommandByCString("multi");
+    bgIteration_handleCommandReplication(dbid, cmd_multi, 1, &shared.multi);
+    bgIteration_handleCommandReplication(dbid, c->cmd, c->argc, c->argv);
+
+    client *nested = getWriteClient(6, "yyy"); // not reached by the iterator yet
+    simulateUnblockedWrite_inCall(nested);
+    bgIteration_handleCommandReplication(dbid, nested->cmd, nested->argc, nested->argv);
+    server.in_call--;
+    freeTestClient(nested);
+
+    struct serverCommand *cmd_exec = lookupCommandByCString("exec");
+    bgIteration_handleCommandReplication(dbid, cmd_exec, 1, &shared.exec);
+    server.in_call--;
+
+    expectReadKeySequence(it, 3, 4); // already queued
+    expectReadMultiReplication(it);
+    expectReadReplication(it, c);
+    expectReadExecReplication(it);
+    expectReadKeySequence(it, 5, LAST_ITEM);
+    expectReadComplete(it);
+}
+
+
+// The last client write created a new future key, which the scan skips.  A module timer then writes a
+// passed key and replicates it with VM_Replicate, outside of any command.  It's replicated, and the
+// new key isn't marked sent a second time.
+TEST_F(BgIterationTest, moduleReplicate_eventual_FromTimerAfterNewKeyWrite) {
+    simpleDelItem(7); // H2 doesn't exist before iteration
+    bgIterator *it = bgIteratorCreateFullScanIter("iter", BGITERATOR_CONSISTENCY_EVENTUAL, NULL,
+                                                  iteratorCleanupFn, PRIVDATA);
+    expectReadKey(it, 0); // Items 1 & 2 are in queue (same bucket)
+
+    c = getWriteClient(7, "xxx");
+    simulateUnblockedWriteWithModification(c);
+
+    client *c2 = getWriteClient(0, "yyy");
+    ASSERT_EQ(server.in_call, 0); // test sanity check
+    bgIteration_handleCommandReplication(c2->db->id, c2->cmd, c2->argc, c2->argv);
+
+    expectReadKeySequence(it, 1, 2);
+    expectReadReplication(it, c);
+    expectReadReplication(it, c2);
+    freeTestClient(c2);
+    expectReadKeySequence(it, 3, 6);
+    // H2 (item 7) is skipped: it was created by the replicated SET
+    expectReadKeySequence(it, 8, LAST_ITEM);
+    expectReadComplete(it);
+}
+
+
+// Same as above, but the module replicates from inside a READ command.
+TEST_F(BgIterationTest, moduleReplicate_eventual_FromReadAfterNewKeyWrite) {
+    simpleDelItem(7); // H2 doesn't exist before iteration
+    bgIterator *it = bgIteratorCreateFullScanIter("iter", BGITERATOR_CONSISTENCY_EVENTUAL, NULL,
+                                                  iteratorCleanupFn, PRIVDATA);
+    expectReadKey(it, 0); // Items 1 & 2 are in queue (same bucket)
+
+    c = getWriteClient(7, "xxx");
+    simulateUnblockedWriteWithModification(c);
+
+    client *readClient = getWriteClient(0, "unused");
+    readClient->cmd = lookupCommandByCString("get"); // Only the command matters here
+    EXPECT_FALSE(bgIteration_blockClientIfRequired(readClient));
+    server.in_call++;
+    client *c2 = getWriteClient(0, "yyy");
+    bgIteration_handleCommandReplication(c2->db->id, c2->cmd, c2->argc, c2->argv);
+    server.in_call--;
+    freeTestClient(readClient);
+
+    expectReadKeySequence(it, 1, 2);
+    expectReadReplication(it, c);
+    expectReadReplication(it, c2);
+    freeTestClient(c2);
+    expectReadKeySequence(it, 3, 6);
+    // H2 (item 7) is skipped: it was created by the replicated SET
+    expectReadKeySequence(it, 8, LAST_ITEM);
+    expectReadComplete(it);
+}
+
+
+// A module timer creates a key and replicates it with VM_Replicate, outside of any command.  The SET
+// is replicated, and the scan must skip the key (the replica crashes on a duplicate key otherwise).
+TEST_F(BgIterationTest, moduleReplicate_eventual_NewKeyFromTimer) {
+    simpleDelItem(7); // H2 doesn't exist before iteration
+    bgIterator *it = bgIteratorCreateFullScanIter("iter", BGITERATOR_CONSISTENCY_EVENTUAL, NULL,
+                                                  iteratorCleanupFn, PRIVDATA);
+    expectReadKey(it, 0); // Items 1 & 2 are in queue (same bucket)
+
+    c = getWriteClient(7, "xxx");
+    ASSERT_EQ(server.in_call, 0); // test sanity check
+    robj *value = dupStringObject(c->argv[2]);
+    setKey(NULL, c->db, c->argv[1], &value, SETKEY_ADD_OR_UPDATE);
+    bgIteration_handleCommandReplication(c->db->id, c->cmd, c->argc, c->argv);
+    bgIteration_endExecutionUnit();
+
+    expectReadKeySequence(it, 1, 2);
+    expectReadReplication(it, c);
+    expectReadKeySequence(it, 3, 6);
+    // H2 (item 7) is skipped: it was created by the replicated SET
+    expectReadKeySequence(it, 8, LAST_ITEM);
+    expectReadComplete(it);
+}
+
+
+// A module timer writes a key the iteration has sent and one it hasn't, and replicates both with a
+// single VM_Replicate.  Neither choice is correct, so the iteration is terminated.
+TEST_F(BgIterationTest, moduleReplicate_eventual_MixedKeysTerminates) {
+    bgIterator *it = bgIteratorCreateFullScanIter("iter", BGITERATOR_CONSISTENCY_EVENTUAL, NULL,
+                                                  iteratorCleanupFn, PRIVDATA);
+    expectReadKey(it, 0);
+    expectReadKey(it, 1); // Key 0 is passed and no longer in use
+
+    robj *argv[5];
+    argv[0] = createStringObjectFromCString("MSET");
+    argv[1] = createStringObjectFromCString(keyStr(0));
+    argv[2] = createStringObjectFromCString("xxx");
+    argv[3] = createStringObjectFromCString(keyStr(6)); // not reached by the iterator yet
+    argv[4] = createStringObjectFromCString("xxx");
+    for (int i = 1; i < 5; i += 2) {
+        robj *value = dupStringObject(argv[i + 1]);
+        setKey(NULL, server.db[0], argv[i], &value, SETKEY_ADD_OR_UPDATE);
+    }
+    bgIteration_handleCommandReplication(0, lookupCommandByCString("mset"), 5, argv);
+    bgIteration_endExecutionUnit();
+    for (int i = 0; i < 5; i++) decrRefCount(argv[i]);
+    EXPECT_TRUE(bgIteratorIsTerminating(it));
+
+    bgIteratorItem *item = bgIteratorRead(it);
+    ASSERT_EQ(item->type, BGITERATOR_ITEM_TERMINATED);
+    bgIteratorClose(it);
+    bgIteration_feedIterators();
+    EXPECT_EQ(cleanupCount, 1);
+    EXPECT_TRUE(cleanupTerminated);
+}
+
+
+// "MULTI; DEL H1; SET H1 xxx; SUNIONSTORE H2 H1; EXEC" with H1 and H2 not reached.  No key of the
+//  transaction is sent, so the SET recreating H1 doesn't replicate either.  If it did, H1 would be sent
+//  and the SUNIONSTORE would mix it with H2, which isn't.
+TEST_F(BgIterationTest, multiRecreatedKeyFollowsTransaction_eventual) {
+    bgIterator *it = bgIteratorCreateFullScanIter("iter", BGITERATOR_CONSISTENCY_EVENTUAL, NULL,
+                                                  iteratorCleanupFn, PRIVDATA);
+    expectReadKey(it, 0); // Keys 1 & 2 are in queue
+
+    c = getMultiClient("DEL H1; SET H1 xxx; SUNIONSTORE H2 H1");
+    simulateUnblockedWrite_inCall(c); // the EXEC
+    server.in_exec = 1;
+
+    advanceMultiClientToCommand(c, 0); // DEL H1
+    EXPECT_CALL(mock, blockClientInUseOnKeys(c, _, _)).Times(0);
+    EXPECT_FALSE(bgIteration_blockClientIfRequired(c));
+    sds delKey = sdsnew(keyStr(6));
+    bgIteration_keyDelete(0, delKey);
+    sdsfree(delKey);
+    simpleDelItem(6);
+    bgIteration_handleCommandReplication(c->db->id, c->cmd, c->argc, c->argv);
+
+    advanceMultiClientToCommand(c, 1); // SET H1 xxx
+    simulateUnblockedWriteWithModification(c);
+
+    advanceMultiClientToCommand(c, 2); // SUNIONSTORE H2 H1
+    EXPECT_FALSE(bgIteration_blockClientIfRequired(c));
+    bgIteration_handleCommandReplication(c->db->id, c->cmd, c->argc, c->argv);
+    server.in_exec = 0;
+    server.in_call--;
+    bgIteration_endExecutionUnit();
+    EXPECT_FALSE(bgIteratorIsTerminating(it));
+
+    // Nothing is replicated.  The scan sends both keys.
+    expectReadKeySequence(it, 1, 5);
+    expectReadKey(it, 6, "xxx");
+    expectReadKeySequence(it, 7, LAST_ITEM);
+    expectReadComplete(it);
+}
+
+
+// A verdict that no propagation used (here a deletion that wasn't propagated, like a script that
+// turned replication off) ends with the execution unit.  Otherwise the deleted key would still count
+// as not sent for a later write, after the scan has passed its position.
+TEST_F(BgIterationTest, keyVerdictsEndWithExecutionUnit_eventual) {
+    bgIterator *it = bgIteratorCreateFullScanIter("iter", BGITERATOR_CONSISTENCY_EVENTUAL, NULL,
+                                                  iteratorCleanupFn, PRIVDATA);
+    expectReadKey(it, 0);
+
+    sds delKey = sdsnew(keyStr(6));
+    bgIteration_keyDelete(0, delKey); // Not reached yet
+    sdsfree(delKey);
+    simpleDelItem(6);
+    bgIteration_endExecutionUnit();
+
+    expectReadKeySequence(it, 1, 5);
+    expectReadKey(it, 7); // 6 is gone, and the scan has passed both
+    expectReadKey(it, 8);
+
+    c = getWrite2KeysClient("sunionstore", 7, 6);
+    simulateUnblockedWrite_inCall(c);
+    bgIteration_handleCommandReplication(c->db->id, c->cmd, c->argc, c->argv);
+    server.in_call--;
+    bgIteration_endExecutionUnit();
+    EXPECT_FALSE(bgIteratorIsTerminating(it));
+
+    expectReadKey(it, 9);
+    expectReadReplication(it, c);
+    expectReadKeySequence(it, 10, LAST_ITEM);
+    expectReadComplete(it);
+}
+
+
+// A module write outside of a command deletes a key the iteration has sent and writes one it hasn't,
+// replicated as "RENAME B0 H1".  The deleted key still counts as sent, so the iteration is terminated
+// rather than dropping a write the replica needs for B0.
+TEST_F(BgIterationTest, moduleReplicate_eventual_DeletedSentKeyStillSent) {
+    bgIterator *it = bgIteratorCreateFullScanIter("iter", BGITERATOR_CONSISTENCY_EVENTUAL, NULL,
+                                                  iteratorCleanupFn, PRIVDATA);
+    expectReadKey(it, 0);
+    expectReadKey(it, 1); // Key 0 is passed and no longer in use
+
+    client *rename = getWrite2KeysClient("rename", 0, 6);
+    bgIteration_keyDelete(0, static_cast<sds>(objectGetVal(rename->argv[1])));
+    simpleDelItem(0);
+    bgIteration_handleCommandReplication(0, rename->cmd, rename->argc, rename->argv);
+    bgIteration_endExecutionUnit();
+    freeTestClient(rename);
+    EXPECT_TRUE(bgIteratorIsTerminating(it));
+
+    bgIteratorItem *item = bgIteratorRead(it);
+    ASSERT_EQ(item->type, BGITERATOR_ITEM_TERMINATED);
+    bgIteratorClose(it);
+    bgIteration_feedIterators();
+    EXPECT_EQ(cleanupCount, 1);
+}
+
+
+// "MULTI; DEL H1; SUNIONSTORE H2 H1; EXEC" with both keys not reached.  H1 is missing when the
+//  SUNIONSTORE runs, which would count as sent for a command outside of a transaction.  Inside the
+//  EXEC it must not expedite H2, as a command inside a transaction can't block.
+TEST_F(BgIterationTest, multiDeletedKeyDoesNotExpediteInExec_eventual) {
+    bgIterator *it = bgIteratorCreateFullScanIter("iter", BGITERATOR_CONSISTENCY_EVENTUAL, NULL,
+                                                  iteratorCleanupFn, PRIVDATA);
+    expectReadKey(it, 0); // Keys 1 & 2 are in queue
+
+    c = getMultiClient("DEL H1; SUNIONSTORE H2 H1");
+    simulateUnblockedWrite_inCall(c); // the EXEC
+    server.in_exec = 1;
+
+    advanceMultiClientToCommand(c, 0); // DEL H1
+    EXPECT_CALL(mock, blockClientInUseOnKeys(c, _, _)).Times(0);
+    EXPECT_FALSE(bgIteration_blockClientIfRequired(c));
+    sds delKey = sdsnew(keyStr(6));
+    bgIteration_keyDelete(0, delKey);
+    sdsfree(delKey);
+    simpleDelItem(6);
+    bgIteration_handleCommandReplication(c->db->id, c->cmd, c->argc, c->argv);
+
+    advanceMultiClientToCommand(c, 1); // SUNIONSTORE H2 H1
+    EXPECT_FALSE(bgIteration_blockClientIfRequired(c));
+    bgIteration_handleCommandReplication(c->db->id, c->cmd, c->argc, c->argv);
+    server.in_exec = 0;
+    server.in_call--;
+    bgIteration_endExecutionUnit();
+
+    // Nothing is replicated.  The scan sends H2.
+    expectReadKeySequence(it, 1, 5);
+    expectReadKeySequence(it, 7, LAST_ITEM);
+    expectReadComplete(it);
+}
+
+
+// "MULTI; SUNIONSTORE H1 H2; SUNIONSTORE B0 H1; EXEC" with B0 passed.  The second command needs H1
+//  sent first, which makes H1 sent for the first command too, so H2 must be sent as well.  Each
+//  command is then replicated with all of its keys sent.
+TEST_F(BgIterationTest, multiExpeditesKeysOfEveryCommand_eventual) {
+    bgIterator *it = bgIteratorCreateFullScanIter("iter", BGITERATOR_CONSISTENCY_EVENTUAL, NULL,
+                                                  iteratorCleanupFn, PRIVDATA);
+    expectReadKey(it, 0);
+    expectReadKey(it, 1); // Key 0 is passed and no longer in use
+
+    c = getMultiClient("SUNIONSTORE H1 H2; SUNIONSTORE B0 H1");
+    simulateBlockedWrite(c, 2); // the EXEC waits on H1 and H2
+    expectReadKey(it, 6);       // H1, expedited for the second command
+    expectReadKey(it, 7);       // H2, expedited when the first command was checked again
+    expectReadKey(it, 2);       // Was already in queue.  Releases H2 and queues keys 3 & 4.
+
+    simulateUnblockedWrite_inCall(c); // the EXEC
+    server.in_exec = 1;
+    struct serverCommand *cmd_multi = lookupCommandByCString("multi");
+    bgIteration_handleCommandReplication(0, cmd_multi, 1, &shared.multi);
+    for (int i = 0; i < 2; i++) {
+        advanceMultiClientToCommand(c, i);
+        EXPECT_FALSE(bgIteration_blockClientIfRequired(c));
+        bgIteration_handleCommandReplication(c->db->id, c->cmd, c->argc, c->argv);
+    }
+    server.in_exec = 0;
+    struct serverCommand *cmd_exec = lookupCommandByCString("exec");
+    bgIteration_handleCommandReplication(0, cmd_exec, 1, &shared.exec);
+    server.in_call--;
+    bgIteration_endExecutionUnit();
+    EXPECT_FALSE(bgIteratorIsTerminating(it));
+
+    expectReadKeySequence(it, 3, 4);
+    expectReadMultiReplication(it);
+    bgIteration_feedIterators();
+    bgIteratorItem *item = bgIteratorRead(it);
+    ASSERT_EQ(item->type, BGITERATOR_ITEM_REPLICATION);
+    EXPECT_THAT(item->u.repl.argv[1], robjEqualsStr(keyStr(6)));
+    item = bgIteratorRead(it);
+    ASSERT_EQ(item->type, BGITERATOR_ITEM_REPLICATION);
+    EXPECT_THAT(item->u.repl.argv[1], robjEqualsStr(keyStr(0)));
+    expectReadExecReplication(it);
+    expectReadKey(it, 5);
+    expectReadKeySequence(it, 8, LAST_ITEM);
+    expectReadComplete(it);
+}
+
+
 /////////////////////////////////////////////////////
 // THE REMAINING TESTS ARE GENERAL / UNCATEGORIZED
 /////////////////////////////////////////////////////

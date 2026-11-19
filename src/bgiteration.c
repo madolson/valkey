@@ -12,6 +12,7 @@
 #include "monotonic.h"
 #include "mutexqueue.h"
 #include "server.h"
+#include "script.h"
 
 
 static bool receiveItemsBackFromOneIterator(bgIterator *it);
@@ -36,11 +37,6 @@ static bool isFormatChangingCommand(struct serverCommand *cmd) {
  * is replicated as a write.  So it needs to be detected and handled specially. */
 static bool isWriteCmd(struct serverCommand *cmd) {
     return ((cmd->flags & CMD_WRITE) || isFormatChangingCommand(cmd) || (cmd->proc == execCommand) || (isScriptCallWriteCmd(cmd)));
-}
-
-// Returns true if the command is a deletion based command (DEL or UNLINK)
-static bool isDeleteCmd(struct serverCommand *cmd) {
-    return ((cmd->proc == delCommand) || (cmd->proc == unlinkCommand));
 }
 
 /* This utility utilizes the main thread and background threads for processing.  The API is split,
@@ -168,10 +164,12 @@ static dictType sdsrefToPtrDictType = {
     .entryDestructor = zfree};
 
 
-/* Wrap decrRefCount() so that it can be used as a callback requiring void. */
-static void decrRefCountVoid(void *o) {
-    decrRefCount(o);
-}
+/* DictType for the key verdicts of an iterator.  The SDS key is owned, the value is a keyVerdict. */
+static dictType keyVerdictDictType = {
+    .entryGetKey = dictEntryGetKey,
+    .hashFunction = dictSdsHash,
+    .keyCompare = dictSdsKeyCompare,
+    .entryDestructor = dictEntryDestructorSdsKey};
 
 
 /* Concatenate argc/argv into a command string for debugging. */
@@ -393,16 +391,23 @@ struct bgIterator {
      * Set to true in iteration client when it decides to end early. */
     volatile bool terminated;
 
-    bool cur_cmd_may_replicate; // Used only in main thread during command processing
+    /* Set by bgIteration_blockClientIfRequired() for a client command (or an EXEC) once any of its keys
+     * has been sent, so that all of its keys are sent before it runs.  Kept through the commands of
+     * the EXEC.  Used only in main thread. */
+    bool expedite_all_keys;
 
-    /* When a key is deleted (expire/evict):
-     *   1. bgIteration_keyDelete() is called
-     *   2. the key is physically deleted
-     *   3. replication is generated
-     * At replication time (step 3) we need to know whether each iterator had already processed the
-     * deleted key.  keyDelete() removes the dbEntry from early_iterate_entries immediately (step 1)
-     * to avoid a dangling pointer.  This flag records if the entry was in early_iterate_entries. */
-    bool last_key_delete_was_early; // Used only in main thread during command processing
+    /* Replication iterators only.  The verdicts for keys created or deleted by writes that haven't
+     * been propagated yet, keyed by keyVerdictKey().  A key's state at propagation time can't tell if
+     * the iterator had sent a key that has since been deleted, or if an existing key was created by
+     * the command.  The first verdict for a key sticks, so it reflects the state before the command.
+     * The propagation of a command uses up the verdicts of its keys, the end of the execution unit
+     * clears the rest.  Used only in main thread. */
+    dict *key_verdicts;
+
+    /* MULTI/EXEC framing for the replication stream.  The MULTI of an execution unit is queued only
+     * before its first replicated command, and the EXEC only if the MULTI was queued. */
+    bool multi_pending;
+    bool multi_sent;
     unsigned long added_since_feed; // Items queued outside of feedIterator since its last call
 
     // Variables maintaining runtime statistics
@@ -439,10 +444,6 @@ static dict *nameToIterator; // bgIterator->name -> bgIterator
 // Global, across all iterators, dict contains a dbEntry pointer -> ref count
 static dict *inUseEntries; // dbEntry -> ref count
 
-/* Key values in the current command which don't exist in the DB yet.  Needed for determination of
- * replication for NON-consistent iterations. */
-static list *curCmdMissingKeys; // list of robj
-
 /* A counter of the total amount of memory used for buffered replication data.  This amount is
  * excluded when computing the need for evictions. */
 static ssize_t bufferedReplicationBytes;
@@ -459,14 +460,6 @@ static long long bgIterator_timeproc_id;
 
 // Incremented on each new iteration, this is updated in dbEntry metadata whenever an entry is modified.
 static uint32_t bgIteration_epoch = 1;
-
-/* If true, the iterators' cur_cmd_may_replicate flag was determined for the current top-level
- * command (or a write nested inside it).  Otherwise, we skipped over computing this flag (maybe
- * because it was a READ command).  The flag is only cleared at top level, so a nested READ
- * (inside EXEC, a script, or RM_Call) doesn't hide the flags of the write that contains it.
- * If this is true, AND we are in the context of executing a command inside of call(), then we
- * should respect the setting of cur_cmd_may_replicate. */
-static bool iteratorReplicationFlagsWereUpdated;
 
 
 /* BgIteration debug captures BgIteration activity to a large sds buffer.  When an iterator is
@@ -936,6 +929,9 @@ static void bgIteratorRelease(bgIterator *it) {
     hashtableRelease(it->early_iterate_entries);
     it->early_iterate_entries = NULL;
 
+    if (it->key_verdicts) dictRelease(it->key_verdicts);
+    it->key_verdicts = NULL;
+
     sdsfree(it->name);
     zfree(it);
 }
@@ -1132,6 +1128,45 @@ static bool iteratorHasPassedKey(bgIterator *it, int dbid, const_sds key, dbEntr
 }
 
 
+/* The verdict a replication iterator records for a key created or deleted by a command that hasn't been
+ * propagated yet.  See bgIterator.key_verdicts. */
+typedef enum {
+    KEY_VERDICT_NONE = 0, // No verdict recorded
+    KEY_VERDICT_CREATED,  // Created by the command
+    KEY_VERDICT_SENT,     // Deleted by the command after the iterator had sent it
+    KEY_VERDICT_NOT_SENT, // Deleted by the command before the iterator had sent it
+} keyVerdict;
+
+static sds keyVerdictKey(int dbid, const_sds key) {
+    sds vkey = sdsnewlen(&dbid, sizeof(dbid));
+    return sdscatlen(vkey, key, sdslen(key));
+}
+
+// The first verdict for a key sticks.
+static void recordKeyVerdict(bgIterator *it, int dbid, const_sds key, keyVerdict verdict) {
+    sds vkey = keyVerdictKey(dbid, key);
+    if (dictAdd(it->key_verdicts, vkey, (void *)(uintptr_t)verdict) != DICT_OK) sdsfree(vkey);
+}
+
+static keyVerdict findKeyVerdict(bgIterator *it, int dbid, const_sds key) {
+    if (dictSize(it->key_verdicts) == 0) return KEY_VERDICT_NONE;
+    sds vkey = keyVerdictKey(dbid, key);
+    dictEntry *de = dictFind(it->key_verdicts, vkey);
+    sdsfree(vkey);
+    return de ? (keyVerdict)(uintptr_t)dictGetVal(de) : KEY_VERDICT_NONE;
+}
+
+static void clearKeyVerdicts(void) {
+    listIter li;
+    listNode *node;
+    listRewind(allIterators, &li);
+    while ((node = listNext(&li)) != NULL) {
+        bgIterator *it = listNodeValue(node);
+        if (it->key_verdicts && dictSize(it->key_verdicts) > 0) dictEmpty(it->key_verdicts, NULL);
+    }
+}
+
+
 // This expedites a single key and doesn't attempt to avoid expediting through optimization.
 static bool expediteSingleKeyWithoutOptimization(bgIterator *it,
                                                  int dbid,
@@ -1181,7 +1216,8 @@ static bool expediteKeysForMove(bgIterator *it,
     if (expediteSingleKeyWithoutOptimization(it, dbid, key, waitingOnKeys)) mustBlock = true;
     if (expediteSingleKeyWithoutOptimization(it, destDbid, key, waitingOnKeys)) mustBlock = true;
 
-    it->cur_cmd_may_replicate = true;
+    // The keys are sent, so in a transaction all of the other keys must be too
+    if (!server.in_exec || scriptIsRunning()) it->expedite_all_keys = true;
     return mustBlock;
 }
 
@@ -1204,7 +1240,8 @@ static bool expediteKeysForCopy(bgIterator *it,
     if (expediteSingleKeyWithoutOptimization(it, dbid, srcKey, waitingOnKeys)) mustBlock = true;
     if (expediteSingleKeyWithoutOptimization(it, destDbid, destKey, waitingOnKeys)) mustBlock = true;
 
-    it->cur_cmd_may_replicate = true;
+    // The keys are sent, so in a transaction all of the other keys must be too
+    if (!server.in_exec || scriptIsRunning()) it->expedite_all_keys = true;
     return mustBlock;
 }
 
@@ -1296,12 +1333,7 @@ static bool expediteKeysForWrite(bgIterator *it,
                 }
             }
         }
-        it->cur_cmd_may_replicate = true; // Will replicate only if replication enabled
     } else {
-        /* Identification of missing keys is only needed for non-consistent iteration.  This only
-         * needs to be collected once (on the 1st non-consistent iteration). */
-        bool collectMissing = (listLength(curCmdMissingKeys) == 0);
-
         if (it->iteration_flags & BGITERATOR_FLAG_REPLICATION) {
             // CONSISTENT = NO,  REPLICATION = YES
             bool someIterated = false;
@@ -1314,10 +1346,8 @@ static bool expediteKeysForWrite(bgIterator *it,
                 sds key = objectGetVal(oKey);
                 dbEntry *de = (server.db[dbid]) ? dbFind(server.db[dbid], key) : NULL;
                 if (de == NULL) {
-                    if (collectMissing) {
-                        incrRefCount(oKey);
-                        listAddNodeHead(curCmdMissingKeys, oKey);
-                    }
+                    /* A key the command creates is sent by its replication, so it counts as sent. */
+                    someIterated = true;
                     continue;
                 }
                 if (iteratorHasPassedKey(it, dbid, key, de)) {
@@ -1331,31 +1361,12 @@ static bool expediteKeysForWrite(bgIterator *it,
                 }
             }
 
-            /* Since missing keys are considered as already iterated, if there are any missing keys
-             * we must consider that some keys have been iterated, and make sure all other keys
-             * will be expedited if needed. */
-            if (listLength(curCmdMissingKeys) > 0) someIterated = true;
-
-            /* This command may be executing as part of a larger transaction.  If some parts of the
-             * transaction have already been identified to replicate, we must wait on all keys and
-             * replicate here as well.  (Take care not to set cur_cmd_may_replicate to false.) */
-            if (someIterated) {
-                if (server.in_exec) {
-                    /* We are now executing the commands in a multi-exec block.
-                     *
-                     * Regarding MULTI/EXEC:  Remember that this code is executed twice for commands
-                     * within a MULTI/EXEC block.  First, we parse all the commands when deciding
-                     * if the EXEC should be blocked.  Then, as each command is executed, it's
-                     * re-parsed so that we can maintain the early iterated list as the commands
-                     * execute.  In this second pass, as each command is executed, we can't change
-                     * the replication decision which was made earlier (when the EXEC was processed).
-                     * We don't want to get tricked (by a key being removed and recreated) into
-                     * starting to replicate in the middle of a MULTI/EXEC block. */
-                } else {
-                    it->cur_cmd_may_replicate = true;
-                }
-            }
-            if (it->cur_cmd_may_replicate) {
+            /* If some keys have been sent, the replication of this command will need the others,
+             * so they are sent before it runs.  Within an EXEC, this was settled for all of the
+             * commands of the transaction when the EXEC was checked, and a command can't block.  A
+             * script can, synchronously. */
+            if (someIterated && (!server.in_exec || scriptIsRunning())) it->expedite_all_keys = true;
+            if (it->expedite_all_keys) {
                 dictEntry *de;
                 dictIterator *di = dictGetIterator(notIteratedKeys);
                 while ((de = dictNext(di)) != NULL) {
@@ -1376,13 +1387,7 @@ static bool expediteKeysForWrite(bgIterator *it,
                 robj *oKey = argv[keyrefs[i].pos];
                 sds key = objectGetVal(oKey);
                 dbEntry *de = (server.db[dbid]) ? dbFind(server.db[dbid], key) : NULL;
-                if (de == NULL) {
-                    if (collectMissing) {
-                        incrRefCount(oKey);
-                        listAddNodeHead(curCmdMissingKeys, oKey);
-                    }
-                    continue;
-                }
+                if (de == NULL) continue;
                 if (isEntryInuseByAnyIterator(de)) {
                     mustBlock = true;
                     hashtableAdd(waitingOnKeys, oKey);
@@ -1519,8 +1524,6 @@ static void processReturnOfItemToMainThread(bgIterator *it, bgIteratorItem *item
         serverAssert(it->swapdb_queued == it->swapdb_processed);
         serverAssert(it->flushdb_queued == it->flushdb_processed);
         serverAssert(it->dbentry_clones_queued == it->dbentry_clones_processed);
-
-        listEmpty(curCmdMissingKeys); // Just in case any remain
 
         bool terminated = it->terminated;
         void *privdata = it->privdata;
@@ -1699,98 +1702,6 @@ void bgIteration_feedIterators(void) {
 }
 
 
-static void resetReplicationFlagForIterators(client *c) {
-    /* For any given command, the command may or may not need to be replicated based on the status
-     * and flags of each iterator.  Furthermore, if a command does need to be replicated, this
-     * replication must occur for an entire atomic unit; we can't replicate only part of a script
-     * or multi/exec.
-     * This function is the only place where the replication flag is cleared. */
-
-    if (c->flag.multi || c->flag.script) {
-        /* REGARDING MULTI/EXEC
-         * --------------------
-         * When processing a MULTI/EXEC, blockClientIfRequired is called first for the MULTI.  Then,
-         * all of the commands are queued up in server.c:processCommand().  It's only when EXEC is
-         * encountered, that server.c:call() is fired to begin execution.
-         *
-         * AFTER the EXEC is processed by call(), then each of the commands in the MULTI/EXEC block
-         * will be processed through call().
-         *
-         * If write commands are present, MULTI & EXEC will be passed to the replication stream
-         * before/after the transaction commands.  Note that MULTI & EXEC are not actually
-         * "executed" at the time when their replication is passed to the replication stream.
-         *
-         * Example:  MULTI; SET A B; EXEC
-         *  1. blockClientIfRequired() called for MULTI.  MULTI flag IS NOT set.  (Won't block.)
-         *  2. blockClientIfRequired() called for EXEC.  MULTI flag IS set.  (Might block.)
-         *  3. blockClientIfRequired() called for SET.  MULTI flag IS set.  (Won't block.)
-         *  4. handleCommandReplication() is called for MULTI.
-         *  5. handleCommandReplication() is called for SET.
-         *  6. handleCommandReplication() is called for EXEC.
-         *
-         * SO - if the MULTI flag is set, we DON'T clear the flag.  It should only be cleared at the
-         * start of the transaction, when MULTI is received - and the flag isn't set yet. */
-
-        /* REGARDING SCRIPTS
-         * -----------------
-         * When processing a script, blockClientIfRequired is called first for the EVAL/EVALSHA/FCALL.
-         * Then, all of the commands are processed using a special script client.  The script
-         * client has the CLIENT_SCRIPT flag set.  For scripts, the replication flag is set when
-         * processing the EVAL/EVALSHA/FCALL and should not be cleared when executing individual
-         * commands in the script. */
-
-        /* If it's the EXEC command, we fall through and clear the flag below.  But for all other
-         *  commands within the transaction, we don't clear the flag. */
-        if (c->cmd->proc != execCommand) return;
-    }
-
-    /* For most commands, the replication flag is cleared and we determine if replication is needed
-     * based on the keys being used and their state in each iterator. If a modified key hasn't been
-     * processed yet, there's no need to expedite the key or send the replication.  The key will be
-     * sent later, when reached by the iterator.
-     *
-     * However, for scripts, it is not possible to perform this optimization.  There is no way to
-     * know if an undeclared key might be modified.  Since the entire script needs to be replicated
-     * (or not replicated) atomically, we can't take the chance that an undeclared key might be
-     * hit which requires replication. */
-    bool isScript = isScriptCallWriteCmd(c->cmd);
-
-    sds firstScriptKey = NULL;
-    if (isScript) {
-        /* If it's a script, we will normally replicate.  But if the keys are out of scope for the
-         * iteration, we shouldn't.  The use-case for this is with slot iteration, when the script
-         * is acting on keys from a different slot.  Here, we just check the first declared key, and
-         * if it's out of scope for the iteration, we won't replicate it.  This might cause issues
-         * for cross-slot scripts (anti-pattern), but the alternative is replicating all scripts,
-         * regardless of slot. */
-        getKeysResult result;
-        initGetKeysResult(&result);
-        getKeysFromCommand(c->cmd, c->argv, c->argc, &result);
-        if (result.numkeys > 0) firstScriptKey = objectGetVal(c->argv[result.keys[0].pos]);
-        getKeysFreeResult(&result);
-    }
-
-    listIter li;
-    listNode *node;
-    listRewind(allIterators, &li);
-    while ((node = listNext(&li)) != NULL) {
-        bgIterator *it = listNodeValue(node);
-        if (it->completed || it->terminated) {
-            it->cur_cmd_may_replicate = false;
-        } else {
-            /* For normal commands, the flag is initialized to false (not to replicate).  For these
-             * commands, we decide later based on the actual commands.
-             *
-             * However, for scripts, we don't know what commands will be executed.  So IF it's a
-             * script, and the keys are in scope (on the right slot) we initialize the replication
-             * flag to true. */
-            it->cur_cmd_may_replicate = isScript && firstScriptKey &&
-                                        it->keyset_iter->isKeyInScope(it->keyset_iter, firstScriptKey);
-        }
-    }
-}
-
-
 static void handleSwapdb(int db1, int db2) {
     serverAssert(hasMainThreadExclusivity());
     serverAssert(bgIteration_iterationActive());
@@ -1896,13 +1807,13 @@ static bool expediteKeysForWriteOnAllIterators(int dbid,
 }
 
 
-static bool anIteratorWillReplicateForThisCommand(void) {
+static bool anIteratorExpeditesAllKeys(void) {
     listIter li;
     listNode *node;
     listRewind(allIterators, &li);
     while ((node = listNext(&li)) != NULL) {
         bgIterator *it = listNodeValue(node);
-        if (it->cur_cmd_may_replicate) return true;
+        if (it->expedite_all_keys) return true;
     }
     return false;
 }
@@ -1933,14 +1844,16 @@ static bool expediteKeysForMultiExec(client *c, hashtable *waitingOnKeys) {
      * key AND dictID.  One way to do this might be with a dict of dicts, where the first dict maps
      * a dictID to a dict of keys.
      *
-     * ALTERNATIVELY (and it's the simpler approach that's taken here) we can just check if the
-     * MULTI will be replicated.  If so, we re-process the MULTI, just in case there were commands
-     * prior to deciding that replication was required that might have missed expediting.  If so,
-     * these will be caught on the 2nd time around.
+     * ALTERNATIVELY (and it's the simpler approach that's taken here) we can just check if some
+     * key of the MULTI has been sent.  If so, we re-process the MULTI, just in case there were
+     * commands prior to that which might have missed expediting.  If so, these will be caught on
+     * the 2nd time around.  Expediting all of the keys of the transaction (not just those of the
+     * commands with a sent key) matters as an expedited key is sent for all of the commands that
+     * use it.
      *
-     * Checking replication status before/after ensures that there can only be a single recursive
+     * Checking the expedite status before/after ensures that there can only be a single recursive
      * call. */
-    bool initiallyAnIteratorWillReplicate = anIteratorWillReplicateForThisCommand();
+    bool initiallyExpeditingAllKeys = anIteratorExpeditesAllKeys();
 
     bool mustBlock = false;
     int *cur_to_orig_db = NULL;
@@ -1975,6 +1888,18 @@ static bool expediteKeysForMultiExec(client *c, hashtable *waitingOnKeys) {
 
         if (!isWriteCmd(cmd)) continue;
 
+        /* A script can expedite keys it doesn't declare as it runs, and the commands after it can't
+         * block.  So the keys of a transaction with a script are all sent up front. */
+        if (isScriptCallWriteCmd(cmd)) {
+            listIter li;
+            listNode *node;
+            listRewind(allIterators, &li);
+            while ((node = listNext(&li)) != NULL) {
+                bgIterator *it = listNodeValue(node);
+                it->expedite_all_keys = true;
+            }
+        }
+
         getKeysResult result;
         initGetKeysResult(&result);
         int numkeys = getKeysFromCommand(cmd, argv, argc, &result);
@@ -1994,10 +1919,10 @@ static bool expediteKeysForMultiExec(client *c, hashtable *waitingOnKeys) {
 
     zfree(cur_to_orig_db);
 
-    if (!initiallyAnIteratorWillReplicate && anIteratorWillReplicateForThisCommand()) {
-        /* We've decided to replicate.  Re-process the MULTI/EXEC just once more to make sure that
+    if (!initiallyExpeditingAllKeys && anIteratorExpeditesAllKeys()) {
+        /* Some key has been sent.  Re-process the MULTI/EXEC just once more to make sure that
          * we didn't miss any keys at the beginning.  This can't continue to recurse because
-         * `initiallyAnIteratorWillReplicate` will be TRUE in the recursive call.  Note that the
+         * `initiallyExpeditingAllKeys` will be TRUE in the recursive call.  Note that the
          * recursive call may add additional entries to `waitingOnKeys`. */
         if (expediteKeysForMultiExec(c, waitingOnKeys)) mustBlock = true;
     }
@@ -2050,8 +1975,10 @@ static bgIterator *bgIteratorCreate(const char *name,
     it->client_is_active = false;
     it->completed = false;
     it->terminated = false;
-    it->cur_cmd_may_replicate = false;
-    it->last_key_delete_was_early = false;
+    it->expedite_all_keys = false;
+    it->key_verdicts = (flags & BGITERATOR_FLAG_REPLICATION) ? dictCreate(&keyVerdictDictType) : NULL;
+    it->multi_pending = false;
+    it->multi_sent = false;
     it->added_since_feed = 0;
 
     it->dbentries_queued = 0;
@@ -2260,10 +2187,6 @@ void bgIteration_init(void) {
     inUseEntries = dictCreate(&dictEntryPtrDictType);
     serverAssert(inUseEntries != NULL);
 
-    curCmdMissingKeys = listCreate();
-    serverAssert(curCmdMissingKeys != NULL);
-    listSetFreeMethod(curCmdMissingKeys, decrRefCountVoid);
-
     bufferedReplicationBytes = 0;
 
     if (BGITERATION_DEBUG) {
@@ -2313,18 +2236,39 @@ void bgIteration_keyDelete(int dbid, const_sds key) {
         }
 
         /* Since the key is being removed from the main dictionary, also remove it from the
-         * early_iterate_entries (if it was there) and save the early iterate status for use during
-         * the replication of the DEL. */
-        it->last_key_delete_was_early = hashtableDelete(it->early_iterate_entries, de);
+         * early_iterate_entries (if it was there).  Whether the iterator had sent the key can't be
+         * told after the removal, so record it for the replication of the deletion. */
+        bool was_early = hashtableDelete(it->early_iterate_entries, de);
+        if (it->iteration_flags & BGITERATOR_FLAG_REPLICATION) {
+            bool sent = was_early || it->keyset_iter->hasPassedItem(it->keyset_iter, key, dbid);
+            recordKeyVerdict(it, dbid, key, sent ? KEY_VERDICT_SENT : KEY_VERDICT_NOT_SENT);
+        }
     }
+}
 
-    /* We might be within the context of a command execution.  This happens if the key is found to
-     * be expired when attempting to execute the command.  In this case, we should treat the key as
-     * missing.  If the key exists after the command executes, we can treat it like a new key. */
-    if (server.in_call) {
-        robj *oKey = createObject(OBJ_STRING, sdsdup(key));
-        listAddNodeHead(curCmdMissingKeys, oKey);
+
+// PUBLIC API
+void bgIteration_keyAdded(int dbid, const_sds key) {
+    if (!bgIteration_iterationActive()) return;
+    serverAssert(hasMainThreadExclusivity());
+
+    listIter li;
+    listNode *node;
+    listRewind(allIterators, &li);
+    while ((node = listNext(&li)) != NULL) {
+        bgIterator *it = listNodeValue(node);
+        if (it->completed || it->terminated || !(it->iteration_flags & BGITERATOR_FLAG_REPLICATION)) continue;
+        if (!it->keyset_iter->isKeyInScope(it->keyset_iter, key)) continue;
+        recordKeyVerdict(it, dbid, key, KEY_VERDICT_CREATED);
     }
+}
+
+
+// PUBLIC API
+void bgIteration_endExecutionUnit(void) {
+    if (!bgIteration_iterationActive()) return;
+    serverAssert(hasMainThreadExclusivity());
+    clearKeyVerdicts();
 }
 
 
@@ -2343,8 +2287,6 @@ void bgIteration_swapdb(int db1, int db2) {
 // PUBLIC API
 bool bgIteration_blockClientIfRequired(client *c) {
     serverAssert(hasMainThreadExclusivity());
-    // Don't clear this when in a nested command (like a GET inside a MULTI)
-    if (server.in_call == 0) iteratorReplicationFlagsWereUpdated = false;
     if (!bgIteration_iterationActive()) return false;
     if (!isWriteCmd(c->cmd)) return false;
 
@@ -2354,11 +2296,16 @@ bool bgIteration_blockClientIfRequired(client *c) {
         sdsfree(sdsArgv);
     }
 
-    /* Before executing a command or atomic transaction, the replication flag is cleared for each
-     * iterator.  If it's determined that the command should replicate, the flag will be set
-     * as the command and keys are examined for expedite. */
-    resetReplicationFlagForIterators(c);
-    iteratorReplicationFlagsWereUpdated = true;
+    // The commands within an EXEC keep the decision made for the EXEC
+    if (!server.in_exec) {
+        listIter li;
+        listNode *node;
+        listRewind(allIterators, &li);
+        while ((node = listNext(&li)) != NULL) {
+            bgIterator *it = listNodeValue(node);
+            it->expedite_all_keys = false;
+        }
+    }
 
     if (c->cmd->proc == flushdbCommand || c->cmd->proc == flushallCommand) {
         // Handle flush commands prior to execution
@@ -2371,7 +2318,6 @@ bool bgIteration_blockClientIfRequired(client *c) {
 
     bool mustBlock = false;
     hashtable *waitOnKeys = hashtableCreate(&tempKeysetHashtableType); // set of robj(sds)
-    listEmpty(curCmdMissingKeys);
 
     if (c->cmd->proc == execCommand) {
         mustBlock = expediteKeysForMultiExec(c, waitOnKeys);
@@ -2412,15 +2358,6 @@ bool bgIteration_blockClientIfRequired(client *c) {
                         c->db->id, c->cmd, c->argc, c->argv, keyrefs, numkeys, waitOnKeys);
                 }
             }
-        } else {
-            // WRITE commands with no keys should always be replicated.  SWAPDB, FLUSH, FUNCTION, etc.
-            listIter li;
-            listNode *node;
-            listRewind(allIterators, &li);
-            while ((node = listNext(&li)) != NULL) {
-                bgIterator *it = listNodeValue(node);
-                it->cur_cmd_may_replicate = true;
-            }
         }
         getKeysFreeResult(&result);
     }
@@ -2454,6 +2391,137 @@ bool bgIteration_blockClientIfRequired(client *c) {
 }
 
 
+/* Queue a replication item for an iterator. */
+static void queueReplication(bgIterator *it, int dbid, struct serverCommand *cmd, int argc, robj **argv) {
+    if (BGITERATION_DEBUG) {
+        debugBuffer = sdscat(debugBuffer, " (queued)\n");
+    }
+
+    bgIteratorItem *item = itemFreeList_getElementOrAllocate();
+    item->type = BGITERATOR_ITEM_REPLICATION;
+    item->dbid = dbid;
+    item->u.repl.cmd = cmd;
+    item->u.repl.argv = cloneRobjArray(argc, argv);
+    item->u.repl.argc = argc;
+    item->u.repl.replication_size = replicationItemSize(item);
+    bufferedReplicationBytes += item->u.repl.replication_size;
+    it->replication_queued++;
+    it->added_since_feed++;
+    mutexQueueAdd(it->items_for_iterator, item);
+}
+
+
+/* How one key of a propagated command votes on its replication. */
+typedef enum {
+    KEY_VOTE_NONE,     // The key doesn't exist before or after the command, or is out of scope
+    KEY_VOTE_SENT,     // The iteration client has the key, so it needs the command
+    KEY_VOTE_NOT_SENT, // The iteration client doesn't have the key, the scan will send it later
+    KEY_VOTE_CREATED,  // The command created the key.  Either way works, if the scan hasn't passed it.
+} keyVote;
+
+/* Decide how a key of a propagated command votes, by its state before the command.  Sets *to_mark to the
+ * dbEntry of a key the command created, which the scan must skip if the command replicates. */
+static keyVote voteForKey(bgIterator *it, int dbid, sds key, dbEntry **to_mark) {
+    *to_mark = NULL;
+    dbEntry *de = (server.db[dbid]) ? dbFind(server.db[dbid], key) : NULL;
+    if (de && iteratorHasPassedKey(it, dbid, key, de)) return KEY_VOTE_SENT;
+
+    switch (findKeyVerdict(it, dbid, key)) {
+    case KEY_VERDICT_SENT: // Deleted by the command, and maybe recreated
+        *to_mark = de;
+        return KEY_VOTE_SENT;
+    case KEY_VERDICT_NOT_SENT: return KEY_VOTE_NOT_SENT;
+    case KEY_VERDICT_CREATED:
+        *to_mark = de;
+        return KEY_VOTE_CREATED;
+    default: return de ? KEY_VOTE_NOT_SENT : KEY_VOTE_NONE;
+    }
+}
+
+
+/* Decides if a propagated write replicates to an iterator, by the state of its keys before it ran:
+ *  - With no keys (SWAPDB, FLUSHDB, FUNCTION, ...), it replicates.
+ *  - With no key in the scope of the iterator, it doesn't.
+ *  - If any key has been sent to the iteration client, it replicates.
+ *  - If any key hasn't been sent, it doesn't.  The scan sends the key in its final state.
+ *  - A command with keys of both kinds can't be replicated correctly.  Client commands don't do this,
+ *    bgIteration_blockClientIfRequired() sends all of their keys first.  A module can, by writing
+ *    and replicating outside of a command.  Sets *mixed, and the iteration is terminated.
+ *  - A command that only creates keys replicates, except within a transaction that has no key sent.
+ *    There the other commands don't replicate, and one of them might use the key.
+ * If it replicates, the keys it created are marked so the scan skips them. */
+static bool shouldReplicateToIterator(bgIterator *it,
+                                      int dbid,
+                                      struct serverCommand *cmd,
+                                      int argc,
+                                      robj **argv,
+                                      int special_dbid,
+                                      int special_pos,
+                                      bool *mixed) {
+    *mixed = false;
+
+    getKeysResult result;
+    initGetKeysResult(&result);
+    int numkeys = getKeysFromCommand(cmd, argv, argc, &result);
+    dbEntry **mark = zmalloc(sizeof(dbEntry *) * (numkeys + 1));
+    int mark_count = 0;
+    bool any_in_scope = false, any_sent = false, any_not_sent = false, any_created = false;
+    for (int pass = 0; pass < 2; pass++) {
+        for (int i = 0; i <= numkeys; i++) {
+            int key_dbid = dbid;
+            sds key;
+            if (i < numkeys) {
+                // The destination of COPY is not in the selected DB
+                if (cmd->proc == copyCommand && result.keys[i].pos == special_pos) continue;
+                key = objectGetVal(argv[result.keys[i].pos]);
+            } else {
+                if (special_pos < 0) break;
+                key_dbid = special_dbid;
+                key = objectGetVal(argv[special_pos]);
+            }
+            if (!it->keyset_iter->isKeyInScope(it->keyset_iter, key)) continue;
+
+            if (pass == 1) {
+                // The verdicts of the keys are used up by the command that wrote them
+                if (dictSize(it->key_verdicts) > 0) {
+                    sds vkey = keyVerdictKey(key_dbid, key);
+                    dictDelete(it->key_verdicts, vkey);
+                    sdsfree(vkey);
+                }
+                continue;
+            }
+            any_in_scope = true;
+            dbEntry *to_mark;
+            keyVote vote = voteForKey(it, key_dbid, key, &to_mark);
+            if (vote == KEY_VOTE_SENT) any_sent = true;
+            if (vote == KEY_VOTE_NOT_SENT) any_not_sent = true;
+            if (vote == KEY_VOTE_CREATED) any_created = true;
+            if (to_mark) mark[mark_count++] = to_mark;
+        }
+    }
+    getKeysFreeResult(&result);
+
+    bool replicate;
+    if (numkeys == 0) {
+        replicate = true;
+    } else if (!any_in_scope || any_not_sent) {
+        *mixed = any_sent;
+        replicate = false;
+    } else if (any_sent || !any_created) {
+        replicate = true;
+    } else {
+        replicate = !server.in_exec || it->expedite_all_keys;
+    }
+
+    // A key can be listed twice (MSET k v k v), so hashtableAdd() may find it already there.
+    if (replicate) {
+        for (int i = 0; i < mark_count; i++) hashtableAdd(it->early_iterate_entries, mark[i]);
+    }
+    zfree(mark);
+    return replicate;
+}
+
+
 // PUBLIC API
 void bgIteration_handleCommandReplication(int dbid,
                                           struct serverCommand *cmd,
@@ -2481,224 +2549,70 @@ void bgIteration_handleCommandReplication(int dbid,
         sdsfree(sdsArgv);
     }
 
-    /* If we are within the context of 'call', then blockClientIfRequired was invoked.  However,
-     * remember that the replication flags might not have been updated and we can still arrive here.
-     * Example, a top-level read command (which doesn't update replication flags) causes an
-     * expiration (which replicates a DEL). */
-    bool blockClientIfRequiredWasCalled = (server.in_call > 0);
-    bool useReplicationFlags = (blockClientIfRequiredWasCalled && iteratorReplicationFlagsWereUpdated);
-    if (!useReplicationFlags) {
-        // curCmdMissingKeys is only valid when we are using the replication flags (and stale otherwise)
-        listEmpty(curCmdMissingKeys);
-    }
-
-    /* In the case that a key is touched in a different DB (COPY/MOVE) the key is recorded as
-     *  a "special" key and than handled below. */
-    int special_dbid = 0;
-    sds special_key = NULL;
-    dbEntry *special_dbEntry = NULL;
-    if (cmd->proc == moveCommand) {
-        /* The MOVE command succeeded.  However MOVE requires special handling as it creates a new
-         * key in a different database.  We need to make sure that we don't later try to iterate
-         * on the key as it would be a duplicate key at that point.  So, instead, we will mark the
-         * newly created key as "early iterated". */
-        bool success = getDbIdFromRobj(argv[MOVE_COMMAND_DBID_ARG_INDEX], &special_dbid);
-        serverAssert(success); // the command already succeeded, so this should work!
-
-        robj *oKey = argv[1];
-        special_key = (sds)objectGetVal(oKey);
-
-        special_dbEntry = dbFind(server.db[special_dbid], special_key);
-    }
-    if (cmd->proc == copyCommand) {
-        // The COPY command succeeded.  However COPY requires special handling (like MOVE).
-        bool success = getTargetDbIdForCopyCommand(argc, argv, dbid, &special_dbid);
-        serverAssert(success); // the command already succeeded, so this should work!
-
-        // Find the newly created entry.
-        robj *oKey = argv[2];
-        special_key = (sds)objectGetVal(oKey);
-
-        special_dbEntry = dbFind(server.db[special_dbid], special_key);
-    }
-
-    /* Implementation note regarding LUA and MULTI:  LUA scripts and MULTI-EXEC blocks must be
-     * treated atomically.  We need to ensure that either ALL of the replication (or none of the
-     * replication) for the atomic operation is processed by the iterator(s).  This is handled
-     * naturally as we can only "complete" the iteration during the feeding process - and feeding
-     * is only performed when handling timer events (after the LUA/MULTI has completed).  */
-
     listIter li;
     listNode *node;
+
+    /* The MULTI is held back until the first command of the transaction that replicates, and the
+     * EXEC is sent only if the MULTI was.  Each command of the transaction is decided by its keys. */
+    if (cmd->proc == multiCommand || cmd->proc == execCommand) {
+        listRewind(allIterators, &li);
+        while ((node = listNext(&li)) != NULL) {
+            bgIterator *it = listNodeValue(node);
+            if (cmd->proc == multiCommand) {
+                it->multi_pending = true;
+                continue;
+            }
+            if (it->multi_sent && !it->completed && !it->terminated) queueReplication(it, dbid, cmd, argc, argv);
+            it->multi_pending = false;
+            it->multi_sent = false;
+        }
+        return;
+    }
+
+    /* MOVE and COPY write a key in a different DB, the argv at SPECIAL_POS.  For MOVE it's also the
+     * source key, for COPY it's the destination key. */
+    int special_dbid = 0;
+    int special_pos = -1;
+    if (cmd->proc == moveCommand) {
+        bool success = getDbIdFromRobj(argv[MOVE_COMMAND_DBID_ARG_INDEX], &special_dbid);
+        serverAssert(success); // the command already succeeded, so this should work!
+        special_pos = 1;
+    }
+    if (cmd->proc == copyCommand) {
+        bool success = getTargetDbIdForCopyCommand(argc, argv, dbid, &special_dbid);
+        serverAssert(success); // the command already succeeded, so this should work!
+        special_pos = 2;
+    }
+
+    /* Implementation note regarding LUA and MULTI:  the iteration can only "complete" during the
+     * feeding process, and feeding is only performed when handling timer events (after the
+     * LUA/MULTI has completed).  So the iterator sees all or none of an atomic unit's commands that
+     * replicate. */
+
     listRewind(allIterators, &li);
     while ((node = listNext(&li)) != NULL) {
         bgIterator *it = listNodeValue(node);
         if (it->completed || it->terminated) continue;
-
-        /* For consistent iteration, we only iterate values based on version.  But for
-         * non-consistent iteration, we don't need to explicitly iterate any values newly created
-         * during the iteration.  So we mark them as expedited.  We know we have a new key if it
-         * was missing before the command, and exists now. */
-
-        if (!(it->iteration_flags & BGITERATOR_FLAG_CONSISTENT)) {
-            // Handle the special case of a key moved to a different DB
-            if (special_dbEntry != NULL) {
-                if (it->cur_cmd_may_replicate &&
-                    !it->keyset_iter->hasPassedItem(it->keyset_iter, special_key, special_dbid)) {
-                    hashtableAdd(it->early_iterate_entries, special_dbEntry);
-                    if (BGITERATION_DEBUG) {
-                        sds entryString = createEntryString(special_dbid, special_dbEntry);
-                        debugBuffer = sdscatprintf(debugBuffer, "EARLY(special): %s\n", entryString);
-                        sdsfree(entryString);
-                    }
-                }
-
-                /* Note: In the cases where there's a special command, we are copying or moving an
-                 *       item to a different DB.  In these limited cases, we can only possibly be
-                 *       creating a single key.  And if we've handled it here, we don't need to
-                 *       handle it as a "missing key" below.  If we were to try to handle it as a
-                 *       standard "missing key", we would get the DBID incorrect. */
-
-            } else if (listLength(curCmdMissingKeys) > 0 && cmd->proc != multiCommand &&
-                       cmd->proc != execCommand && !isDeleteCmd(cmd) && cmd->proc != hdelCommand) {
-                /* MULTI/EXEC are ignored because they are injected around a transaction by
-                 * propagateToBgIteration without passing through bgIteration_blockClientIfRequired.
-                 * curCmdMissingKeys holds the keys of a command inside the transaction.
-                 * Deletes are ignored because they never create keys.  A DEL/HDEL from a lazy
-                 * expiry in a nested READ would otherwise re-process the list of the enclosing
-                 * write, adding its new keys to early_iterate_entries a second time. */
-                listIter missingIt;
-                listNode *missingNode;
-                listRewind(curCmdMissingKeys, &missingIt);
-                while ((missingNode = listNext(&missingIt)) != NULL) {
-                    robj *oKey = listNodeValue(missingNode);
-                    const_sds key = objectGetVal(oKey);
-                    dbEntry *de = dbFind(server.db[dbid], (sds)key);
-                    if (de != NULL) {
-                        // It exists now!
-                        if (it->cur_cmd_may_replicate &&
-                            !it->keyset_iter->hasPassedItem(it->keyset_iter, key, dbid)) {
-                            /* If the current command is allowed to replicate, and there is a new
-                             * key which we haven't yet reached in iteration, it needs to be added
-                             * to the set of early iterate entries.  (We know that it's not already
-                             * in that set because it's a newly created key!) */
-                            bool wasAdded = hashtableAdd(it->early_iterate_entries, de);
-                            serverAssert(wasAdded);
-                            if (BGITERATION_DEBUG) {
-                                sds entryString = createEntryString(dbid, de);
-                                debugBuffer = sdscatprintf(debugBuffer, "EARLY(NEW): %s\n", entryString);
-                                sdsfree(entryString);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // ** The code above maintains iterator state (regardless of replication)
-        // ** The code below performs the replication (if necessary) and can be skipped
         if (!(it->iteration_flags & BGITERATOR_FLAG_REPLICATION)) continue;
 
-        bool replicate = false;
-        if (useReplicationFlags) replicate = it->cur_cmd_may_replicate;
-
-        /* Deletes (and unlinks) are special.
-         * Developer context:  For most commands, we call bgIteration_blockClientIfRequired before
-         *  the command and then call bgIteration_handleCommandReplication after the command.  While
-         *  the "before" logic is determining the need to block, it can also determine (mostly) the
-         *  need for replication (on each iterator).  Doing this all in one place saves us from
-         *  performing some of the same logic twice.  When we get to this point in the code, we just
-         *  use the previously determined information regarding replication.  This works because
-         *  Valkey is single-threaded and only processes one command at a time.
-         *
-         * But deletes (and unlinks) happen multiple ways - and occur outside the normal
-         *  before/after logic for commands.  These situations must be handled:
-         *    - A normal (client-driven) DEL/UNLINK command will use the standard before/after
-         *      logic.  If the key is in use by bgIteration, the command will be blocked.
-         *    - An EVICTION generates a DEL/UNLINK which happens outside of the context of a client
-         *      issued command.  The replication flags on the iterators are stale and relate to the
-         *      prior command executed.
-         *    - An EXPIRATION in the context of a client-driven WRITE command occurs when the client
-         *      command attempts to access a key and it is found to be expired.  In this case, the
-         *      client-command has already gone through the blocking process, so it should be OK to
-         *      use it->cmd_may_replicate.
-         *    - An EXPIRATION in the context of a client-driven READ command occurs when the client
-         *      command attempts to access a key and it is found to be expired.  In this case, the
-         *      client-command has NOT gone through the blocking process.  The replication flags on
-         *      the iterators are stale and relate to the prior (write) command executed.
-         *    - An EXPIRATION outside of a client-driven command occurs due to active expiry.  In
-         *      this case, the replication flags on the iterator are stale and relate to the prior
-         *      command executed.
-         *
-         * In the case of EXPIRE/EVICT occurring outside the context of a write command, this is
-         *  handled.  If the key is in-use by bgIterator, increment of robj's refcount prevents the
-         *  key from deletion. In this case the key will be removed from the main dictionary, but
-         *  held by bgIteration until no longer needed.
-         *  Even though the entry is not physically deleted yet, it is logically deleted and it is
-         *  safe to replicate the DEL/UNLINK.  Since iterators process items FIFO, the replication
-         *  for DEL/UNLINK won't actually get processed until other queued replication is processed.
-         *
-         * In the case of a client driven DEL command, the key will have already been deleted when
-         *  we hit this routine.  In the case of EXPIRE/EVICT, they propagate happens before the key
-         *  is deleted.  So if the key is missing, we can use the cached replication decision.  But
-         *  if the key still exists (indicating EXPIRE/EVICT) we evaluate it specially. */
-        if (isDeleteCmd(cmd)) {
-            sds key = objectGetVal(argv[1]);
-            dbEntry *de = dbFind(server.db[dbid], key);
-            serverAssert(de == NULL); // dbEntry should be removed before replication (self-check)
-            if (!replicate) {
-                if (it->keyset_iter->isKeyInScope(it->keyset_iter, key)) {
-                    /* Otherwise, it's something like active expiration or eviction (unrelated), or a
-                     * lazy expiration in a READ nested inside a write whose decision didn't account
-                     * for this key.
-                     * Replicate the DEL if the iterator had already accounted for this key: either
-                     * the scan has passed its position, or it was expedited early.  The
-                     * early-expedite signal was captured into it->last_key_delete_was_early in
-                     * bgIteration_keyDelete before the entry was removed from early_iterate_entries. */
-                    if (it->keyset_iter->hasPassedItem(it->keyset_iter, key, dbid) ||
-                        it->last_key_delete_was_early) {
-                        replicate = true;
-                    }
-                }
-            }
+        bool mixed;
+        bool replicate = shouldReplicateToIterator(it, dbid, cmd, argc, argv, special_dbid, special_pos, &mixed);
+        if (mixed) {
+            serverLog(LL_WARNING,
+                      "Terminating %s: %s writes keys the iteration has sent and keys it hasn't",
+                      it->name, cmd->fullname);
+            bgIteratorTerminate(it);
+            continue;
         }
+        if (!replicate) continue;
 
-        /* An HDEL that the replication flags don't replicate: active hash field expiry, lazy expiry
-         * on a read (top-level or nested inside a write), or a client HDEL that isn't replicating.
-         * Like a DEL, decide by the key's state: replicate if the iterator has already passed the
-         * key (or sent it early).  Otherwise the iterator will send the key later in its current
-         * state, which already reflects the expired fields.  Unlike a DEL, the key usually still
-         * exists here (the final HDEL is followed by a real DEL, handled above). */
-        if (!replicate && cmd->proc == hdelCommand) {
-            sds key = objectGetVal(argv[1]);
-            if (it->keyset_iter->isKeyInScope(it->keyset_iter, key) &&
-                iteratorHasPassedKey(it, dbid, key, dbFind(server.db[dbid], key))) {
-                replicate = true;
-            }
+        if (it->multi_pending && !it->multi_sent) {
+            static struct serverCommand *cmd_multi = NULL; // STATIC
+            if (cmd_multi == NULL) cmd_multi = lookupCommandOrOriginal(&shared.multi, 1);
+            queueReplication(it, dbid, cmd_multi, 1, &shared.multi);
+            it->multi_sent = true;
         }
-
-        if (replicate) {
-            /* We will replicate the command in these cases:
-             * 1) For consistent iteration - it->cur_cmd_may_replicate is always true
-             * 2) For non-consistent, if any of the keys have been processed, expediteKeysForWrite
-             *    will ensure that ALL of the keys have been expedited - and we should replicate
-             * 3) For non-consistent, if NONE of the keys have been processed, no need to replicate */
-            if (BGITERATION_DEBUG) {
-                debugBuffer = sdscat(debugBuffer, " (queued)\n");
-            }
-
-            bgIteratorItem *item = itemFreeList_getElementOrAllocate();
-            item->type = BGITERATOR_ITEM_REPLICATION;
-            item->dbid = dbid;
-            item->u.repl.cmd = cmd;
-            item->u.repl.argv = cloneRobjArray(argc, argv);
-            item->u.repl.argc = argc;
-            item->u.repl.replication_size = replicationItemSize(item);
-            bufferedReplicationBytes += item->u.repl.replication_size;
-            it->replication_queued++;
-            it->added_since_feed++;
-            mutexQueueAdd(it->items_for_iterator, item);
-        }
+        queueReplication(it, dbid, cmd, argc, argv);
     } // allIterators loop
 }
 

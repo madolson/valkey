@@ -299,6 +299,16 @@ void bgIteration_beforeSleep(void);
 void bgIteration_keyDelete(int dbid, const_sds key);
 
 
+/* Notify bgIteration that a key has been added to the main dictionary.  This call must happen after
+ * the insertion.  Together with bgIteration_keyDelete(), this lets a replication iterator decide the
+ * replication of each write by the keys it writes. */
+void bgIteration_keyAdded(int dbid, const_sds key);
+
+
+/* Called at the end of each execution unit (after its replication has been provided). */
+void bgIteration_endExecutionUnit(void);
+
+
 /* Iteration needs to know if a FLUSHALL is being performed.  For normal clients, this comes through
  * the standard "blockClientIfRequired" interface.  This interface is for cases where Valkey
  * performs the FLUSHALL operation independently of clients (e.g. when syncing with master). */
@@ -342,9 +352,9 @@ bool bgIteration_blockClientIfRequired(client *c);
 
 
 /* After execution of a write command, the Valkey main thread must provide the command to iterators
- * which are interested in the replication feed.  It is required that all commands have been passed
- * through bgIteration_blockClientIfRequired(), however, it is permitted that the command can be
- * re-written for propagation. */
+ * which are interested in the replication feed.  This includes writes made outside of a client
+ * command (expiry, eviction, modules).  Each write is decided by the state of its keys, so the
+ * command can be re-written for propagation. */
 void bgIteration_handleCommandReplication(
     int dbid,
     struct serverCommand *cmd,
