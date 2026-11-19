@@ -2509,7 +2509,7 @@ foreach load_mode {disabled on-empty-db} {
                 $replica config set key-load-delay 10000
                 set loglines [count_log_lines -1]
                 $replica replicaof $primary_host $primary_port
-                wait_for_log_messages -1 {"*forkless-save: replication done*"} $loglines 300 100
+                wait_for_log_messages -1 {"*forkless-save: forkless save complete*"} $loglines 300 100
                 wait_for_condition 300 100 {
                     [s 0 loading] eq 1
                 } else {
@@ -2546,17 +2546,18 @@ foreach load_mode {disabled on-empty-db} {
 
 foreach primary_diskless {yes no} {
     foreach replica_load [expr {$primary_diskless eq "yes" ? {disabled on-empty-db} : {disabled on-empty-db swapdb}}] {
-        # {db command}: FLUSHDB targets the small db1, since flushing most keys cancels the save.
+        # {db command}: FLUSHDB targets the small db1.
         foreach inline_cmd {{0 {swapdb 0 1}} {1 {flushdb}} {1 {move db1:1 2}} {1 {copy db1:2 dst db 2}}
                             {1 {copy db1:3 db1:copy3 db 1}} {1 {copy db1:4 dst4 db 3 db 3}} {1 {move db1:5 7}}
                             {1 {swapdb 2 3}}} {
             lassign $inline_cmd cmd_db cmd
-            # A to-disk save is cancelled by any FLUSHDB, so those variants can't replay the
-            # command inside the running sync. They assert the cancel and the fresh full sync
-            # that follows instead, and are named accordingly so a CI failure reads correctly.
-            set cancels_to_disk_save [expr {$cmd eq "flushdb" && $primary_diskless eq "no"}]
-            if {$cancels_to_disk_save} {
-                set test_name "FLUSHDB during forkless sync cancels the to-disk save and resyncs"
+            # A forkless save is a point-in-time snapshot, so any FLUSHDB cancels it and the
+            # FLUSHDB variants can't replay the command inside the running sync. They assert the
+            # cancel and the fresh full sync that follows instead, and are named accordingly so a
+            # CI failure reads correctly.
+            set cancels_save [expr {$cmd eq "flushdb"}]
+            if {$cancels_save} {
+                set test_name "FLUSHDB during forkless sync cancels the save and resyncs"
             } else {
                 set test_name "[string toupper $cmd] during forkless sync replays correctly"
             }
@@ -2596,10 +2597,10 @@ foreach primary_diskless {yes no} {
                         $primary select $cmd_db
                         assert_not_equal 0 [$primary {*}$cmd]
                         $primary select 0
-                        if {$cancels_to_disk_save} {
-                            # The FLUSHDB cancels the to-disk save at once. rdb_bgsave_in_progress
-                            # only clears on the 200ms snapshot-end poll, so reading it right after
-                            # the reply is racy. Wait for the cancel in the log instead.
+                        if {$cancels_save} {
+                            # The FLUSHDB cancels the save at once. rdb_bgsave_in_progress only
+                            # clears once the save is torn down, so reading it right after the
+                            # reply is racy. Wait for the cancel in the log instead.
                             wait_for_log_messages -1 {"*forkless save cancelled*"} $loglines 300 100
                         } else {
                             assert_equal 1 [s -1 rdb_bgsave_in_progress]
