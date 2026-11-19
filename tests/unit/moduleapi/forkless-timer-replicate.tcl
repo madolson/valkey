@@ -143,6 +143,50 @@ start_server {tags {"modules repl external:skip"} overrides {save {} forkless-in
     }
 }
 
+# A module opens every new key for write from its "new" notification while a
+# forkless full sync runs. The keys are created after the snapshot, so the
+# replica must get them only from the replication stream.
+start_server {tags {"modules repl external:skip"} overrides {save {} forkless-infrastructure-enabled yes forkless-policy prefer-forkless repl-diskless-sync yes repl-diskless-sync-delay 0 repl-timeout 60}} {
+    r module load $testmodule
+    set primary [srv 0 client]
+    set primary_host [srv 0 host]
+    set primary_port [srv 0 port]
+    $primary debug populate 1000 filler 10
+
+    start_server {overrides {save {}}} {
+        set replica [srv 0 client]
+
+        test "Module opening new keys from their notification during a forkless full sync keeps the replica in sync" {
+            # About 2s over the 1000 filler keys.
+            test_config_set $primary rdb-key-save-delay 2000
+            set loglines [count_log_lines -1]
+            $replica replicaof $primary_host $primary_port
+            wait_for_condition 500 10 {
+                [s -1 rdb_bgsave_in_progress] == 1
+            } else {
+                fail "full sync did not start"
+            }
+            assert_equal {OK} [$primary forklesstimer.opennew 1]
+            for {set i 0} {$i < 50} {incr i} {
+                $primary incr newctr:$i
+                $primary append newstr:$i a
+            }
+            assert_equal {OK} [$primary forklesstimer.opennew 0]
+            assert_equal 1 [s -1 rdb_bgsave_in_progress]
+
+            $primary config set rdb-key-save-delay 0
+            wait_for_sync $replica
+            wait_for_ofs_sync $primary $replica
+            for {set i 0} {$i < 50} {incr i} {
+                assert_equal 1 [$replica get newctr:$i]
+                assert_equal a [$replica get newstr:$i]
+            }
+            assert_equal [$primary debug digest] [$replica debug digest]
+            verify_no_log_message -1 {*forkless save cancelled*} $loglines
+        }
+    }
+}
+
 # A module timer replicates one write that touches two keys during a forkless
 # full sync.
 start_server {tags {"modules repl external:skip"} overrides {save {} forkless-infrastructure-enabled yes forkless-policy prefer-forkless repl-diskless-sync yes repl-diskless-sync-delay 0 repl-timeout 60}} {

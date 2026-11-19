@@ -13,6 +13,7 @@
 static long long timer_set = 0;     /* keys written by the last timer */
 static long long timer_skipped = 0; /* keys the key API refused (in use by the sync) */
 static int timer_done = 0;
+static int open_new_keys = 0; /* open every new key for write from its "new" notification */
 
 typedef struct {
     ValkeyModuleString *prefix;
@@ -140,6 +141,27 @@ static int msetCommand(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc
     return ValkeyModule_ReplyWithSimpleString(ctx, "OK");
 }
 
+/* Opens a new key for write and closes it without changing it, like a module
+ * that inspects every key it sees created. */
+static int newKeyNotification(ValkeyModuleCtx *ctx, int type, const char *event, ValkeyModuleString *keyname) {
+    VALKEYMODULE_NOT_USED(type);
+    VALKEYMODULE_NOT_USED(event);
+    if (!open_new_keys) return VALKEYMODULE_OK;
+    ValkeyModuleKey *key = ValkeyModule_OpenKey(ctx, keyname, VALKEYMODULE_WRITE);
+    if (key) ValkeyModule_CloseKey(key);
+    return VALKEYMODULE_OK;
+}
+
+/* FORKLESSTIMER.OPENNEW <0|1> */
+static int openNewCommand(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
+    long long enable;
+    if (argc != 2) return ValkeyModule_WrongArity(ctx);
+    if (ValkeyModule_StringToLongLong(argv[1], &enable) != VALKEYMODULE_OK)
+        return ValkeyModule_ReplyWithError(ctx, "ERR invalid value");
+    open_new_keys = enable != 0;
+    return ValkeyModule_ReplyWithSimpleString(ctx, "OK");
+}
+
 /* FORKLESSTIMER.STATS -> [done, set, skipped] */
 static int statsCommand(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
     VALKEYMODULE_NOT_USED(argv);
@@ -167,6 +189,11 @@ int ValkeyModule_OnLoad(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int arg
         return VALKEYMODULE_ERR;
     if (ValkeyModule_CreateCommand(ctx, "forklesstimer.mset", msetCommand,
                                    "readonly", 0, 0, 0) == VALKEYMODULE_ERR)
+        return VALKEYMODULE_ERR;
+    if (ValkeyModule_CreateCommand(ctx, "forklesstimer.opennew", openNewCommand,
+                                   "readonly", 0, 0, 0) == VALKEYMODULE_ERR)
+        return VALKEYMODULE_ERR;
+    if (ValkeyModule_SubscribeToKeyspaceEvents(ctx, VALKEYMODULE_NOTIFY_NEW, newKeyNotification) == VALKEYMODULE_ERR)
         return VALKEYMODULE_ERR;
     if (ValkeyModule_CreateCommand(ctx, "forklesstimer.stats", statsCommand,
                                    "readonly", 0, 0, 0) == VALKEYMODULE_ERR)
