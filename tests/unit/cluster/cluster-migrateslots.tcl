@@ -3247,7 +3247,16 @@ start_cluster 2 1 {tags {logreqres:skip external:skip cluster} overrides {cluste
         verify_no_log_message 0 {*forkless save cancelled*} $loglines
         R 1 CLUSTER CANCELSLOTMIGRATIONS
         wait_for_migration_field 0 $jobname state failed
+        wait_for_migration_field 1 $jobname state cancelled
         set_debug_prevent_pause 0
+        # The next test needs a BGSAVE on node 1, so wait until the cancelled
+        # export's snapshot child is gone.
+        wait_for_condition 50 100 {
+            ![catch {R 1 bgsave}]
+        } else {
+            fail "Node 1 still has a child process"
+        }
+        waitForBgsave [Rn 1]
         wait_for_ofs_sync [Rn 0] [Rn 2]
         assert_equal [R 0 DEBUG DIGEST] [R 2 DEBUG DIGEST]
         R 0 flushall
