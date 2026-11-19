@@ -654,9 +654,6 @@ void clusterCommandSyncSlotsEstablish(client *c) {
     slotMigrationJob *job = createSlotImportJob(c, source_node, name, slot_ranges);
     fireModuleSlotMigrationEvent(job, VALKEYMODULE_SUBEVENT_ATOMIC_SLOT_MIGRATION_IMPORT_STARTED);
     listAddNodeHead(server.cluster->slot_migration_jobs, job);
-    /* A forkless sync that is still scanning would drop the migration's
-     * SYNCSLOTS commands, so stop it. The replicas retry with a fork. */
-    if (forklessIteratorOwnsIncomingReplication()) forklessSaveCancel();
 
     clusterDoBeforeSleep(CLUSTER_TODO_HANDLE_SLOT_MIGRATION);
     forceCommandPropagation(c, PROPAGATE_REPL | PROPAGATE_AOF);

@@ -237,10 +237,6 @@ size_t freeMemoryGetNotCountedMemory(void) {
         overhead += clusterGetTotalSlotExportBufferMemory();
     }
 
-    if (forklessIteratorOwnsIncomingReplication()) {
-        overhead += bgIteration_memoryInuseForReplication();
-    }
-
     return overhead;
 }
 

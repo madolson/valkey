@@ -107,6 +107,7 @@ robj *lookupKey(serverDb *db, robj *key, int flags) {
     }
 
     if (val) {
+        if (flags & LOOKUP_WRITE) bgIteration_keyWillBeWritten(db->id, val, true);
         /* Update the access time for the ageing algorithm.
          * Don't do it if we have a saving child, as this will trigger
          * a copy on write madness. */

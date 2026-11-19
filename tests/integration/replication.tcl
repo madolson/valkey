@@ -2940,3 +2940,46 @@ start_server {tags {"repl external:skip needs:debug"} overrides {save "" forkles
         }
     }
 }
+
+start_server {tags {"repl external:skip needs:debug"} overrides {save "" forkless-infrastructure-enabled yes forkless-policy prefer-forkless repl-diskless-sync yes repl-diskless-sync-delay 0}} {
+    start_server {overrides {save ""}} {
+        set primary [srv -1 client]
+        set primary_host [srv -1 host]
+        set primary_port [srv -1 port]
+        set replica [srv 0 client]
+
+        test "Active hash field expiry of hashes a forkless full sync has not sent reaches the replica" {
+            # The fields get their TTL before the sync starts, so no client command
+            # touches the hashes during the sync. Only active expiry writes them.
+            $primary debug populate 2000 a 10
+            for {set h 0} {$h < 200} {incr h} {
+                $primary hset h:$h f0 v f1 v f2 v f3 v f4 v keep1 v keep2 v
+                $primary hpexpire h:$h 1500 FIELDS 5 f0 f1 f2 f3 f4
+            }
+
+            # About 6.6s over the 2200 keys, so most hashes are not sent yet
+            # when their fields expire.
+            $primary config set rdb-key-save-delay 3000
+            $replica replicaof $primary_host $primary_port
+            wait_for_condition 100 100 {
+                [forkless_field_expiry_reaped $primary] == 200
+            } else {
+                fail "primary did not expire the fields"
+            }
+            assert_equal 1 [s -1 rdb_bgsave_in_progress]
+            assert_equal {forkless} [s -1 rdb_current_bgsave_type]
+
+            $primary config set rdb-key-save-delay 0
+            wait_for_condition 200 100 {
+                [s -1 rdb_bgsave_in_progress] == 0 &&
+                [status $replica master_link_status] eq "up"
+            } else {
+                fail "sync did not finish"
+            }
+            wait_for_ofs_sync $primary $replica
+
+            assert_equal [$primary dbsize] [$replica dbsize]
+            assert_equal 200 [forkless_field_expiry_reaped $replica]
+        }
+    }
+}

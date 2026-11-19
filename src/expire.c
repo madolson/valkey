@@ -173,6 +173,7 @@ void fieldExpireScanCallback(void *privdata, void *volaKey, int didx) {
     data->has_more_expired_entries = false;
     data->sampled++;
 
+    bgIteration_keyWillBeWritten(data->db->id, o, false);
     if (bgIteration_isEntryInuse(o)) return;
 
     mstime_t now = server.mstime;
