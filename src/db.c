@@ -107,6 +107,7 @@ robj *lookupKey(serverDb *db, robj *key, int flags) {
     }
 
     if (val) {
+        if (flags & LOOKUP_WRITE) bgIteration_keyWillBeWritten(db->id, val, true);
         /* Update the access time for the ageing algorithm.
          * Don't do it if we have a saving child, as this will trigger
          * a copy on write madness. */
@@ -225,6 +226,9 @@ static void dbAddInternal(serverDb *db, robj *key, robj **valref, int update_if_
     /* Not existing. Convert val to valkey object and insert. */
     robj *val = *valref;
     val = objectSetKeyAndExpire(val, objectGetVal(key), -1);
+    /* A new key is never part of a snapshot. Mark it before the keyspace
+     * notification below, which may open it for write. */
+    bgIteration_dbEntryModified(val);
     /* Track hash object if it has volatile fields (for active expiry).
      * For example, this is needed when a hash is moved to a new DB (e.g. MOVE). */
     dbTrackKeyWithVolatileItems(db, val);

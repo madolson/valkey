@@ -358,6 +358,16 @@ void bgIteration_handleCommandReplication(
 size_t bgIteration_memoryInuseForReplication(void);
 
 
+/* Notify bgIteration that an existing dbEntry is about to be written.  A consistent iterator that
+ * has not reached the entry yet takes it now, before the write.  Client commands get this from
+ * bgIteration_blockClientIfRequired(), this is for writes that don't (module timers, keyspace
+ * notifications, active field expiry).
+ *
+ * If WAIT is true, the call returns once the entry can be modified.  Otherwise, the caller must
+ * check bgIteration_isEntryInuse() and skip the write if it is still in use. */
+void bgIteration_keyWillBeWritten(int dbid, dbEntry *de, bool wait);
+
+
 /* Check if a dbEntry is currently in-use/locked by bgIteration. */
 bool bgIteration_isEntryInuse(dbEntry *de);
 

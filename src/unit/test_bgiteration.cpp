@@ -2138,6 +2138,156 @@ TEST_F(BgIterationTest, fieldExpiry_eventual_AfterNewKeyWrite) {
 
 
 /////////////////////////////////////////////////////
+// TESTS RELATED TO WRITES OUTSIDE OF A CLIENT COMMAND
+// A consistent iterator must take a key it hasn't reached before any write to it, not only
+//  before a client command.  Module timers, keyspace notifications and active field expiry write
+//  without bgIteration_blockClientIfRequired(), so they call bgIteration_keyWillBeWritten().
+/////////////////////////////////////////////////////
+
+// A module timer writes a key the iterator hasn't reached, after a client created a new key.
+//  The key is sent with its old value before the write, the new key isn't sent, and there is no
+//  replication item for either write.
+TEST_F(BgIterationTest, moduleWrite_start_FromTimerAfterNewKeyWrite) {
+    simpleDelItem(7); // H2 doesn't exist before iteration
+    bgIterator *it = bgIteratorCreateFullScanIter("iter", BGITERATOR_CONSISTENCY_START, NULL,
+                                                  iteratorCleanupFn, PRIVDATA);
+    expectReadKey(it, 0); // Items 1 & 2 are in queue (same bucket)
+
+    c = getWriteClient(7, "xxx");
+    simulateUnblockedWriteWithModification(c);
+
+    ASSERT_EQ(server.in_call, 0); // test sanity check
+    client *c2 = getWriteClient(6, "yyy");
+    bgIteration_keyWillBeWritten(c2->db->id, getItem(6), false);
+    EXPECT_TRUE(bgIteration_isEntryInuse(getItem(6)));
+
+    expectReadKey(it, 6); // expedited, with its old value
+    expectReadKeyWithUnblock(it, 1, 6);
+    EXPECT_FALSE(bgIteration_isEntryInuse(getItem(6)));
+    robj *value = dupStringObject(c2->argv[2]);
+    setKey(NULL, c2->db, c2->argv[1], &value, SETKEY_ALREADY_EXIST);
+    bgIteration_handleCommandReplication(c2->db->id, c2->cmd, c2->argc, c2->argv);
+
+    // The key has been taken, so a second write doesn't take it again.
+    bgIteration_keyWillBeWritten(c2->db->id, getItem(6), false);
+    EXPECT_FALSE(bgIteration_isEntryInuse(getItem(6)));
+    freeTestClient(c2);
+
+    expectReadKeySequence(it, 2, 5);
+    // 6 was sent early, and H2 (item 7) was created after the iteration started
+    expectReadKeySequence(it, 8, LAST_ITEM);
+    expectReadComplete(it);
+}
+
+
+// Same as above, but the module writes from inside a READ command.
+TEST_F(BgIterationTest, moduleWrite_start_FromReadAfterNewKeyWrite) {
+    simpleDelItem(7); // H2 doesn't exist before iteration
+    bgIterator *it = bgIteratorCreateFullScanIter("iter", BGITERATOR_CONSISTENCY_START, NULL,
+                                                  iteratorCleanupFn, PRIVDATA);
+    expectReadKey(it, 0); // Items 1 & 2 are in queue (same bucket)
+
+    c = getWriteClient(7, "xxx");
+    simulateUnblockedWriteWithModification(c);
+
+    client *readClient = getWriteClient(0, "unused");
+    readClient->cmd = lookupCommandByCString("get"); // Only the command matters here
+    EXPECT_FALSE(bgIteration_blockClientIfRequired(readClient));
+    server.in_call++;
+    client *c2 = getWriteClient(6, "yyy");
+    bgIteration_keyWillBeWritten(c2->db->id, getItem(6), false);
+    EXPECT_TRUE(bgIteration_isEntryInuse(getItem(6)));
+    expectReadKey(it, 6); // expedited, with its old value
+    expectReadKeyWithUnblock(it, 1, 6);
+    robj *value = dupStringObject(c2->argv[2]);
+    setKey(NULL, c2->db, c2->argv[1], &value, SETKEY_ALREADY_EXIST);
+    bgIteration_handleCommandReplication(c2->db->id, c2->cmd, c2->argc, c2->argv);
+    server.in_call--;
+    freeTestClient(readClient);
+    freeTestClient(c2);
+
+    expectReadKeySequence(it, 2, 5);
+    // 6 was sent early, and H2 (item 7) was created after the iteration started
+    expectReadKeySequence(it, 8, LAST_ITEM);
+    expectReadComplete(it);
+}
+
+
+// A transaction creates a new key, and its EXEC is propagated after call() has returned (a script
+//  run through RM_Call from a module timer).  The new key isn't sent, and neither MULTI, the SET
+//  nor the EXEC produce a replication item.
+TEST_F(BgIterationTest, multiCreatesNewKey_start_ExecAfterCall) {
+    simpleDelItem(14); // W0 (DB1) doesn't exist before iteration
+    bgIterator *it = bgIteratorCreateFullScanIter("iter", BGITERATOR_CONSISTENCY_START, NULL,
+                                                  iteratorCleanupFn, PRIVDATA);
+    expectReadKey(it, 0); // Items 1 & 2 are in queue (same bucket)
+
+    c = getMultiClient("SET W0 xxx", 1);
+    int dbid = c->db->id;
+    simulateUnblockedWrite_inCall(c); // the EXEC
+
+    server.in_exec = 1;
+    advanceMultiClientToCommand(c, 0); // SET W0 xxx
+    EXPECT_CALL(mock, blockClientInUseOnKeys(c, _, _)).Times(0);
+    EXPECT_FALSE(bgIteration_blockClientIfRequired(c));
+    server.in_call++;
+    robj *value = dupStringObject(c->argv[2]);
+    setKey(c, c->db, c->argv[1], &value, SETKEY_ADD_OR_UPDATE);
+
+    struct serverCommand *cmd_multi = lookupCommandByCString("multi");
+    bgIteration_handleCommandReplication(dbid, cmd_multi, 1, &shared.multi);
+    bgIteration_handleCommandReplication(dbid, c->cmd, c->argc, c->argv);
+    server.in_call--;
+    server.in_exec = 0;
+    server.in_call--;
+
+    struct serverCommand *cmd_exec = lookupCommandByCString("exec");
+    bgIteration_handleCommandReplication(dbid, cmd_exec, 1, &shared.exec);
+
+    expectReadKeySequence(it, 1, 13);
+    // W0 (item 14) was created after the iteration started
+    expectReadKey(it, LAST_ITEM);
+    expectReadComplete(it);
+}
+
+
+// A module command inside MULTI/EXEC writes, through RM_Call, a key the iterator has passed and a
+//  key it hasn't reached.  The unreached key is sent with its old value before the write, and no
+//  write produces a replication item.
+TEST_F(BgIterationTest, multiNestedWrites_start) {
+    bgIterator *it = bgIteratorCreateFullScanIter("iter", BGITERATOR_CONSISTENCY_START, NULL,
+                                                  iteratorCleanupFn, PRIVDATA);
+    expectReadKeySequence(it, 0, 2); // 0 is passed (and no longer in use).  3 & 4 are queued.
+
+    c = getWriteClient(0, "xxx"); // already passed by the iterator
+    int dbid = c->db->id;
+    simulateUnblockedWrite_inCall(c);
+    struct serverCommand *cmd_multi = lookupCommandByCString("multi");
+    bgIteration_handleCommandReplication(dbid, cmd_multi, 1, &shared.multi);
+    bgIteration_handleCommandReplication(dbid, c->cmd, c->argc, c->argv);
+
+    client *nested = getWriteClient(6, "yyy"); // not reached by the iterator yet
+    bgIteration_keyWillBeWritten(dbid, getItem(6), false);
+    EXPECT_TRUE(bgIteration_isEntryInuse(getItem(6)));
+    expectReadKey(it, 6); // expedited, with its old value
+    expectReadKeyWithUnblock(it, 3, 6);
+    robj *value = dupStringObject(nested->argv[2]);
+    setKey(nested, nested->db, nested->argv[1], &value, SETKEY_ALREADY_EXIST);
+    bgIteration_handleCommandReplication(dbid, nested->cmd, nested->argc, nested->argv);
+    freeTestClient(nested);
+
+    struct serverCommand *cmd_exec = lookupCommandByCString("exec");
+    bgIteration_handleCommandReplication(dbid, cmd_exec, 1, &shared.exec);
+    server.in_call--;
+
+    expectReadKeySequence(it, 4, 5);
+    // 6 was sent early
+    expectReadKeySequence(it, 7, LAST_ITEM);
+    expectReadComplete(it);
+}
+
+
+/////////////////////////////////////////////////////
 // THE REMAINING TESTS ARE GENERAL / UNCATEGORIZED
 /////////////////////////////////////////////////////
 
