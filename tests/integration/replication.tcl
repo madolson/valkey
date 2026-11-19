@@ -2940,3 +2940,65 @@ start_server {tags {"repl external:skip needs:debug"} overrides {save "" forkles
         }
     }
 }
+
+# Writes that create and delete keys during a forkless full sync, one command at
+# a time in a script or as a transaction. Each command is decided by the state
+# of its keys before it ran. DB 0 is scanned first, so the keys of DB 9 have not
+# been reached when the writes run.
+foreach {name writes} {
+    "Lua: SET p; DEL u; RENAME p u"
+        {{eval {redis.call('select',9) redis.call('set','p','1') redis.call('del','u') return redis.call('rename','p','u')} 0}}
+    "Lua: SET p; DEL u; COPY p u"
+        {{eval {redis.call('select',9) redis.call('set','p','1') redis.call('del','u') return redis.call('copy','p','u')} 0}}
+    "Lua: SET p; DEL u; SET u a; MSET u b p c; DEL u"
+        {{eval {redis.call('select',9) redis.call('set','p','1') redis.call('del','u') redis.call('set','u','a') redis.call('mset','u','b','p','c') return redis.call('del','u')} 0}}
+    "SET p; MULTI; EVAL RENAME u p; EXEC"
+        {{select 9} {set p 1} multi {eval {return redis.call('rename','u','p')} 0} exec}
+    "MULTI; DEL u; SET u new; COPY u p; EXEC"
+        {{select 9} multi {del u} {set u new} {copy u p} exec}
+    "MULTI; DEL u; EVAL SET u; INCR c; EXEC"
+        {{select 9} multi {del u} {eval {return redis.call('set',KEYS[1],ARGV[1])} 1 u new} {incr c} exec}
+} {
+start_server {tags {"repl external:skip needs:debug"} overrides {save "" forkless-infrastructure-enabled yes forkless-policy prefer-forkless repl-diskless-sync yes repl-diskless-sync-delay 0}} {
+    start_server {overrides {save ""}} {
+        set primary [srv -1 client]
+        set primary_host [srv -1 host]
+        set primary_port [srv -1 port]
+        set replica [srv 0 client]
+
+        test "Forkless full sync: $name" {
+            $primary select 0
+            $primary debug populate 1000 key 1000
+            $primary select 9
+            $primary set u old
+            $primary set c 5
+            $primary select 0
+
+            # Keep the forkless iteration in DB 0 while the writes run.
+            test_config_set $primary rdb-key-save-delay 5000
+            set loglines [count_log_lines -1]
+            $replica replicaof $primary_host $primary_port
+            wait_for_condition 500 10 {
+                [s -1 rdb_bgsave_in_progress] == 1
+            } else {
+                fail "full sync did not start"
+            }
+            assert_equal {forkless} [s -1 rdb_current_bgsave_type]
+            wait_for_condition 500 10 {
+                [s -1 current_save_keys_processed] >= 100
+            } else {
+                fail "the sync did not progress"
+            }
+
+            foreach cmd $writes { $primary {*}$cmd }
+            assert_equal 1 [s -1 rdb_bgsave_in_progress]
+
+            $primary config set rdb-key-save-delay 0
+            wait_for_sync $replica
+            wait_for_ofs_sync $primary $replica
+            assert_equal [$primary debug digest] [$replica debug digest]
+            verify_no_log_message -1 {*Terminating*} $loglines
+        }
+    }
+}
+}
