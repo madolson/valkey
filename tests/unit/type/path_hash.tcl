@@ -567,6 +567,138 @@ start_server {tags {pathhash}} {
         assert_equal 0 [lindex $page 0]
     }
 
+    test {PHRANGE honors inclusive, exclusive and infinite bounds} {
+        r del range-tree
+        foreach path {{} a aa ab b ba c} {r phset range-tree $path fields 1 f "v:$path"}
+        assert_equal {{} a aa ab b ba c} [r phrange range-tree - +]
+        assert_equal {a aa ab b} [r phrange range-tree {[a} {[b}]
+        assert_equal {aa ab} [r phrange range-tree {(a} {(b}]
+        assert_equal {{} a} [r phrange range-tree - {(aa}]
+        assert_equal {ba c} [r phrange range-tree {(b} +]
+        assert_equal {{}} [r phrange range-tree {[} {[}]
+        assert_equal {a} [r phrange range-tree {[a} {[a}]
+        assert_equal {} [r phrange range-tree {(a} {(a}]
+        assert_equal {} [r phrange range-tree {[b} {[a}]
+        assert_equal {} [r phrange range-tree + -]
+        assert_equal {} [r phrange range-tree + +]
+        assert_equal {} [r phrange range-tree - -]
+        assert_equal {} [r phrange range-tree {[d} +]
+        # Bounds between stored paths.
+        assert_equal {ab} [r phrange range-tree {[aaa} {[az}]
+    }
+
+    test {PHRANGE REV takes the high bound first and walks backward} {
+        assert_equal {c ba b ab aa a {}} [r phrange range-tree + - rev]
+        assert_equal {b ab aa a} [r phrange range-tree {[b} {[a} rev]
+        assert_equal {ab aa} [r phrange range-tree {(b} {(a} rev]
+        assert_equal {ba b} [r phrange range-tree {[baa} {(ab} rev]
+        assert_equal {} [r phrange range-tree {[a} {[b} rev]
+        assert_equal {} [r phrange range-tree - + rev]
+        assert_equal {{}} [r phrange range-tree {(a} - rev]
+    }
+
+    test {PHRANGE LIMIT applies offset and count in both directions} {
+        assert_equal {aa ab} [r phrange range-tree {(a} + limit 0 2]
+        assert_equal {b ba} [r phrange range-tree {(a} + limit 2 2]
+        assert_equal {ba c} [r phrange range-tree {(a} + limit 3 -1]
+        assert_equal {} [r phrange range-tree {(a} + limit 10 2]
+        assert_equal {} [r phrange range-tree - + limit -1 2]
+        assert_equal {} [r phrange range-tree - + limit 0 0]
+        assert_equal {ba b} [r phrange range-tree + - rev limit 1 2]
+        assert_equal {a {}} [r phrange range-tree {[a} - rev limit 0 5]
+        # Paging with an exclusive bound on the last returned path.
+        set paths {}
+        set start -
+        while 1 {
+            set page [r phrange range-tree $start + limit 0 3]
+            lappend paths {*}$page
+            if {[llength $page] < 3} break
+            set start "([lindex $page end]"
+        }
+        assert_equal {{} a aa ab b ba c} $paths
+        set paths {}
+        set start +
+        while 1 {
+            set page [r phrange range-tree $start - rev limit 0 2]
+            lappend paths {*}$page
+            if {[llength $page] < 2} break
+            set start "([lindex $page end]"
+        }
+        assert_equal {c ba b ab aa a {}} $paths
+    }
+
+    test {PHRANGE WITHVALUES returns each path with its field map} {
+        set reply [r phrange range-tree {[ab} {[b} withvalues]
+        assert_equal {{ab {f v:ab}} {b {f v:b}}} $reply
+        assert_equal {{b {f v:b}} {ab {f v:ab}}} [r phrange range-tree {[b} {[ab} rev withvalues]
+        assert_equal {{ba {f v:ba}}} [r phrange range-tree {(b} + limit 0 1 withvalues]
+
+        # A payload large enough to use the hashtable encoding.
+        r del big-tree
+        set args {}
+        for {set i 0} {$i < 1000} {incr i} {lappend args "f$i" "v$i"}
+        r phset big-tree big fields 1000 {*}$args
+        r phset big-tree small fields 1 f v
+        set reply [r phrange big-tree - + withvalues]
+        assert_equal {big small} [list [lindex $reply 0 0] [lindex $reply 1 0]]
+        assert_equal [sort_path_hash_field_pairs $args] [sort_path_hash_field_pairs [lindex $reply 0 1]]
+        assert_equal {f v} [lindex $reply 1 1]
+
+        # A path whose last field is deleted is gone, so no payload is empty.
+        r phdel big-tree small f
+        assert_equal {big} [r phrange big-tree - +]
+    }
+
+    test {PHRANGE orders and bounds binary paths with 0x00 and 0xff bytes} {
+        r del bin-tree
+        set p00 [binary format H* 00]
+        set p0000 [binary format H* 0000]
+        set p0001 [binary format H* 0001]
+        set pa00 [binary format H* 6100]
+        set paff [binary format H* 61ff]
+        set pff [binary format H* ff]
+        set pffff [binary format H* ffff]
+        foreach path [list $pffff $p0001 a $pa00 $p00 $paff $pff $p0000] {r phset bin-tree $path fields 1 f $path}
+        set all [list $p00 $p0000 $p0001 a $pa00 $paff $pff $pffff]
+        assert_equal $all [r phrange bin-tree - +]
+        assert_equal [lreverse $all] [r phrange bin-tree + - rev]
+        assert_equal [list $p0000 $p0001] [r phrange bin-tree "($p00" "\[$p0001"]
+        assert_equal [list $pa00 $paff] [r phrange bin-tree {(a} "\[$paff"]
+        assert_equal [list $pffff] [r phrange bin-tree "($pff" +]
+        assert_equal [list $pff $paff $pa00] [r phrange bin-tree "\[$pff" {(a} rev]
+        assert_equal [list [list $pa00 [list f $pa00]]] [r phrange bin-tree {(a} "($paff" withvalues]
+    }
+
+    test {PHRANGE over a prefix range matches PHPATHSCAN PREFIX} {
+        r del prefix-tree
+        foreach path {a user user: user:1 user:10 user:2 user; userz} {r phset prefix-tree $path fields 1 f v}
+        set scanned [lindex [r phpathscan prefix-tree 0 prefix user: count 100] 1]
+        # The range [P, P with its last byte incremented) holds exactly the paths with prefix P.
+        assert_equal $scanned [r phrange prefix-tree {[user:} {(user;}]
+        assert_equal {user: user:1 user:10 user:2} $scanned
+        assert_equal [lreverse $scanned] [r phrange prefix-tree {(user;} {[user:} rev]
+    }
+
+    test {PHRANGE validates arguments, missing keys and types} {
+        r del range-missing
+        assert_equal {} [r phrange range-missing - +]
+        assert_equal {} [r phrange range-missing - + rev limit 0 1 withvalues]
+        assert_error ERR*wrong*number* {r phrange range-tree -}
+        foreach bounds {{a +} {- b} {++ +} {- --} {{} +}} {
+            assert_error ERR*not*valid*string*range* {r phrange range-tree {*}$bounds}
+            assert_error ERR*not*valid*string*range* {r phrange range-missing {*}$bounds}
+        }
+        foreach options {{rev rev} {withvalues withvalues} {limit 0} {limit} {limit x 1} {limit 0 x} {byscore} {count 1}} {
+            assert_error ERR* {r phrange range-tree - + {*}$options}
+            assert_error ERR* {r phrange range-missing - + {*}$options}
+        }
+        assert_error ERR*syntax* {r phrange range-tree - + rev rev}
+        assert_error ERR*not*integer* {r phrange range-tree - + limit x 1}
+        r set range-string value
+        assert_error WRONGTYPE* {r phrange range-string - +}
+        assert_equal {range-tree} [r command getkeys phrange range-tree - + withvalues]
+    }
+
     test {Path Hash commands return WRONGTYPE consistently} {
         r set not-pathhash value
         foreach command {
@@ -580,6 +712,7 @@ start_server {tags {pathhash}} {
             {phprefixes not-pathhash p}
             {phpathdel not-pathhash p withsubpaths}
             {phpathscan not-pathhash 0}
+            {phrange not-pathhash - +}
             {phscan not-pathhash p 0}
             {phpathcount not-pathhash}
         } {
@@ -614,7 +747,7 @@ start_server {tags {pathhash}} {
     }
 
     test {Path Hash commands are registered with the PH prefix} {
-        set commands {phdel phget phgetall phmget phmset phpathcount phpathdel phpathexists phpathscan phprefixes phscan phset}
+        set commands {phdel phget phgetall phmget phmset phpathcount phpathdel phpathexists phpathscan phprefixes phrange phscan phset}
         assert_equal $commands [lsort [r command list filterby aclcat pathhash]]
         foreach command $commands {
             assert_no_match {*radix*} [string tolower [r command docs $command]]
@@ -713,7 +846,12 @@ start_server {tags {pathhash}} {
                 {phprefixes tree a fields 1 f1} [list {*1} {*2} {$1} a {*1} {$2} v1] \
                 {phprefixes tree a fields 2 f1 missing} [concat [list {*1}] $fields] \
                 {phprefixes tree z withvalues} [list {*0}] \
-                {phpathscan missing 0} [list {*2} {$1} 0 {*0}]] {
+                {phpathscan missing 0} [list {*2} {$1} 0 {*0}] \
+                {phrange tree - +} [list {*1} {$1} a] \
+                {phrange tree - + withvalues} [concat [list {*1}] $match] \
+                {phrange tree + - rev limit 0 1 withvalues} [concat [list {*1}] $match] \
+                {phrange tree (a + withvalues} [list {*0}] \
+                {phrange missing - + withvalues} [list {*0}]] {
                 r {*}$command
                 foreach line $expected {
                     assert_equal $line [r read]

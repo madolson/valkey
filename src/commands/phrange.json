@@ -1,0 +1,42 @@
+{
+    "PHRANGE": {
+        "summary": "Returns the stored paths of a path hash between two lexicographic bounds, optionally with their values.",
+        "complexity": "O(log(N) + O + M) where N is the number of paths, O the LIMIT offset and M the number of paths returned, plus the size of each returned payload with WITHVALUES.",
+        "group": "pathhash",
+        "since": "9.3.0",
+        "arity": -4,
+        "function": "phrangeCommand",
+        "command_flags": ["READONLY"],
+        "acl_categories": ["PATHHASH", "READ", "SLOW"],
+        "key_specs": [{"flags": ["RO", "ACCESS"], "begin_search": {"index": {"pos": 1}}, "find_keys": {"range": {"lastkey": 0, "step": 1, "limit": 0}}}],
+        "reply_schema": {
+            "description": "Stored paths in byte lexicographic order, descending with REV, optionally with values.",
+            "type": "array",
+            "items": {
+                "oneOf": [
+                    {"type": "string"},
+                    {
+                        "type": "array",
+                        "minItems": 2,
+                        "maxItems": 2,
+                        "items": [
+                            {"type": "string"},
+                            {"description": "The field/value payload when WITHVALUES is used: a map in RESP3 or a flat array in RESP2. Field order is unspecified.", "type": "object", "additionalProperties": {"type": "string"}}
+                        ]
+                    }
+                ]
+            }
+        },
+        "arguments": [
+            {"name": "key", "type": "key", "key_spec_index": 0},
+            {"name": "start", "summary": "The low bound, or the high bound with REV: [path or (path for an inclusive or exclusive bound, - or + for the ends.", "type": "string"},
+            {"name": "end", "summary": "The high bound, or the low bound with REV, in the same syntax as start.", "type": "string"},
+            {"name": "rev", "type": "pure-token", "token": "REV", "optional": true},
+            {"name": "limit", "type": "block", "token": "LIMIT", "optional": true, "arguments": [
+                {"name": "offset", "type": "integer"},
+                {"name": "count", "summary": "Maximum number of paths to return; a negative count returns every path after the offset.", "type": "integer"}
+            ]},
+            {"name": "withvalues", "type": "pure-token", "token": "WITHVALUES", "optional": true}
+        ]
+    }
+}
