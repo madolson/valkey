@@ -798,6 +798,86 @@ void phpathscanCommand(client *c) {
     zfree(entries);
 }
 
+/* PHRANGE key start end [REV] [LIMIT offset count] [WITHVALUES]
+ *
+ * Returns stored paths between two ZRANGE BYLEX bounds. With REV, start is the
+ * high bound and paths are returned from high to low. The iterator seeks to the
+ * first bound, so a call costs O(log N + offset + M), not a walk from either end. */
+void phrangeCommand(client *c) {
+    int reverse = 0, withvalues = 0;
+    long offset = 0, limit = -1;
+    for (int j = 4; j < c->argc; j++) {
+        char *arg = objectGetVal(c->argv[j]);
+        if (!strcasecmp(arg, "rev") && !reverse) {
+            reverse = 1;
+        } else if (!strcasecmp(arg, "withvalues") && !withvalues) {
+            withvalues = 1;
+        } else if (!strcasecmp(arg, "limit") && j + 2 < c->argc) {
+            if (getLongFromObjectOrReply(c, c->argv[j + 1], &offset, NULL) != C_OK ||
+                getLongFromObjectOrReply(c, c->argv[j + 2], &limit, NULL) != C_OK)
+                return;
+            j += 2;
+        } else {
+            addReplyErrorObject(c, shared.syntaxerr);
+            return;
+        }
+    }
+
+    zlexrangespec range;
+    robj *min = c->argv[reverse ? 3 : 2], *max = c->argv[reverse ? 2 : 3];
+    if (zsetParseLexRange(min, max, &range) != C_OK) {
+        addReplyError(c, "min or max not valid string range item");
+        return;
+    }
+
+    robj *o = lookupKeyRead(c->db, c->argv[1]);
+    if (checkType(c, o, OBJ_PATH_HASH)) {
+        zsetFreeLexRange(&range);
+        return;
+    }
+    if (o == NULL || offset < 0 || limit == 0) {
+        addReply(c, shared.emptyarray);
+        zsetFreeLexRange(&range);
+        return;
+    }
+
+    pathHashObject *path_hash = objectGetVal(o);
+    raxIterator iter;
+    raxStart(&iter, path_hash->index);
+    sds first = reverse ? range.max : range.min;
+    int first_ex = reverse ? range.maxex : range.minex;
+    if (first == shared.minstring)
+        raxSeek(&iter, "^", NULL, 0);
+    else if (first == shared.maxstring)
+        raxSeek(&iter, "$", NULL, 0);
+    else if (reverse)
+        raxSeek(&iter, first_ex ? "<" : "<=", (unsigned char *)first, sdslen(first));
+    else
+        raxSeek(&iter, first_ex ? ">" : ">=", (unsigned char *)first, sdslen(first));
+
+    void *replylen = addReplyDeferredLen(c);
+    long returned = 0;
+    while (limit != 0 && (reverse ? raxPrev(&iter) : raxNext(&iter))) {
+        /* The seek satisfies the first bound except when a bound is the wrong
+         * infinity, such as a "+" low bound, so check both. */
+        if (!zsetLexGteMin((char *)iter.key, iter.key_len, &range) ||
+            !zsetLexLteMax((char *)iter.key, iter.key_len, &range))
+            break;
+        if (offset) {
+            offset--;
+            continue;
+        }
+        if (withvalues) addReplyArrayLen(c, 2);
+        addReplyBulkCBuffer(c, iter.key, iter.key_len);
+        if (withvalues) pathHashReplyPayload(c, iter.data);
+        returned++;
+        if (limit > 0) limit--;
+    }
+    raxStop(&iter);
+    setDeferredArrayLen(c, replylen, returned);
+    zsetFreeLexRange(&range);
+}
+
 /* Count stored paths with a byte prefix; an empty prefix counts the whole tree. */
 size_t pathHashTypeCount(robj *o, const unsigned char *prefix, size_t prefix_len) {
     pathHashObject *path_hash = objectGetVal(o);
