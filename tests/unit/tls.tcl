@@ -791,6 +791,29 @@ start_server {tags {"tls"}} {
             # Empty CA certificate directory
             test_tls_cert_rejection_runtime r ca-dir $tlsdir/ca-empty
         }
+
+        test {TLS: CA directory trusts every certificate in a bundle file} {
+            set tlsdir [file normalize ./tests/tls]
+            set ca_dir [file normalize [tmpdir ca-bundle-dir]]
+            set fd [open $ca_dir/bundle.pem w]
+            # The CA that issued the client certificate is not the first in the file.
+            foreach f {server.crt ca.crt} {
+                set in [open $tlsdir/$f]
+                puts -nonewline $fd [read $in]
+                close $in
+            }
+            close $fd
+
+            set ca_file [lindex [r config get tls-ca-cert-file] 1]
+            r CONFIG SET tls-ca-cert-file "" tls-ca-cert-dir $ca_dir
+            catch {
+                set s [valkey_client]
+                $s PING
+            } e
+            catch {$s close}
+            r CONFIG SET tls-ca-cert-file $ca_file tls-ca-cert-dir ""
+            assert_equal PONG $e
+        }
     }
 }
 
