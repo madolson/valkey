@@ -2094,7 +2094,9 @@ void propagateDeletion(serverDb *db, robj *key, int lazy, int slot) {
      * Even if module executed a command without asking for propagation. */
     int prev_replication_allowed = server.replication_allowed;
     server.replication_allowed = 1;
+    server.propagating_implicit_del = true;
     alsoPropagate(db->id, argv, 2, PROPAGATE_AOF | PROPAGATE_REPL, slot);
+    server.propagating_implicit_del = false;
     server.replication_allowed = prev_replication_allowed;
 }
 
@@ -2122,7 +2124,9 @@ int propagateFieldsDeletion(serverDb *db, robj *o, size_t n_fields, robj *fields
         argv[argc++] = fields[i];
     }
 
+    server.propagating_implicit_del = true;
     alsoPropagate(db->id, argv, argc, PROPAGATE_AOF | PROPAGATE_REPL, didx);
+    server.propagating_implicit_del = false;
     server.replication_allowed = prev_replication_allowed;
     for (int i = 0; i < argc; i++) {
         decrRefCount(argv[i]);
