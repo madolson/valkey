@@ -95,15 +95,37 @@ med3(char *a, char *b, char *c,
               :(cmp(b, c) > 0 ? b : (cmp(a, c) < 0 ? a : c ));
 }
 
+/* pqsort_depth_limit returns the maximum left-partition recursion depth
+ * allowed before falling back to libc qsort.  2 * floor(log2(n)) matches
+ * the introsort bound and keeps stack depth O(log n) even when an
+ * adversarial comparison function forces the pivot to the extreme. */
+static int pqsort_depth_limit(size_t n) {
+    int depth = 0;
+    while (n > 1) {
+        n >>= 1;
+        depth++;
+    }
+    return depth * 2;
+}
+
 static void
 _pqsort(void *a, size_t n, size_t es,
-    int (*cmp) (const void *, const void *), void *lrange, void *rrange)
+    int (*cmp) (const void *, const void *), void *lrange, void *rrange,
+    int depth_limit)
 {
-	char *pa, *pb, *pc, *pd, *pl, *pm, *pn;
-	size_t d, r;
-	int swaptype, cmp_result;
+    char *pa, *pb, *pc, *pd, *pl, *pm, *pn;
+    size_t d, r;
+    int swaptype, cmp_result;
 
-loop:	SWAPINIT(a, es);
+loop:
+    /* Depth limit reached: fall back to libc qsort for this subarray.
+     * qsort handles the entire [a, a+n*es) region, so both the would-be
+     * left and right partitions are covered. */
+    if (depth_limit == 0) {
+        qsort(a, n, es, cmp);
+        return;
+    }
+    SWAPINIT(a, es);
 	if (n < 7) {
 		for (pm = (char *) a + es; pm < (char *) a + n * es; pm += es)
 			for (pl = pm; pl > (char *) a && cmp(pl - es, pl) > 0;
@@ -154,32 +176,29 @@ loop:	SWAPINIT(a, es);
 	vecswap(a, pb - r, r);
 	r = min((size_t)(pd - pc), pn - pd - es);
 	vecswap(pb, pn - r, r);
-	if ((r = pb - pa) > es) {
-                void *_l = a, *_r = ((unsigned char*)a)+r-1;
-                if (!((lrange < _l && rrange < _l) ||
-                    (lrange > _r && rrange > _r)))
-		    _pqsort(a, r / es, es, cmp, lrange, rrange);
-        }
-	if ((r = pd - pc) > es) {
-                void *_l, *_r;
+    if ((r = pb - pa) > es) {
+        void *_l = a, *_r = ((unsigned char *)a) + r - 1;
+        if (!((lrange < _l && rrange < _l) || (lrange > _r && rrange > _r)))
+            _pqsort(a, r / es, es, cmp, lrange, rrange, depth_limit - 1);
+    }
+    if ((r = pd - pc) > es) {
+        void *_l, *_r;
 
-		/* Iterate rather than recurse to save stack space */
-		a = pn - r;
-		n = r / es;
+        /* Iterate rather than recurse to save stack space */
+        a = pn - r;
+        n = r / es;
 
-                _l = a;
-                _r = ((unsigned char*)a)+r-1;
-                if (!((lrange < _l && rrange < _l) ||
-                    (lrange > _r && rrange > _r)))
-		    goto loop;
-	}
-/*		qsort(pn - r, r / es, es, cmp);*/
+        _l = a;
+        _r = ((unsigned char *)a) + r - 1;
+        if (!((lrange < _l && rrange < _l) || (lrange > _r && rrange > _r)))
+            goto loop;
+    }
 }
 
 void
 pqsort(void *a, size_t n, size_t es,
-    int (*cmp) (const void *, const void *), size_t lrange, size_t rrange)
+       int (*cmp)(const void *, const void *), size_t lrange, size_t rrange)
 {
-    _pqsort(a,n,es,cmp,((unsigned char*)a)+(lrange*es),
-                       ((unsigned char*)a)+((rrange+1)*es)-1);
+    _pqsort(a, n, es, cmp, ((unsigned char *)a) + (lrange * es), ((unsigned char *)a) + ((rrange + 1) * es) - 1,
+            pqsort_depth_limit(n));
 }
