@@ -480,6 +480,24 @@ start_server {tags {"dump"}} {
         assert_match {*Bad data format*} $err
     } {} {needs:debug}
 
+    test {RESTORE rejects set with declared count larger than remaining payload} {
+        # type=0x02 (SET), count=4294967295 (32-bit RDB length: 0x80 ff ff ff ff),
+        # one valid member "x" (0x01 0x78), then the RDB version and a zeroed CRC.
+        # The declared count (4294967295) vastly exceeds the remaining payload bytes.
+        # Without the fix, rdbLoadObject() pre-sizes a hashtable to ~10^9 buckets via
+        # hashtableTryExpand(), then walks every bucket on cleanup when the second
+        # element read fails, stalling the server for seconds.  With the fix, the
+        # count is rejected before any allocation.
+        r debug set-skip-checksum-validation 1
+        set payload "\x02\x80\xff\xff\xff\xff\x01\x78\x51\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+        set t0 [clock milliseconds]
+        catch {r restore stall_test 0 $payload} err
+        set elapsed [expr {[clock milliseconds] - $t0}]
+        r debug set-skip-checksum-validation 0
+        assert_match {*Bad data format*} $err
+        assert {$elapsed < 5000}
+    } {} {needs:debug}
+
     test {RESTORE rejects stream with shared NACK across consumers} {
         # Create a valid stream with consumer group and two consumers
         r DEL mystream
