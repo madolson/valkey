@@ -303,6 +303,34 @@ start_server {tags {"acl external:skip"}} {
         $rd close
     } {0}
 
+    test {Subscribers are killed when authenticating as a user without channel permission} {
+        r ACL setuser psuser resetchannels &foo:1
+        r ACL setuser nochannels on nopass resetchannels +@all
+        r ACL setuser anychannel on nopass allchannels +@all
+        set rd [valkey_deferring_client]
+        $rd HELLO 3 AUTH psuser pspass SETNAME deathrow
+        $rd read
+        $rd SUBSCRIBE foo:1
+        $rd read
+        $rd AUTH anychannel pass
+        $rd read
+        $rd ACL WHOAMI
+        assert_equal anychannel [$rd read]
+        $rd AUTH psuser pspass
+        $rd read
+        $rd ACL WHOAMI
+        assert_equal psuser [$rd read]
+        $rd AUTH nochannels pass
+        $rd read
+        wait_for_condition 50 100 {
+            ![string match {*deathrow*} [r CLIENT LIST]]
+        } else {
+            fail "Subscriber was not killed after switching to a user without channel permission"
+        }
+        $rd close
+        r ACL deluser nochannels anychannel
+    } {2}
+
     test {Subscribers are pardoned if literal permissions are retained and/or gaining allchannels} {
         set rd [valkey_deferring_client]
         r ACL setuser psuser resetchannels &foo:1 &bar:* &orders
