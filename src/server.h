@@ -3899,6 +3899,7 @@ void phprefixesCommand(client *c);
 void phpathdelCommand(client *c);
 void phscanCommand(client *c);
 void phpathscanCommand(client *c);
+void phrangeCommand(client *c);
 void phpathcountCommand(client *c);
 
 /* Pub / Sub */
