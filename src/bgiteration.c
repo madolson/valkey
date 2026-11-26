@@ -1142,6 +1142,26 @@ static bool iteratorHasPassedKey(bgIterator *it, int dbid, const_sds key, dbEntr
 }
 
 
+/* Decides the replication of a write that has no command decision by the state of its key: it
+ * replicates iff the iterator has already sent the key. Returns false if the write doesn't touch
+ * exactly one key that exists now. */
+static bool replicateByKeyState(bgIterator *it, int dbid, struct serverCommand *cmd, int argc, robj **argv, bool *replicate) {
+    bool decided = false;
+    getKeysResult result;
+    initGetKeysResult(&result);
+    if (getKeysFromCommand(cmd, argv, argc, &result) == 1) {
+        sds key = objectGetVal(argv[result.keys[0].pos]);
+        dbEntry *de = (server.db[dbid]) ? dbFind(server.db[dbid], key) : NULL;
+        if (de != NULL) {
+            *replicate = iteratorHasPassedKey(it, dbid, key, de);
+            decided = true;
+        }
+    }
+    getKeysFreeResult(&result);
+    return decided;
+}
+
+
 // This expedites a single key and doesn't attempt to avoid expediting through optimization.
 static bool expediteSingleKeyWithoutOptimization(bgIterator *it,
                                                  int dbid,
@@ -2611,6 +2631,22 @@ void bgIteration_handleCommandReplication(int dbid,
 
         bool replicate = false;
         if (useReplicationFlags) replicate = it->cur_cmd_may_replicate;
+
+        /* A write with no command decision behind it: a module propagating outside of a write
+         * command (VM_Replicate from a timer, a keyspace notification outside of a command, a
+         * thread-safe context, or a readonly command that hasn't run a nested write). DEL/UNLINK/HDEL are decided by key state below. A write to a single
+         * existing key is decided the same way. Anything else (several keys, no keys, or a key that
+         * no longer exists) can't be decided safely, so the iteration is abandoned. */
+        if (!useReplicationFlags && !isDeleteCmd(cmd) && cmd->proc != hdelCommand &&
+            cmd->proc != multiCommand && cmd->proc != execCommand) {
+            if (!replicateByKeyState(it, dbid, cmd, argc, argv, &replicate)) {
+                serverLog(LL_WARNING,
+                          "Terminating %s: %s was propagated outside of a write command and its replication can't be decided",
+                          it->name, cmd->fullname);
+                bgIteratorTerminate(it);
+                continue;
+            }
+        }
 
         /* Deletes (and unlinks) are special.
          * Developer context:  For most commands, we call bgIteration_blockClientIfRequired before
