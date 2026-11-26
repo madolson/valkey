@@ -2720,6 +2720,28 @@ size_t bgIteration_memoryInuseForReplication(void) {
 
 
 // PUBLIC API
+void bgIteration_keyWillBeWritten(int dbid, dbEntry *de, bool wait) {
+    if (!bgIteration_iterationActive()) return;
+    serverAssert(hasMainThreadExclusivity());
+
+    sds key = objectGetKey(de);
+    bool queued = false;
+    listIter li;
+    listNode *node;
+    listRewind(allIterators, &li);
+    while ((node = listNext(&li)) != NULL) {
+        bgIterator *it = listNodeValue(node);
+        if (!(it->iteration_flags & BGITERATOR_FLAG_CONSISTENT)) continue;
+        if (!it->keyset_iter->isKeyInScope(it->keyset_iter, key)) continue;
+        if (((bgIterationEntryMetadata *)objectGetMetadata(de))->iterator_epoch > it->consistent_modification_id) continue;
+        if (iteratorHasPassedKey(it, dbid, key, de)) continue;
+        if (addEarlyIterationKey(it, de, dbid)) queued = true;
+    }
+    while (wait && queued && isEntryInuseByAnyIterator(de)) receiveItemsBackFromIterators(true);
+}
+
+
+// PUBLIC API
 bool bgIteration_isEntryInuse(dbEntry *de) {
     serverAssert(hasMainThreadExclusivity());
     if (!bgIteration_iterationActive()) return false;

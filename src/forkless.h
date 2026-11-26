@@ -12,7 +12,6 @@ void forklessSaveCancel(void);
 int isForklessSaveInProgress(void);
 sds forkless_catInfo(sds info);
 sds forkless_catDebugInfo(sds info);
-int forklessIteratorOwnsIncomingReplication(void);
 void retireForklessManagedReplica(client *c);
 
 #endif

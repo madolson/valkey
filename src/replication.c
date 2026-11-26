@@ -567,13 +567,6 @@ int canFeedReplicaReplBuffer(client *replica) {
     /* Don't feed replicas that are still waiting for BGSAVE to start. */
     if (replica->repl_data->repl_state == REPLICA_STATE_WAIT_BGSAVE_START) return 0;
 
-    /* Don't feed replicas that are syncing via forkless-save-to-socket while the
-     * iterator is still scanning the keyspace: replication is inlined into the
-     * RDB stream by the iterator, so the shared backlog is not needed yet. */
-    if (replica->flag.forkless_managed && isForklessSaveInProgress() &&
-        forklessIteratorOwnsIncomingReplication())
-        return 0;
-
     return 1;
 }
 

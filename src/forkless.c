@@ -38,19 +38,6 @@ typedef struct {
 /* Keep a global indicator of the current iterator (for cancellation purposes). */
 static forklessSaveInfo *currentForklessSave = NULL;
 
-/* True while a socket forkless save's iterator is scanning the keyspace. During
- * that time the syncing replicas are not fed from the shared replication backlog
- * like normal replicas: the iterator inlines live writes into the RDB stream
- * instead, so they don't accumulate in the backlog for the whole scan.
- * canFeedReplicaReplBuffer checks this flag to keep the replicas out of the
- * backlog.
- *
- * The flag is cleared when the iterator finishes. From then on the replicas
- * behave like those of a fork-based socket sync: they are pinned to the backlog
- * tail, the offset at that point goes into the RDB tail (repl-offset aux field),
- * and later writes are sent from the backlog after the replica ACKs. */
-static bool iteratorOwnsIncomingReplication = false;
-
 /* Orders a cancel against the snapshot rename, so that once forklessSaveCancel()
  * returns the stale snapshot cannot be renamed over a newer save. */
 static pthread_mutex_t forkless_rename_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -107,20 +94,6 @@ static int writeDbSizeHints(forklessSaveInfo *saveInfo) {
         if (rdbSaveDbSizeHints(&saveInfo->save_rio, db, 0) < 0) return C_ERR;
     }
     return C_OK;
-}
-
-
-/* Write an inline replication command into the RDB stream using RDB_OPCODE_UPDATE.
- * The command is serialized as RESP (multi-bulk) so the replica can replay it during RDB load. */
-static int writeReplicationData(forklessSaveInfo *saveInfo, bgIteratorItem *item) {
-    serverAssert(item->type == BGITERATOR_ITEM_REPLICATION);
-
-    if (rdbSaveType(&saveInfo->save_rio, RDB_OPCODE_UPDATE) == -1) return C_ERR;
-
-    sds cmd = catAppendOnlyGenericCommand(sdsempty(), item->u.repl.argc, item->u.repl.argv);
-    int ok = rioWrite(&saveInfo->save_rio, cmd, sdslen(cmd));
-    sdsfree(cmd);
-    return ok ? C_OK : C_ERR;
 }
 
 /* If a client is unresponsive or is being closed by the main thread, we might have to drop it
@@ -328,24 +301,6 @@ static void *forklessSaveProcessor(void *arg) {
             }
             break;
 
-        case BGITERATOR_ITEM_REPLICATION:
-            serverAssert(saveInfo->write_target == RDB_WRITE_TARGET_SOCKET);
-            if ((err = writeSelectDb(saveInfo, item->dbid)) == C_ERR) break;
-            err = writeReplicationData(saveInfo, item);
-            break;
-
-        case BGITERATOR_ITEM_SWAPDB:
-            /* Should only get SWAPDB for inconsistent (replication) iteration. */
-            serverAssert(saveInfo->write_target == RDB_WRITE_TARGET_SOCKET);
-            /* Iterator tracks swapdb internally; no special action needed. */
-            break;
-
-        case BGITERATOR_ITEM_FLUSHDB:
-            /* Should only get FLUSHDB for inconsistent (replication) iteration. */
-            serverAssert(saveInfo->write_target == RDB_WRITE_TARGET_SOCKET);
-            /* Flush command will be replicated via the replication stream. */
-            break;
-
         default:
             /* bgIteration may deliver item types that are not necessarily relevant to us.
              * New types may also be added in the future. It is the client's responsibility
@@ -381,10 +336,7 @@ static void *forklessSaveProcessor(void *arg) {
     if (saveInfo->write_target == RDB_WRITE_TARGET_SOCKET) {
         if (!terminated && err == C_OK) {
             sds footer = saveInfo->u.repl.footer_buf;
-            if (footer == NULL) {
-                /* Tail render failed on the main thread at iteration done. */
-                err = C_ERR;
-            } else if (rioWrite(&saveInfo->save_rio, footer, sdslen(footer)) == 0) {
+            if (rioWrite(&saveInfo->save_rio, footer, sdslen(footer)) == 0) {
                 serverLog(LL_WARNING, "forkless-save: error writing RDB tail to connset");
                 err = C_ERR;
             } else if (rdbWriteEofAndChecksum(&saveInfo->save_rio) == C_ERR) {
@@ -507,7 +459,6 @@ static void cleanupSaveInfoAndEmitEndMetrics(forklessSaveInfo *saveInfo) {
     updateReplicasWaitingBgsave(success ? C_OK : C_ERR, saveInfo->write_target);
 
     currentForklessSave = NULL;
-    iteratorOwnsIncomingReplication = false;
     atomic_store_explicit(&server.stat_current_save_keys_processed, 0, memory_order_relaxed);
     atomic_store_explicit(&server.stat_current_save_keys_total, 0, memory_order_relaxed);
 
@@ -642,7 +593,6 @@ static void forklessSaveComplete(bool terminated, void *privdata) {
     saveInfo->terminated = terminated;
     /* The save iterator should be terminated and freed at this point in time. */
     saveInfo->iterator = NULL;
-    iteratorOwnsIncomingReplication = false;
 
     if (saveInfo->write_target == RDB_WRITE_TARGET_SOCKET) {
         /* Abandoned forkless replicas are usually freed by the timer proc, but
@@ -703,8 +653,7 @@ static int forklessSaveCommonStart(forklessSaveInfo *saveInfo, int req, int rdbv
     startSaving(RDBFLAGS_FORKLESS_SAVE);
 
     rdbSaveInfo rsi, *rsiptr = NULL;
-    /* A socket save's offset is only known at the cut and is emitted in the RDB
-     * tail. Don't emit a stale start offset here. */
+    /* A socket save emits its offset in the RDB tail. */
     if (saveInfo->write_target == RDB_WRITE_TARGET_DISK) rsiptr = rdbPopulateSaveInfo(&rsi);
     if (rdbWriteHeader(&saveInfo->save_rio, req, rdbver, RDBFLAGS_NONE, rsiptr) == C_ERR) return C_ERR;
 
@@ -738,7 +687,6 @@ static void forklessMarkSaveFailed(forklessSaveInfo *saveInfo) {
     rdbClearSaveState(time(NULL));
     stopSaving(0);
     currentForklessSave = NULL;
-    iteratorOwnsIncomingReplication = false;
     serverLog(LL_WARNING, "forkless-save: save failed. %lld seconds.", (long long)server.rdb_save_time_last);
 }
 
@@ -835,13 +783,6 @@ int isForklessSaveInProgress(void) {
     return server.cur_bgsave_type == RDB_BGSAVE_TYPE_FORKLESS;
 }
 
-/* True while a forkless socket save's iterator is still scanning the keyspace
- * and inlining live writes into the RDB stream (see iteratorOwnsIncomingReplication). */
-int forklessIteratorOwnsIncomingReplication(void) {
-    return iteratorOwnsIncomingReplication;
-}
-
-
 /* Timer proc that runs on the main thread during socket-based forkless save.
  * The bg thread may need to abandon unresponsive replicas, but can't free
  * clients from a non-main thread. It queues them to foreground_queue, and
@@ -868,8 +809,10 @@ static long long replicationMonitorTimeProc(struct aeEventLoop *eventLoop, long 
     return REPLICATION_MONITOR_INTERVAL_MS;
 }
 
-/* Render the RDB tail's main-thread-only parts into the footer_buf
- * for the bg thread to write.
+/* Render the RDB tail's main-thread-only parts into the footer_buf for the bg
+ * thread to write. Rendered when the sync starts, so the repl-offset aux field
+ * is the offset of the snapshot and later writes reach the replica through the
+ * replication backlog, as in a fork-based sync.
  *
  * The EOF opcode + trailing checksum are NOT written here: this is a main-thread
  * function, and the main thread produces the header and this tail but not the
@@ -891,73 +834,6 @@ static int renderForklessRdbTail(forklessSaveInfo *saveInfo) {
     }
     saveInfo->u.repl.footer_buf = tail.io.buffer.ptr;
     return C_OK;
-}
-
-/* Pin each replica of the save to the current tail of the shared replication
- * backlog. From the iteration-done cut point on, live writes accumulate in the
- * shared backlog rather than being inlined into the RDB; the bytes are withheld
- * until the replica ACKs. */
-static void pinForklessCohortToBacklog(void) {
-    serverAssert(onServerMainThread());
-
-    listNode *target_node = listLast(server.repl_buffer_blocks);
-    if (target_node == NULL) return;
-    size_t target_pos = ((replBufBlock *)listNodeValue(target_node))->used;
-
-    listNode *ln;
-    listIter li;
-    /* Walk server.replicas rather then the save's client list, since the bg thread may still be
-     * removing replicas from the save's list. */
-    listRewind(server.replicas, &li);
-    while ((ln = listNext(&li)) != NULL) {
-        client *c = listNodeValue(ln);
-        if (!c->flag.forkless_managed) continue;
-        if (c->repl_data && atomic_load_explicit(&c->repl_data->forkless_pending_close, memory_order_relaxed)) continue;
-        serverAssert(c->repl_data);
-        ((replBufBlock *)listNodeValue(target_node))->refcount++;
-        if (c->repl_data->ref_repl_buf_node != NULL) {
-            ((replBufBlock *)listNodeValue(c->repl_data->ref_repl_buf_node))->refcount--;
-        }
-        c->repl_data->ref_repl_buf_node = target_node;
-        c->repl_data->ref_block_pos = target_pos;
-    }
-}
-
-/* Called on the main thread when the bg iterator finishes iterating all keys.
- * This is the iteration-done cut point. The bg thread has written all key data
- * but not the RDB tail yet. Two independent things happen here:
- *
- *   1. We render the RDB tail (repl aux fields — carrying the offset — plus the
- *      module AFTER_RDB aux) into footer_buf for the bg thread to emit after the
- *      keyspace (renderForklessRdbTail).
- *
- *   2. We pick this instant as the offset cut point: from here on, live writes
- *      stop being inlined into the RDB and instead accumulate in the shared
- *      replication backlog, so we pin each replica to the backlog tail now
- *      (pinForklessCohortToBacklog). */
-static bool forklessDoneIteratingKeyspace(void *privdata) {
-    serverAssert(onServerMainThread());
-
-    forklessSaveInfo *saveInfo = privdata;
-    serverAssert(saveInfo->write_target == RDB_WRITE_TARGET_SOCKET);
-
-    serverLog(LL_NOTICE, "forkless-save: replication done - primary_repl_offset: %lld",
-              server.primary_repl_offset);
-
-    /* Stage the RDB tail for the bg thread. On failure, footer_buf stays NULL
-     * and the bg thread fails the save cleanly when it finds no tail to write. */
-    if (renderForklessRdbTail(saveInfo) == C_ERR) {
-        serverLog(LL_WARNING, "forkless-save: error rendering RDB tail at iteration done");
-    } else {
-        /* Move the cohort onto the shared backlog for post-cut-point writes. */
-        pinForklessCohortToBacklog();
-    }
-
-    /* The iterator is done inlining replication. from here,
-     * live writes reach the cohort through the shared backlog. */
-    iteratorOwnsIncomingReplication = false;
-
-    return true;
 }
 
 int forklessSaveToSockets(int req, int rdbver) {
@@ -1037,16 +913,20 @@ int forklessSaveToSockets(int req, int rdbver) {
         goto werr;
     }
 
-    /* Create iterator with CONSISTENCY_EVENTUAL flag (no consistent snapshot needed).
-     * forklessDoneIteratingKeyspace is called on the main thread when iteration finishes. */
+    if (renderForklessRdbTail(saveInfo) == C_ERR) {
+        serverLog(LL_WARNING, "forkless-save: error rendering RDB tail");
+        goto werr;
+    }
+
+    /* The replicas get a point-in-time snapshot. Writes from now on are fed to
+     * them through the replication backlog. */
     saveInfo->iterator = bgIteratorCreateFullScanIter(FORKLESS_SOCKET_ITER_NAME,
-                                                      BGITERATOR_CONSISTENCY_EVENTUAL, forklessDoneIteratingKeyspace, forklessSaveComplete, saveInfo);
+                                                      BGITERATOR_CONSISTENCY_START, NULL, forklessSaveComplete, saveInfo);
     if (saveInfo->iterator == NULL) {
         serverLog(LL_WARNING, "forkless-save: error creating iterator");
         goto werr;
     }
     currentForklessSave = saveInfo;
-    iteratorOwnsIncomingReplication = true;
 
     atomic_store_explicit(&server.stat_current_save_keys_total, dbTotalServerKeyCount(), memory_order_relaxed);
     atomic_store_explicit(&server.stat_current_save_keys_processed, 0, memory_order_relaxed);

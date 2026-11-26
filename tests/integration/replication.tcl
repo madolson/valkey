@@ -2509,7 +2509,7 @@ foreach load_mode {disabled on-empty-db} {
                 $replica config set key-load-delay 10000
                 set loglines [count_log_lines -1]
                 $replica replicaof $primary_host $primary_port
-                wait_for_log_messages -1 {"*forkless-save: replication done*"} $loglines 300 100
+                wait_for_log_messages -1 {"*forkless-save: forkless save complete*"} $loglines 300 100
                 wait_for_condition 300 100 {
                     [s 0 loading] eq 1
                 } else {
@@ -2546,17 +2546,18 @@ foreach load_mode {disabled on-empty-db} {
 
 foreach primary_diskless {yes no} {
     foreach replica_load [expr {$primary_diskless eq "yes" ? {disabled on-empty-db} : {disabled on-empty-db swapdb}}] {
-        # {db command}: FLUSHDB targets the small db1, since flushing most keys cancels the save.
+        # {db command}: FLUSHDB targets the small db1.
         foreach inline_cmd {{0 {swapdb 0 1}} {1 {flushdb}} {1 {move db1:1 2}} {1 {copy db1:2 dst db 2}}
                             {1 {copy db1:3 db1:copy3 db 1}} {1 {copy db1:4 dst4 db 3 db 3}} {1 {move db1:5 7}}
                             {1 {swapdb 2 3}}} {
             lassign $inline_cmd cmd_db cmd
-            # A to-disk save is cancelled by any FLUSHDB, so those variants can't replay the
-            # command inside the running sync. They assert the cancel and the fresh full sync
-            # that follows instead, and are named accordingly so a CI failure reads correctly.
-            set cancels_to_disk_save [expr {$cmd eq "flushdb" && $primary_diskless eq "no"}]
-            if {$cancels_to_disk_save} {
-                set test_name "FLUSHDB during forkless sync cancels the to-disk save and resyncs"
+            # A forkless save is a point-in-time snapshot, so any FLUSHDB cancels it and the
+            # FLUSHDB variants can't replay the command inside the running sync. They assert the
+            # cancel and the fresh full sync that follows instead, and are named accordingly so a
+            # CI failure reads correctly.
+            set cancels_save [expr {$cmd eq "flushdb"}]
+            if {$cancels_save} {
+                set test_name "FLUSHDB during forkless sync cancels the save and resyncs"
             } else {
                 set test_name "[string toupper $cmd] during forkless sync replays correctly"
             }
@@ -2596,10 +2597,10 @@ foreach primary_diskless {yes no} {
                         $primary select $cmd_db
                         assert_not_equal 0 [$primary {*}$cmd]
                         $primary select 0
-                        if {$cancels_to_disk_save} {
-                            # The FLUSHDB cancels the to-disk save at once. rdb_bgsave_in_progress
-                            # only clears on the 200ms snapshot-end poll, so reading it right after
-                            # the reply is racy. Wait for the cancel in the log instead.
+                        if {$cancels_save} {
+                            # The FLUSHDB cancels the save at once. rdb_bgsave_in_progress only
+                            # clears once the save is torn down, so reading it right after the
+                            # reply is racy. Wait for the cancel in the log instead.
                             wait_for_log_messages -1 {"*forkless save cancelled*"} $loglines 300 100
                         } else {
                             assert_equal 1 [s -1 rdb_bgsave_in_progress]
@@ -2936,6 +2937,49 @@ start_server {tags {"repl external:skip needs:debug"} overrides {save "" forkles
             wait_for_ofs_sync $primary $replica
 
             # DEBUG DIGEST skips expired fields, so compare the field counts.
+            assert_equal 200 [forkless_field_expiry_reaped $replica]
+        }
+    }
+}
+
+start_server {tags {"repl external:skip needs:debug"} overrides {save "" forkless-infrastructure-enabled yes forkless-policy prefer-forkless repl-diskless-sync yes repl-diskless-sync-delay 0}} {
+    start_server {overrides {save ""}} {
+        set primary [srv -1 client]
+        set primary_host [srv -1 host]
+        set primary_port [srv -1 port]
+        set replica [srv 0 client]
+
+        test "Active hash field expiry of hashes a forkless full sync has not sent reaches the replica" {
+            # The fields get their TTL before the sync starts, so no client command
+            # touches the hashes during the sync. Only active expiry writes them.
+            $primary debug populate 2000 a 10
+            for {set h 0} {$h < 200} {incr h} {
+                $primary hset h:$h f0 v f1 v f2 v f3 v f4 v keep1 v keep2 v
+                $primary hpexpire h:$h 1500 FIELDS 5 f0 f1 f2 f3 f4
+            }
+
+            # About 6.6s over the 2200 keys, so most hashes are not sent yet
+            # when their fields expire.
+            $primary config set rdb-key-save-delay 3000
+            $replica replicaof $primary_host $primary_port
+            wait_for_condition 100 100 {
+                [forkless_field_expiry_reaped $primary] == 200
+            } else {
+                fail "primary did not expire the fields"
+            }
+            assert_equal 1 [s -1 rdb_bgsave_in_progress]
+            assert_equal {forkless} [s -1 rdb_current_bgsave_type]
+
+            $primary config set rdb-key-save-delay 0
+            wait_for_condition 200 100 {
+                [s -1 rdb_bgsave_in_progress] == 0 &&
+                [status $replica master_link_status] eq "up"
+            } else {
+                fail "sync did not finish"
+            }
+            wait_for_ofs_sync $primary $replica
+
+            assert_equal [$primary dbsize] [$replica dbsize]
             assert_equal 200 [forkless_field_expiry_reaped $replica]
         }
     }
