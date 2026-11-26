@@ -230,6 +230,7 @@ static void dbAddInternal(serverDb *db, robj *key, robj **valref, int update_if_
     dbTrackKeyWithVolatileItems(db, val);
     initObjectLRUOrLFU(val);
     kvstoreHashtableAdd(db->keys, dict_index, val);
+    bgIteration_keyAdded(db->id, objectGetVal(key));
     signalKeyAsReady(db, key, val->type);
     notifyKeyspaceEvent(NOTIFY_NEW, "new", key, db->id);
     *valref = val;
