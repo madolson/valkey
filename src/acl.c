@@ -2687,7 +2687,8 @@ static void ACLKillPubsubClientsIfNeeded(user *new, user *original) {
         client *c = listNodeValue(ln);
         if (c->user != original) continue;
         if (ACLShouldKillPubsubClient(c, channels)) {
-            freeClientOrCloseLater(c, 0);
+            /* Free asynchronously, a module callback may still hold the client. */
+            freeClientOrCloseLater(c, 1);
         }
     }
 
@@ -2810,6 +2811,23 @@ cleanup:
     zfree(acl_args);
 
     return error;
+}
+
+/* Like ACLSetUser(), but also disconnects the user's pub/sub clients whose
+ * channel permissions the operation revokes. */
+int ACLSetUserAndKillPubsubClients(user *u, const char *op, ssize_t oplen) {
+    user *tempu = ACLCreateUnlinkedUser();
+    ACLCopyUser(tempu, u);
+    int retval = ACLSetUser(tempu, op, oplen);
+    if (retval == C_OK) {
+        ACLKillPubsubClientsIfNeeded(tempu, u);
+        ACLCopyUser(u, tempu);
+    }
+    /* Callers rely on the errno set by ACLSetUser(). */
+    int saved_errno = errno;
+    ACLFreeUser(tempu);
+    errno = saved_errno;
+    return retval;
 }
 
 /* Given an argument vector describing a user in the form:
