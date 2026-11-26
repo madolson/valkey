@@ -823,6 +823,24 @@ start_server {tags {"acl external:skip"}} {
         assert {[dict get $entry username] eq {antirez}}
     }
 
+    test {ACL LOG entries do not retain unbounded strings} {
+        r ACL LOG RESET
+        set big [string repeat x 1000000]
+        r CLIENT SETNAME $big
+        catch {r AUTH $big foo}
+        r AUTH antirez foo
+        catch {r SET $big 1}
+        r AUTH default ""
+        r CLIENT SETNAME ""
+        set log [r ACL LOG]
+        assert_equal 2 [llength $log]
+        foreach entry $log {
+            foreach field {object username client-info} {
+                assert_lessthan [string length [dict get $entry $field]] 2048
+            }
+        }
+    }
+
     test {ACLLOG - zero max length is correctly handled} {
         r ACL LOG RESET
         r CONFIG SET acllog-max-len 0
